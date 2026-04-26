@@ -11,6 +11,10 @@ services:
       KAFKA_TRACE_TOPIC: tracer
       POSTGRES_DSN: postgresql://postgres:postgres@postgres:5432/fluiq
       POSTGRES_USER_TABLE: user
+      JWT_SECRET: asjdhasjxnhsagdsdskhfaskdnua21eysadbsacnldsfgjs
+      JWT_ALGORITHM: HS256
+      JWT_EXPIRE_MINUTES: 60
+      JWT_REFRESH_EXPIRE_DAYS: 7
     networks:
       - fluiq-ai
     restart: unless-stopped
