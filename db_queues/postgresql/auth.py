@@ -1,14 +1,18 @@
+import hashlib
 import os
+import secrets
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import asyncpg
 from dotenv import load_dotenv
 
-from shared.model import OrganizationModel, UserModel, UserType
+from shared.model import ApiKeyCreated, OrganizationModel, UserModel, UserType
 
 from . import postgres_client
+
+API_KEY_PREFIX_LENGTH = 11
 
 load_dotenv()
 
@@ -108,12 +112,125 @@ async def is_refresh_token_revoked(jti: str) -> bool:
         return row is not None
 
 
+async def get_organization(org_id: uuid.UUID) -> Optional[OrganizationModel]:
+    async with postgres_client.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT * FROM {POSTGRES_ORG_TABLE} WHERE org_id = $1",
+            org_id,
+        )
+    if row is None:
+        return None
+    return OrganizationModel(**dict(row))
+
+
+async def resolve_api_key(
+    plaintext: str,
+) -> Optional[tuple[uuid.UUID, str, uuid.UUID]]:
+    """Resolve a plaintext api key to (org_id, prefix, key_id).
+
+    Returns None if the key is unknown. Matching is done against the
+    SHA-256 hash stored in `organizations.api_keys[].hashed_key`; the
+    plaintext key itself is never compared or persisted.
+    """
+    if not plaintext:
+        return None
+    hashed = _hash_api_key(plaintext)
+    async with postgres_client.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT org_id, elem->>'prefix' AS prefix, elem->>'key_id' AS key_id "
+            f"FROM {POSTGRES_ORG_TABLE}, jsonb_array_elements(api_keys) elem "
+            f"WHERE elem->>'hashed_key' = $1 LIMIT 1",
+            hashed,
+        )
+    if row is None:
+        return None
+    return row["org_id"], row["prefix"], uuid.UUID(row["key_id"])
+
+
+def _generate_api_key() -> str:
+    return f"fl_{secrets.token_urlsafe(32)}"
+
+
+def _hash_api_key(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+async def create_api_key(
+    org_id: uuid.UUID, name: str
+) -> Optional[ApiKeyCreated]:
+    """Append a new API key to the organization and bump usage.
+
+    The plaintext key is returned exactly once; only its SHA-256 hash plus a
+    short prefix are persisted. Returns None if the org would exceed its
+    limit or does not exist.
+    """
+    plaintext = _generate_api_key()
+    prefix = plaintext[:API_KEY_PREFIX_LENGTH]
+    created_at = datetime.now(timezone.utc)
+    key_id = uuid.uuid4()
+    entry = {
+        "key_id": str(key_id),
+        "name": name,
+        "prefix": prefix,
+        "hashed_key": _hash_api_key(plaintext),
+        "created_at": created_at.isoformat(),
+    }
+    async with postgres_client.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                f"UPDATE {POSTGRES_ORG_TABLE} "
+                f"SET api_keys = api_keys || $2::jsonb, "
+                f"    api_key_usage = api_key_usage + 1, "
+                f"    updated_at = NOW() "
+                f"WHERE org_id = $1 AND api_key_usage < api_key_limit "
+                f"RETURNING org_id",
+                org_id, entry,
+            )
+    if row is None:
+        return None
+    return ApiKeyCreated(
+        key_id=key_id,
+        name=name,
+        prefix=prefix,
+        key=plaintext,
+        created_at=created_at,
+    )
+
+
+async def delete_api_key(org_id: uuid.UUID, key_id: uuid.UUID) -> bool:
+    """Remove an API key from the organization. Returns True if removed."""
+    async with postgres_client.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                f"UPDATE {POSTGRES_ORG_TABLE} "
+                f"SET api_keys = COALESCE(("
+                f"        SELECT jsonb_agg(elem) "
+                f"        FROM jsonb_array_elements(api_keys) elem "
+                f"        WHERE elem->>'key_id' <> $2"
+                f"    ), '[]'::jsonb), "
+                f"    api_key_usage = GREATEST(api_key_usage - 1, 0), "
+                f"    updated_at = NOW() "
+                f"WHERE org_id = $1 "
+                f"  AND EXISTS ("
+                f"        SELECT 1 FROM jsonb_array_elements(api_keys) elem "
+                f"        WHERE elem->>'key_id' = $2"
+                f"    ) "
+                f"RETURNING org_id",
+                org_id, str(key_id),
+            )
+    return row is not None
+
+
 __all__ = [
     "email_exists",
     "register_user",
     "get_user_by_email",
     "revoke_refresh_token",
     "is_refresh_token_revoked",
+    "get_organization",
+    "resolve_api_key",
+    "create_api_key",
+    "delete_api_key",
     "POSTGRES_USER_TABLE",
     "POSTGRES_ORG_TABLE",
     "POSTGRES_REVOKED_TOKEN_TABLE",

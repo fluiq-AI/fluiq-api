@@ -8,13 +8,21 @@ services:
       - "8000:8000"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_TRACE_TOPIC: tracer
-      POSTGRES_DSN: postgresql://postgres:postgres@postgres:5432/fluiq
-      POSTGRES_USER_TABLE: user
+      KAFKA_TRACE_TOPIC: traces
+      POSTGRES_DSN: postgresql://fluiq:fluiq@postgres:5432/fluiq
+      POSTGRES_USER_TABLE: users
       JWT_SECRET: asjdhasjxnhsagdsdskhfaskdnua21eysadbsacnldsfgjs
       JWT_ALGORITHM: HS256
       JWT_EXPIRE_MINUTES: 60
       JWT_REFRESH_EXPIRE_DAYS: 7
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DATABASE: fluiq
+      CLICKHOUSE_TRACE_TABLE: traces
+    volumes:
+      - .:/app
     networks:
       - fluiq-ai
     restart: unless-stopped

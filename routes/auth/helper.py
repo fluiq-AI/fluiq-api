@@ -7,7 +7,8 @@ import bcrypt
 import jwt
 from dotenv import load_dotenv
 from email_validator import EmailNotValidError, validate_email
-from fastapi import HTTPException, status
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 load_dotenv()
 
@@ -109,3 +110,35 @@ def _decode_refresh_token(token: str) -> dict:
             detail="Invalid refresh token",
         )
     return payload
+
+
+_bearer_scheme = HTTPBearer(auto_error=True)
+
+
+def _decode_access_token(token: str) -> dict:
+    """Validate an access JWT and return its claims. Raises 401 on failure."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Access token expired",
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid access token",
+        )
+    if payload.get("type") != "access":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid access token",
+        )
+    return payload
+
+
+def get_current_session(
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer_scheme),
+) -> dict:
+    """FastAPI dependency: decode Bearer access token; return JWT claims."""
+    return _decode_access_token(credentials.credentials)

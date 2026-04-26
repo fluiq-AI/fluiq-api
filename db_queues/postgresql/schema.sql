@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS organizations (
     name          TEXT NOT NULL,
     user_id       UUID NOT NULL,
     team_ids      UUID[] NOT NULL DEFAULT '{}',
-    api_keys      UUID[] NOT NULL DEFAULT '{}',
+    api_keys      JSONB NOT NULL DEFAULT '[]'::jsonb,
     api_key_limit INTEGER NOT NULL DEFAULT 1,
     api_key_usage INTEGER NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),

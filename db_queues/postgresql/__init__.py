@@ -1,17 +1,29 @@
+import json
 import os
 import logging
 from dotenv import load_dotenv
+from pathlib import Path
 from typing import Optional
 
 import asyncpg
 
 load_dotenv()
 
+
+async def _init_connection(conn: asyncpg.Connection) -> None:
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+
 logger = logging.getLogger(__name__)
 
-POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/fluiq")
+POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://fluiq:fluiq@localhost:5432/fluiq")
 POSTGRES_POOL_MIN = int(os.getenv("POSTGRES_POOL_MIN", "1"))
 POSTGRES_POOL_MAX = int(os.getenv("POSTGRES_POOL_MAX", "10"))
+SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 class PostgresClient:
     """Async PostgreSQL connection pool wrapper."""
@@ -34,8 +46,19 @@ class PostgresClient:
             dsn=self.dsn,
             min_size=self.pool_min,
             max_size=self.pool_max,
+            init=_init_connection,
         )
         logger.info("[POSTGRES] Connection pool started: %s", self.dsn)
+        await self._apply_schema()
+
+    async def _apply_schema(self) -> None:
+        if not SCHEMA_PATH.is_file():
+            logger.warning("[POSTGRES] schema.sql not found at %s", SCHEMA_PATH)
+            return
+        ddl = SCHEMA_PATH.read_text(encoding="utf-8")
+        async with self._pool.acquire() as conn:
+            await conn.execute(ddl)
+        logger.info("[POSTGRES] schema applied from %s", SCHEMA_PATH)
 
     async def stop(self) -> None:
         if self._pool is None:
