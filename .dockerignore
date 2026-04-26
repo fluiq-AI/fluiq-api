@@ -1,0 +1,11 @@
+.api_venv
+.venv
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+.env
+output.json
+.vscode
+.idea

@@ -1,0 +1,21 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fluiq-api
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TRACE_TOPIC: tracer
+      POSTGRES_DSN: postgresql://postgres:postgres@postgres:5432/fluiq
+      POSTGRES_USER_TABLE: user
+    networks:
+      - fluiq-ai
+    restart: unless-stopped
+
+networks:
+  fluiq-ai:
+    external: true
+    name: fluiq-ai
