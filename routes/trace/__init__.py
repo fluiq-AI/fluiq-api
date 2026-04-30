@@ -9,12 +9,36 @@ from db_queues.clickhouse import clickhouse_client
 from db_queues.kafka import kafka_queue
 from db_queues.postgresql.auth import get_organization, resolve_api_key
 from routes.auth.helper import get_current_session
+from shared.quotas import (
+    bump_eval_count,
+    bump_trace_count,
+    get_quota_status,
+)
 
 from .model import IngestPayload, TraceListResponse, TraceRecord
 
 load_dotenv()
 
 router = APIRouter()
+
+_RETRIEVAL_APIS = {
+    "query",
+    "search",
+    "near_text",
+    "near_vector",
+    "hybrid",
+    "bm25",
+    "query_points",
+    "fetch_objects",
+}
+
+
+def _is_retrieval_event(event: dict) -> bool:
+    return (
+        event.get("type") == "vectorstore"
+        and event.get("api") in _RETRIEVAL_APIS
+    )
+
 
 @router.post("/ingest")
 async def ingestion(payload: IngestPayload):
@@ -31,18 +55,56 @@ async def ingestion(payload: IngestPayload):
         )
     org_id, prefix, _key_id = resolved
 
+    # Enforce tier quotas before doing any Kafka work. Trace quota is a hard
+    # stop (402); eval quota gates only the evaluations fan-out so tracing
+    # keeps flowing even after the eval cap is reached.
+    quota = await get_quota_status(org_id)
+    if quota.trace_over:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=(
+                f"Trace quota exceeded for {quota.tier} tier "
+                f"({quota.trace_count}/{quota.trace_quota}). "
+                f"Upgrade your plan to resume ingestion."
+            ),
+        )
+
+    event = payload.event
+    trace_id = event.get("trace_id")
+    if not trace_id:
+        trace_id = str(uuid.uuid4())
+        event["trace_id"] = trace_id
+
     job = {
         "organization_id": str(org_id),
         "api_key_prefix": prefix,
-        "event": payload.event,
+        "trace_id": trace_id,
+        "event": event,
     }
     await kafka_queue.add_job(
         job,
-        topic=os.getenv("KAFKA_TRACE_TOPIC"),
+        topic=os.getenv("KAFKA_TRACE_TOPIC", "traces"),
         key=str(org_id),
     )
+    bump_trace_count(org_id)
 
-    return {"ok": True}
+    eval_skipped = False
+    if _is_retrieval_event(event):
+        if quota.eval_over:
+            eval_skipped = True
+        else:
+            await kafka_queue.add_job(
+                job,
+                topic=os.getenv("KAFKA_EVAL_TOPIC", "evaluations"),
+                key=str(org_id),
+            )
+            bump_eval_count(org_id)
+
+    return {
+        "ok": True,
+        "trace_id": trace_id,
+        "eval_skipped": eval_skipped,
+    }
 
 
 @router.get("/traces", response_model=TraceListResponse)

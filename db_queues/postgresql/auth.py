@@ -22,7 +22,12 @@ POSTGRES_REVOKED_TOKEN_TABLE = os.getenv(
     "POSTGRES_REVOKED_TOKEN_TABLE", "revoked_refresh_tokens"
 )
 
-API_KEY_LIMITS: dict[str, int] = {"Free": 1, "Team": 5, "Enterprise": 50}
+API_KEY_LIMITS: dict[str, int] = {
+    "Free": 1,
+    "Team": 5,
+    "Growth": 15,
+    "Enterprise": 50,
+}
 
 
 async def email_exists(email: str) -> bool:
@@ -121,6 +126,25 @@ async def get_organization(org_id: uuid.UUID) -> Optional[OrganizationModel]:
     if row is None:
         return None
     return OrganizationModel(**dict(row))
+
+
+async def get_org_tier(org_id: uuid.UUID) -> Optional[str]:
+    """Return the tier (`Free` / `Team` / `Growth` / `Enterprise`) for an org.
+
+    The tier is read from the org owner's ``users.user_type`` row. Returns
+    ``None`` if the org or its owner cannot be found.
+    """
+    async with postgres_client.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT u.user_type "
+            f"FROM {POSTGRES_ORG_TABLE} o "
+            f"JOIN {POSTGRES_USER_TABLE} u ON u.user_id = o.user_id "
+            f"WHERE o.org_id = $1",
+            org_id,
+        )
+    if row is None:
+        return None
+    return row["user_type"]
 
 
 async def resolve_api_key(
@@ -228,6 +252,7 @@ __all__ = [
     "revoke_refresh_token",
     "is_refresh_token_revoked",
     "get_organization",
+    "get_org_tier",
     "resolve_api_key",
     "create_api_key",
     "delete_api_key",

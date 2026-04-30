@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS users (
     hashed_password TEXT NOT NULL,
     name            TEXT NOT NULL,
     user_type       TEXT NOT NULL DEFAULT 'Free'
-                    CHECK (user_type IN ('Free', 'Team', 'Enterprise')),
+                    CHECK (user_type IN ('Free', 'Team', 'Growth', 'Enterprise')),
     org_id          UUID NOT NULL REFERENCES organizations(org_id),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ
@@ -34,3 +34,30 @@ CREATE TABLE IF NOT EXISTS revoked_refresh_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_revoked_refresh_tokens_expires_at
     ON revoked_refresh_tokens(expires_at);
+
+CREATE TABLE IF NOT EXISTS model_prices (
+    id                                       BIGSERIAL PRIMARY KEY,
+    provider                                 TEXT NOT NULL,
+    model                                    TEXT NOT NULL,
+    modality                                 TEXT NOT NULL,
+    input_token_cost_per_million             NUMERIC,
+    cached_input_token_cost_per_million      NUMERIC,
+    output_token_cost_per_million            NUMERIC,
+    long_context_consider_token_greater_than INTEGER,
+    long_context_input_per_million           NUMERIC,
+    long_context_cached_input_per_million    NUMERIC,
+    long_context_output_per_million          NUMERIC,
+    cache_valid_5_minutes_per_million        NUMERIC,
+    cache_valid_60_minutes_per_million       NUMERIC,
+    training_cost_per_hour                   NUMERIC,
+    video_size                               TEXT,
+    video_portrait                           TEXT,
+    video_landscape                          TEXT,
+    video_price_per_second                   NUMERIC,
+    audio_price_per_second                   NUMERIC,
+    created_at                               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_model_prices_provider_model
+    ON model_prices(provider, model);
+CREATE INDEX IF NOT EXISTS idx_model_prices_provider_model_modality
+    ON model_prices(provider, model, modality);
