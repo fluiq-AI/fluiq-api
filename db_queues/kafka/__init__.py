@@ -19,6 +19,7 @@ class KafkaQueue:
         kafka_certfile = config.KAFKA_SSL_CERT_FILE,
         kafka_keyfile = config.KAFKA_SSL_KEY_FILE,
         kafka_security_protocol = config.KAFKA_SECURITY_PROTOCOL
+        
     ) -> None:
         self.bootstrap_servers = bootstrap_servers
         self.kafka_cafile = kafka_cafile
@@ -32,9 +33,9 @@ class KafkaQueue:
         if self._producer is not None:
             return
         
-        print("File Values: ")
-        print(f"Kafka CA File: {self.kafka_cafile}")
-        logger.log(1, msg=f"Kafka CA File: {self.kafka_cafile}")
+        logger.info(f"Kafka CA File: {self.kafka_cafile}")
+        logger.info(f"Kafka Cert File: {self.kafka_certfile}")
+        logger.info(f"Kafka Key File: {self.kafka_keyfile}")
 
         context = create_ssl_context(
             cafile=self.kafka_cafile,
