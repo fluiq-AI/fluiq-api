@@ -19,12 +19,17 @@ class KafkaQueue:
         kafka_certfile = config.KAFKA_SSL_CERT_FILE,
         kafka_keyfile = config.KAFKA_SSL_KEY_FILE,
         kafka_security_protocol = config.KAFKA_SECURITY_PROTOCOL
-        
+
     ) -> None:
+        
+        logger.info(f"Kafka CA File: {self.kafka_cafile}")
+        logger.info(f"Kafka Cert File: {self.kafka_certfile}")
+        logger.info(f"Kafka Key File: {self.kafka_keyfile}")
+
         self.bootstrap_servers = bootstrap_servers
         self.kafka_cafile = kafka_cafile
         self.kafka_certfile = kafka_certfile
-        self.kafka_keyfile - kafka_keyfile
+        self.kafka_keyfile = kafka_keyfile
         self.kafka_security_protocol = kafka_security_protocol
         self.default_topic = default_topic
         self._producer: Optional[AIOKafkaProducer] = None
@@ -32,10 +37,6 @@ class KafkaQueue:
     async def start(self) -> None:
         if self._producer is not None:
             return
-        
-        logger.info(f"Kafka CA File: {self.kafka_cafile}")
-        logger.info(f"Kafka Cert File: {self.kafka_certfile}")
-        logger.info(f"Kafka Key File: {self.kafka_keyfile}")
 
         context = create_ssl_context(
             cafile=self.kafka_cafile,
