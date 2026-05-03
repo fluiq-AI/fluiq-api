@@ -3,6 +3,7 @@ import json
 import logging
 from typing import Any, Optional
 from aiokafka import AIOKafkaProducer
+from aiokafka.helpers import create_ssl_context
 import config
 
 logger = logging.getLogger(__name__)
@@ -22,12 +23,17 @@ class KafkaQueue:
     async def start(self) -> None:
         if self._producer is not None:
             return
+        
+        context = create_ssl_context(
+            cafile=config.KAFKA_SSL_CA_FILE,
+            certfile=config.KAFKA_SSL_CERT_FILE,
+            keyfile=config.KAFKA_SSL_KEY_FILE
+        )
+        
         self._producer = AIOKafkaProducer(
             bootstrap_servers=self.bootstrap_servers,
             security_protocol=config.KAFKA_SECURITY_PROTOCOL,
-            ssl_cafile=config.KAFKA_SSL_CA_FILE,
-            ssl_certfile=config.KAFKA_SSL_CERT_FILE,
-            ssl_keyfile=config.KAFKA_SSL_KEY_FILE,
+            ssl_context=context,
             value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
             key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else k,
             acks="all",
