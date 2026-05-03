@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from db_queues.clickhouse import clickhouse_client
 from db_queues.kafka import kafka_queue
 from db_queues.postgresql import postgres_client
+from realtime import trace_consumer
 from routes import trace, auth
 from routes.agents import router as agents_router
 from routes.api_keys import api_keys_router
@@ -17,9 +18,11 @@ async def lifespan(app: FastAPI):
     await kafka_queue.start()
     await postgres_client.start()
     await clickhouse_client.start()
+    await trace_consumer.start()
     try:
         yield
     finally:
+        await trace_consumer.stop()
         await clickhouse_client.stop()
         await postgres_client.stop()
         await kafka_queue.stop()
