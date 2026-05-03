@@ -1,14 +1,11 @@
 import json
 import os
 import logging
-from dotenv import load_dotenv
+import config
 from pathlib import Path
 from typing import Optional
 
 import asyncpg
-
-load_dotenv()
-
 
 async def _init_connection(conn: asyncpg.Connection) -> None:
     await conn.set_type_codec(
@@ -20,9 +17,6 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 
 logger = logging.getLogger(__name__)
 
-POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://fluiq:fluiq@localhost:5432/fluiq")
-POSTGRES_POOL_MIN = int(os.getenv("POSTGRES_POOL_MIN", "1"))
-POSTGRES_POOL_MAX = int(os.getenv("POSTGRES_POOL_MAX", "10"))
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 class PostgresClient:
@@ -30,9 +24,9 @@ class PostgresClient:
 
     def __init__(
         self,
-        dsn: str = POSTGRES_DSN,
-        pool_min: int = POSTGRES_POOL_MIN,
-        pool_max: int = POSTGRES_POOL_MAX,
+        dsn: str = config.POSTGRES_DSN,
+        pool_min: int = config.POSTGRES_POOL_MIN,
+        pool_max: int = config.POSTGRES_POOL_MAX,
     ) -> None:
         self.dsn = dsn
         self.pool_min = pool_min

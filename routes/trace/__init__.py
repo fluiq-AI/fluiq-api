@@ -1,11 +1,10 @@
 import asyncio
 import json
-import os
+import config
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sse_starlette.sse import EventSourceResponse
 
@@ -22,7 +21,6 @@ from shared.quotas import (
 
 from .model import IngestPayload, TraceListResponse, TraceRecord
 
-load_dotenv()
 
 router = APIRouter()
 
@@ -94,7 +92,7 @@ async def ingestion(payload: IngestPayload):
     }
     await kafka_queue.add_job(
         job,
-        topic=os.getenv("KAFKA_TRACE_TOPIC", "traces"),
+        topic=config.KAFKA_TRACE_TOPIC,
         key=str(org_id),
     )
     if not is_running:
@@ -107,7 +105,7 @@ async def ingestion(payload: IngestPayload):
         else:
             await kafka_queue.add_job(
                 job,
-                topic=os.getenv("KAFKA_EVAL_TOPIC", "evaluations"),
+                topic=config.KAFKA_EVAL_TOPIC,
                 key=str(org_id),
             )
             bump_eval_count(org_id)

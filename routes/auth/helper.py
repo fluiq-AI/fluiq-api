@@ -5,21 +5,14 @@ from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import jwt
-from dotenv import load_dotenv
+import config
 from email_validator import EmailNotValidError, validate_email
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-load_dotenv()
-
 PASSWORD_MIN_LENGTH = 8
 _PASSWORD_LETTER_RE = re.compile(r"[A-Za-z]")
 _PASSWORD_DIGIT_RE = re.compile(r"[0-9]")
-
-JWT_SECRET = os.getenv("JWT_SECRET")
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM")
-JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES"))
-JWT_REFRESH_EXPIRE_DAYS = int(os.getenv("JWT_REFRESH_EXPIRE_DAYS"))
 
 
 def _validate_password(password: str) -> None:
@@ -61,7 +54,7 @@ def _verify_password(password: str, hashed_password: str) -> bool:
 
 def _create_access_token(user_id: str, org_id: str) -> tuple[str, int]:
     """Encode a short-lived access JWT. Returns (token, expires_in_seconds)."""
-    expires_in = JWT_EXPIRE_MINUTES * 60
+    expires_in = config.JWT_EXPIRE_MINUTES * 60
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
@@ -70,13 +63,13 @@ def _create_access_token(user_id: str, org_id: str) -> tuple[str, int]:
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=expires_in)).timestamp()),
     }
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    token = jwt.encode(payload, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
     return token, expires_in
 
 
 def _create_refresh_token(user_id: str, org_id: str) -> tuple[str, int]:
     """Encode a long-lived refresh JWT. Returns (token, expires_in_seconds)."""
-    expires_in = JWT_REFRESH_EXPIRE_DAYS * 86400
+    expires_in = config.JWT_REFRESH_EXPIRE_DAYS * 86400
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
@@ -86,14 +79,14 @@ def _create_refresh_token(user_id: str, org_id: str) -> tuple[str, int]:
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=expires_in)).timestamp()),
     }
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    token = jwt.encode(payload, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
     return token, expires_in
 
 
 def _decode_refresh_token(token: str) -> dict:
     """Validate a refresh JWT and return its claims. Raises 401 on failure."""
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, config.JWT_SECRET, algorithms=[config.JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -118,7 +111,7 @@ _bearer_scheme = HTTPBearer(auto_error=True)
 def _decode_access_token(token: str) -> dict:
     """Validate an access JWT and return its claims. Raises 401 on failure."""
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, config.JWT_SECRET, algorithms=[config.JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

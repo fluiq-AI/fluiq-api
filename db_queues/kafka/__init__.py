@@ -1,25 +1,19 @@
 import os
 import json
 import logging
-from dotenv import load_dotenv
 from typing import Any, Optional
 from aiokafka import AIOKafkaProducer
-
-load_dotenv()
+import config
 
 logger = logging.getLogger(__name__)
-
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-KAFKA_TRACE_TOPIC = os.getenv("KAFKA_TRACE_TOPIC", "traces")
-
 
 class KafkaQueue:
     """Async Kafka producer wrapper for enqueuing trace jobs."""
 
     def __init__(
         self,
-        bootstrap_servers: str = KAFKA_BOOTSTRAP_SERVERS,
-        default_topic: str = KAFKA_TRACE_TOPIC,
+        bootstrap_servers: str = config.KAFKA_BOOTSTRAP_SERVERS,
+        default_topic: str = config.KAFKA_TRACE_TOPIC,
     ) -> None:
         self.bootstrap_servers = bootstrap_servers
         self.default_topic = default_topic

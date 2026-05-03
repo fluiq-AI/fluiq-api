@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import asyncpg
-from dotenv import load_dotenv
+import config
 
 from shared.model import ApiKeyCreated, OrganizationModel, UserModel, UserType
 
@@ -14,13 +14,7 @@ from . import postgres_client
 
 API_KEY_PREFIX_LENGTH = 11
 
-load_dotenv()
 
-POSTGRES_USER_TABLE = os.getenv("POSTGRES_USER_TABLE", "users")
-POSTGRES_ORG_TABLE = os.getenv("POSTGRES_ORG_TABLE", "organizations")
-POSTGRES_REVOKED_TOKEN_TABLE = os.getenv(
-    "POSTGRES_REVOKED_TOKEN_TABLE", "revoked_refresh_tokens"
-)
 
 API_KEY_LIMITS: dict[str, int] = {
     "Free": 1,
@@ -33,7 +27,7 @@ API_KEY_LIMITS: dict[str, int] = {
 async def email_exists(email: str) -> bool:
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
-            f"SELECT 1 FROM {POSTGRES_USER_TABLE} WHERE email = $1",
+            f"SELECT 1 FROM {config.config.POSTGRES_USER_TABLE} WHERE email = $1",
             email,
         )
         return row is not None
@@ -58,13 +52,13 @@ async def register_user(
         async with conn.transaction():
             try:
                 org_row = await conn.fetchrow(
-                    f"INSERT INTO {POSTGRES_ORG_TABLE} "
+                    f"INSERT INTO {config.POSTGRES_ORG_TABLE} "
                     f"(org_id, name, user_id, api_key_limit, api_key_usage, created_at) "
                     f"VALUES ($1, $2, $3, $4, 0, NOW()) RETURNING *",
                     org_id, org_name, user_id, api_key_limit,
                 )
                 user_row = await conn.fetchrow(
-                    f"INSERT INTO {POSTGRES_USER_TABLE} "
+                    f"INSERT INTO {config.POSTGRES_USER_TABLE} "
                     f"(user_id, email, hashed_password, name, user_type, org_id, created_at) "
                     f"VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *",
                     user_id, email, hashed_password, name, user_type, org_id,
@@ -84,13 +78,13 @@ async def get_user_by_email(
     """
     async with postgres_client.acquire() as conn:
         user_row = await conn.fetchrow(
-            f"SELECT * FROM {POSTGRES_USER_TABLE} WHERE email = $1",
+            f"SELECT * FROM {config.POSTGRES_USER_TABLE} WHERE email = $1",
             email,
         )
         if user_row is None:
             return None
         org_row = await conn.fetchrow(
-            f"SELECT * FROM {POSTGRES_ORG_TABLE} WHERE org_id = $1",
+            f"SELECT * FROM {config.POSTGRES_ORG_TABLE} WHERE org_id = $1",
             user_row["org_id"],
         )
         if org_row is None:
@@ -102,7 +96,7 @@ async def revoke_refresh_token(jti: str, expires_at: datetime) -> None:
     """Insert a refresh token's jti into the revocation list (idempotent)."""
     async with postgres_client.acquire() as conn:
         await conn.execute(
-            f"INSERT INTO {POSTGRES_REVOKED_TOKEN_TABLE} (jti, expires_at) "
+            f"INSERT INTO {config.POSTGRES_REVOKED_TOKEN_TABLE} (jti, expires_at) "
             f"VALUES ($1, $2) ON CONFLICT (jti) DO NOTHING",
             uuid.UUID(str(jti)), expires_at,
         )
@@ -111,7 +105,7 @@ async def revoke_refresh_token(jti: str, expires_at: datetime) -> None:
 async def is_refresh_token_revoked(jti: str) -> bool:
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
-            f"SELECT 1 FROM {POSTGRES_REVOKED_TOKEN_TABLE} WHERE jti = $1",
+            f"SELECT 1 FROM {config.POSTGRES_REVOKED_TOKEN_TABLE} WHERE jti = $1",
             uuid.UUID(str(jti)),
         )
         return row is not None
@@ -120,7 +114,7 @@ async def is_refresh_token_revoked(jti: str) -> bool:
 async def get_organization(org_id: uuid.UUID) -> Optional[OrganizationModel]:
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
-            f"SELECT * FROM {POSTGRES_ORG_TABLE} WHERE org_id = $1",
+            f"SELECT * FROM {config.POSTGRES_ORG_TABLE} WHERE org_id = $1",
             org_id,
         )
     if row is None:
@@ -137,8 +131,8 @@ async def get_org_tier(org_id: uuid.UUID) -> Optional[str]:
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
             f"SELECT u.user_type "
-            f"FROM {POSTGRES_ORG_TABLE} o "
-            f"JOIN {POSTGRES_USER_TABLE} u ON u.user_id = o.user_id "
+            f"FROM {config.POSTGRES_ORG_TABLE} o "
+            f"JOIN {config.POSTGRES_USER_TABLE} u ON u.user_id = o.user_id "
             f"WHERE o.org_id = $1",
             org_id,
         )
@@ -162,7 +156,7 @@ async def resolve_api_key(
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
             f"SELECT org_id, elem->>'prefix' AS prefix, elem->>'key_id' AS key_id "
-            f"FROM {POSTGRES_ORG_TABLE}, jsonb_array_elements(api_keys) elem "
+            f"FROM {config.POSTGRES_ORG_TABLE}, jsonb_array_elements(api_keys) elem "
             f"WHERE elem->>'hashed_key' = $1 LIMIT 1",
             hashed,
         )
@@ -202,7 +196,7 @@ async def create_api_key(
     async with postgres_client.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
-                f"UPDATE {POSTGRES_ORG_TABLE} "
+                f"UPDATE {config.POSTGRES_ORG_TABLE} "
                 f"SET api_keys = api_keys || $2::jsonb, "
                 f"    api_key_usage = api_key_usage + 1, "
                 f"    updated_at = NOW() "
@@ -226,7 +220,7 @@ async def delete_api_key(org_id: uuid.UUID, key_id: uuid.UUID) -> bool:
     async with postgres_client.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
-                f"UPDATE {POSTGRES_ORG_TABLE} "
+                f"UPDATE {config.POSTGRES_ORG_TABLE} "
                 f"SET api_keys = COALESCE(("
                 f"        SELECT jsonb_agg(elem) "
                 f"        FROM jsonb_array_elements(api_keys) elem "
@@ -256,8 +250,8 @@ __all__ = [
     "resolve_api_key",
     "create_api_key",
     "delete_api_key",
-    "POSTGRES_USER_TABLE",
-    "POSTGRES_ORG_TABLE",
-    "POSTGRES_REVOKED_TOKEN_TABLE",
+    "config.POSTGRES_USER_TABLE",
+    "config.POSTGRES_ORG_TABLE",
+    "config.POSTGRES_REVOKED_TOKEN_TABLE",
     "API_KEY_LIMITS",
 ]

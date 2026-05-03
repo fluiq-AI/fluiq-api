@@ -1,38 +1,26 @@
-import os
 import json
 import logging
 import uuid
-from dotenv import load_dotenv
 from typing import Any, Optional
 
 import clickhouse_connect
 from clickhouse_connect.driver.asyncclient import AsyncClient
 
-load_dotenv()
+import config 
 
 logger = logging.getLogger(__name__)
-
-CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "localhost")
-CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", "8123"))
-CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
-CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "")
-CLICKHOUSE_DATABASE = os.getenv("CLICKHOUSE_DATABASE", "fluiq")
-CLICKHOUSE_TRACE_TABLE = os.getenv("CLICKHOUSE_TRACE_TABLE", "traces")
-CLICKHOUSE_TRACE_COSTS_TABLE = os.getenv("CLICKHOUSE_TRACE_COSTS_TABLE", "trace_costs")
-CLICKHOUSE_EVALUATIONS_TABLE = os.getenv("CLICKHOUSE_EVALUATIONS_TABLE", "evaluations")
-
 
 class ClickHouseClient:
     """Async ClickHouse client for reading trace records."""
 
     def __init__(
         self,
-        host: str = CLICKHOUSE_HOST,
-        port: int = CLICKHOUSE_PORT,
-        username: str = CLICKHOUSE_USER,
-        password: str = CLICKHOUSE_PASSWORD,
-        database: str = CLICKHOUSE_DATABASE,
-        default_table: str = CLICKHOUSE_TRACE_TABLE,
+        host: str = config.CLICKHOUSE_HOST,
+        port: int = config.CLICKHOUSE_PORT,
+        username: str = config.CLICKHOUSE_USER,
+        password: str = config.CLICKHOUSE_PASSWORD,
+        database: str = config.CLICKHOUSE_DATABASE,
+        default_table: str = config.CLICKHOUSE_TRACE_TABLE,
     ) -> None:
         self.host = host
         self.port = port
@@ -83,8 +71,8 @@ class ClickHouseClient:
         if self._client is None:
             await self.start()
         target = table or self.default_table
-        costs_target = costs_table or CLICKHOUSE_TRACE_COSTS_TABLE
-        evals_target = evaluations_table or CLICKHOUSE_EVALUATIONS_TABLE
+        costs_target = costs_table or config.CLICKHOUSE_TRACE_COSTS_TABLE
+        evals_target = evaluations_table or config.CLICKHOUSE_EVALUATIONS_TABLE
         where = "t.organization_id = {org_id:UUID}"
         params: dict[str, Any] = {
             "org_id": str(organization_id),
@@ -195,7 +183,7 @@ class ClickHouseClient:
         return await self.count_rows(organization_id, self.default_table)
 
     async def count_evaluations(self, organization_id: uuid.UUID) -> int:
-        return await self.count_rows(organization_id, CLICKHOUSE_EVALUATIONS_TABLE)
+        return await self.count_rows(organization_id, config.CLICKHOUSE_EVALUATIONS_TABLE)
 
     async def fetch_cache_stats(
         self,
@@ -284,7 +272,7 @@ GROUP BY kind
         if self._client is None:
             await self.start()
         target = table or self.default_table
-        costs_target = costs_table or CLICKHOUSE_TRACE_COSTS_TABLE
+        costs_target = costs_table or config.CLICKHOUSE_TRACE_COSTS_TABLE
         params = {"org_id": str(organization_id), "limit": limit}
         # The root trace's own ingestion timestamp is a better "last_run"
         # signal than the leaf cost row's, but root may be missing (synthetic

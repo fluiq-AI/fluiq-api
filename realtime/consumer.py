@@ -11,7 +11,7 @@ already saw them.
 import asyncio
 import json
 import logging
-import os
+import config
 import uuid
 from typing import Optional
 
@@ -22,15 +22,12 @@ from .running_registry import running_registry
 
 logger = logging.getLogger(__name__)
 
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-KAFKA_TRACE_PERSISTED_TOPIC = os.getenv("KAFKA_TRACE_PERSISTED_TOPIC", "traces.persisted")
-
 
 class TraceConsumer:
     def __init__(
         self,
-        bootstrap_servers: str = KAFKA_BOOTSTRAP_SERVERS,
-        topic: str = KAFKA_TRACE_PERSISTED_TOPIC,
+        bootstrap_servers: str = config.KAFKA_BOOTSTRAP_SERVERS,
+        topic: str = config.KAFKA_TRACE_PERSISTED_TOPIC,
     ) -> None:
         self.bootstrap_servers = bootstrap_servers
         self.topic = topic
