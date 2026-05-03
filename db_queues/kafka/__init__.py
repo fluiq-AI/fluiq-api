@@ -15,8 +15,16 @@ class KafkaQueue:
         self,
         bootstrap_servers: str = config.KAFKA_BOOTSTRAP_SERVERS,
         default_topic: str = config.KAFKA_TRACE_TOPIC,
+        kafka_cafile = config.KAFKA_SSL_CA_FILE,
+        kafka_certfile = config.KAFKA_SSL_CERT_FILE,
+        kafka_keyfile = config.KAFKA_SSL_KEY_FILE,
+        kafka_security_protocol = config.KAFKA_SECURITY_PROTOCOL
     ) -> None:
         self.bootstrap_servers = bootstrap_servers
+        self.kafka_cafile = kafka_cafile
+        self.kafka_certfile = kafka_certfile
+        self.kafka_keyfile - kafka_keyfile
+        self.kafka_security_protocol = kafka_security_protocol
         self.default_topic = default_topic
         self._producer: Optional[AIOKafkaProducer] = None
 
@@ -24,15 +32,19 @@ class KafkaQueue:
         if self._producer is not None:
             return
         
+        print("File Values: ")
+        print(f"Kafka CA File: {self.kafka_cafile}")
+        logger.log(1, msg=f"Kafka CA File: {self.kafka_cafile}")
+
         context = create_ssl_context(
-            cafile=config.KAFKA_SSL_CA_FILE,
-            certfile=config.KAFKA_SSL_CERT_FILE,
-            keyfile=config.KAFKA_SSL_KEY_FILE
+            cafile=self.kafka_cafile,
+            certfile=self.kafka_certfile,
+            keyfile=self.kafka_keyfile
         )
-        
+
         self._producer = AIOKafkaProducer(
             bootstrap_servers=self.bootstrap_servers,
-            security_protocol=config.KAFKA_SECURITY_PROTOCOL,
+            security_protocol=self.kafka_security_protocol,
             ssl_context=context,
             value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
             key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else k,
