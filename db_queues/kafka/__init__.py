@@ -1,4 +1,4 @@
-import os
+from os import PathLike
 import json
 import logging
 from typing import Any, Optional
@@ -15,16 +15,15 @@ class KafkaQueue:
         self,
         bootstrap_servers: str = config.KAFKA_BOOTSTRAP_SERVERS,
         default_topic: str = config.KAFKA_TRACE_TOPIC,
-        kafka_cafile = config.KAFKA_SSL_CA_FILE,
-        kafka_certfile = config.KAFKA_SSL_CERT_FILE,
-        kafka_keyfile = config.KAFKA_SSL_KEY_FILE,
-        kafka_security_protocol = config.KAFKA_SECURITY_PROTOCOL
-
+        kafka_cafile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_CA_FILE,
+        kafka_certfile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_CERT_FILE,
+        kafka_keyfile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_KEY_FILE,
+        kafka_security_protocol: str = config.KAFKA_SECURITY_PROTOCOL
     ) -> None:
         
-        logger.info(f"Kafka CA File: {self.kafka_cafile}")
-        logger.info(f"Kafka Cert File: {self.kafka_certfile}")
-        logger.info(f"Kafka Key File: {self.kafka_keyfile}")
+        logger.info(f"Kafka CA File: {kafka_cafile}")
+        logger.info(f"Kafka Cert File: {kafka_certfile}")
+        logger.info(f"Kafka Key File: {kafka_keyfile}")
 
         self.bootstrap_servers = bootstrap_servers
         self.kafka_cafile = kafka_cafile
