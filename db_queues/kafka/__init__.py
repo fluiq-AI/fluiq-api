@@ -24,10 +24,10 @@ class KafkaQueue:
             return
         self._producer = AIOKafkaProducer(
             bootstrap_servers=self.bootstrap_servers,
-            security_protocol="SSL",
-            ssl_cafile="ca.pem",
-            ssl_certfile="service.cert",
-            ssl_keyfile="service.key",
+            security_protocol=config.KAFKA_SECURITY_PROTOCOL,
+            ssl_cafile=config.KAFKA_SSL_CA_FILE,
+            ssl_certfile=config.KAFKA_SSL_CERT_FILE,
+            ssl_keyfile=config.KAFKA_SSL_KEY_FILE,
             value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
             key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else k,
             acks="all",
