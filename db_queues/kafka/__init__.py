@@ -37,6 +37,10 @@ class KafkaQueue:
         logger.info(f"Kafka Cert File: {self.kafka_certfile} | {config.KAFKA_SSL_CERT_FILE}")
         logger.info(f"Kafka Key File: {self.kafka_keyfile} | {config.KAFKA_SSL_KEY_FILE}")
 
+        print(f"Kafka CA File: {self.kafka_cafile} | {config.KAFKA_SSL_CA_FILE}")
+        print(f"Kafka Cert File: {self.kafka_certfile} | {config.KAFKA_SSL_CERT_FILE}")
+        print(f"Kafka Key File: {self.kafka_keyfile} | {config.KAFKA_SSL_KEY_FILE}")
+
         context = create_ssl_context(
             cafile=self.kafka_cafile,
             certfile=self.kafka_certfile,
