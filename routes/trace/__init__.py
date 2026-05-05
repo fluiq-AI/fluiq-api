@@ -251,25 +251,30 @@ async def stream_traces(
         selected_prefix = match.prefix
 
     async def event_source():
-        subscription = trace_broker.subscribe(
-            organization_id=str(org_id),
-            api_key_prefix=selected_prefix,
-        )
-        try:
+        # ``trace_broker.subscribe`` is an async context manager yielding
+        # the underlying asyncio.Queue. We wrap ``queue.get()`` in
+        # ``wait_for`` for heartbeats; cancelling that coroutine on
+        # timeout doesn't damage the queue, so the loop keeps running for
+        # the lifetime of the connection.
+        async with trace_broker.subscribe(str(org_id)) as queue:
             yield {"event": "ready", "data": "{}"}
             while True:
                 if await request.is_disconnected():
                     break
                 try:
                     message = await asyncio.wait_for(
-                        subscription.__anext__(),
+                        queue.get(),
                         timeout=SSE_HEARTBEAT_SECONDS,
                     )
                 except asyncio.TimeoutError:
                     yield {"event": "ping", "data": "{}"}
                     continue
-                except StopAsyncIteration:
-                    break
+                if (
+                    selected_prefix is not None
+                    and isinstance(message, dict)
+                    and message.get("api_key_prefix") != selected_prefix
+                ):
+                    continue
                 # Route by ``kind`` so the frontend can prepend new rows
                 # ("trace"), merge cost / evaluation updates by trace_id
                 # ("trace.enriched"), or render an in-progress placeholder
@@ -287,7 +292,5 @@ async def stream_traces(
                     "event": event_name,
                     "data": json.dumps(message, default=str),
                 }
-        finally:
-            await subscription.aclose()
 
     return EventSourceResponse(event_source())

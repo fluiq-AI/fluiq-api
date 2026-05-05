@@ -14,6 +14,7 @@ fans out only to *its* connected clients.
 import asyncio
 import logging
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional
 
 logger = logging.getLogger(__name__)
@@ -70,26 +71,27 @@ class TraceBroker:
             if not subs:
                 self._subscribers.pop(organization_id, None)
 
+    @asynccontextmanager
     async def subscribe(
         self,
         organization_id: str,
-        api_key_prefix: Optional[str] = None,
-    ) -> AsyncIterator[dict]:
-        """Yield messages for `organization_id` until the caller cancels.
+    ) -> AsyncIterator[asyncio.Queue]:
+        """Yield a per-subscriber :class:`asyncio.Queue` for `organization_id`.
 
-        Pass `api_key_prefix` to filter to a single API key; messages for
-        other keys in the same org are skipped before they reach the
-        client. Cancellation (the SSE connection closing) drops the
-        subscription via the surrounding ``finally``.
+        Returning the queue directly (rather than an async generator over
+        it) lets callers wrap ``queue.get()`` in :func:`asyncio.wait_for`
+        for heartbeats without the generator-cancellation pitfall: when
+        ``wait_for`` cancels ``__anext__`` of an async generator, the
+        generator's frame is torn down and subsequent ``__anext__`` calls
+        raise :class:`StopAsyncIteration`, ending the stream after the
+        first idle timeout. With a plain queue the cancellation cancels
+        only the current ``get()`` coroutine and the queue itself remains
+        usable. Per-message API-key filtering lives in the caller.
         """
         q: asyncio.Queue = asyncio.Queue(maxsize=self._queue_maxsize)
         await self._add(organization_id, q)
         try:
-            while True:
-                message = await q.get()
-                if api_key_prefix is not None and message.get("api_key_prefix") != api_key_prefix:
-                    continue
-                yield message
+            yield q
         finally:
             await self._remove(organization_id, q)
 
