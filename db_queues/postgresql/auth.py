@@ -27,7 +27,7 @@ API_KEY_LIMITS: dict[str, int] = {
 async def email_exists(email: str) -> bool:
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
-            f"SELECT 1 FROM {config.config.POSTGRES_USER_TABLE} WHERE email = $1",
+            f"SELECT 1 FROM {config.POSTGRES_USER_TABLE} WHERE email = $1",
             email,
         )
         return row is not None
