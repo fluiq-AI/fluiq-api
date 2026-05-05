@@ -192,8 +192,12 @@ async def forgot_password(
     background task so the response is fast and resilient to SMTP delays.
     """
     email = _normalize_email(payload.email)
+    
+    logger.info("[auth] forgot-password attempt for: %s", email)
+
     result = await get_user_by_email(email)
     if result is not None:
+        logger.info("[auth] user found, queueing email")
         user, _ = result
         otp = _generate_otp(config.PASSWORD_RESET_OTP_LENGTH)
         otp_hash = _hash_password(otp)
@@ -216,6 +220,7 @@ async def forgot_password(
             expires_in_minutes=config.PASSWORD_RESET_EXPIRE_MINUTES,
         )
     else:
+        logger.warning("[auth] no user found for email: %s", email) 
         logger.info("[auth] forgot-password requested for unknown email")
     return ForgotPasswordResponse(ok=True)
 

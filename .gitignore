@@ -4,3 +4,4 @@ output.json
 .env
 .env.development
 .env.production
+scripts
