@@ -95,3 +95,11 @@ class RefreshResponse(BaseModel):
 
 class LogoutResponse(BaseModel):
     ok: bool = True
+
+
+class ForgotPasswordResponse(BaseModel):
+    ok: bool = True
+
+
+class ResetPasswordResponse(BaseModel):
+    ok: bool = True

@@ -17,3 +17,13 @@ class RefreshPayload(BaseModel):
 
 class LogoutPayload(BaseModel):
     refresh_token: str
+
+
+class ForgotPasswordPayload(BaseModel):
+    email: str
+
+
+class ResetPasswordPayload(BaseModel):
+    email: str
+    otp: str
+    new_password: str

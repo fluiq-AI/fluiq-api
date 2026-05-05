@@ -111,6 +111,72 @@ async def is_refresh_token_revoked(jti: str) -> bool:
         return row is not None
 
 
+async def update_user_password(user_id: uuid.UUID, hashed_password: str) -> bool:
+    async with postgres_client.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE {config.POSTGRES_USER_TABLE} "
+            f"SET hashed_password = $2, updated_at = NOW() "
+            f"WHERE user_id = $1 RETURNING user_id",
+            user_id, hashed_password,
+        )
+    return row is not None
+
+
+async def create_password_reset(
+    user_id: uuid.UUID, otp_hash: str, expires_at: datetime
+) -> uuid.UUID:
+    """Insert a new password reset token and invalidate any prior unused
+    tokens for the same user. Returns the new token_id."""
+    token_id = uuid.uuid4()
+    async with postgres_client.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                f"UPDATE {config.POSTGRES_PASSWORD_RESET_TABLE} "
+                f"SET used_at = NOW() "
+                f"WHERE user_id = $1 AND used_at IS NULL",
+                user_id,
+            )
+            await conn.execute(
+                f"INSERT INTO {config.POSTGRES_PASSWORD_RESET_TABLE} "
+                f"(token_id, user_id, otp_hash, expires_at) "
+                f"VALUES ($1, $2, $3, $4)",
+                token_id, user_id, otp_hash, expires_at,
+            )
+    return token_id
+
+
+async def fetch_active_password_reset(
+    user_id: uuid.UUID,
+) -> Optional[tuple[uuid.UUID, str, datetime]]:
+    """Return (token_id, otp_hash, expires_at) of the latest unused, unexpired
+    reset token for the user, or None."""
+    async with postgres_client.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT token_id, otp_hash, expires_at "
+            f"FROM {config.POSTGRES_PASSWORD_RESET_TABLE} "
+            f"WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW() "
+            f"ORDER BY created_at DESC LIMIT 1",
+            user_id,
+        )
+    if row is None:
+        return None
+    return row["token_id"], row["otp_hash"], row["expires_at"]
+
+
+async def consume_password_reset(token_id: uuid.UUID) -> bool:
+    """Atomically mark a reset token as used. Returns True if it was still
+    unused and unexpired at the moment of consumption."""
+    async with postgres_client.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE {config.POSTGRES_PASSWORD_RESET_TABLE} "
+            f"SET used_at = NOW() "
+            f"WHERE token_id = $1 AND used_at IS NULL AND expires_at > NOW() "
+            f"RETURNING token_id",
+            token_id,
+        )
+    return row is not None
+
+
 async def get_organization(org_id: uuid.UUID) -> Optional[OrganizationModel]:
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
@@ -245,6 +311,10 @@ __all__ = [
     "get_user_by_email",
     "revoke_refresh_token",
     "is_refresh_token_revoked",
+    "update_user_password",
+    "create_password_reset",
+    "fetch_active_password_reset",
+    "consume_password_reset",
     "get_organization",
     "get_org_tier",
     "resolve_api_key",
@@ -253,5 +323,6 @@ __all__ = [
     "config.POSTGRES_USER_TABLE",
     "config.POSTGRES_ORG_TABLE",
     "config.POSTGRES_REVOKED_TOKEN_TABLE",
+    "config.POSTGRES_PASSWORD_RESET_TABLE",
     "API_KEY_LIMITS",
 ]

@@ -35,6 +35,19 @@ CREATE TABLE IF NOT EXISTS revoked_refresh_tokens (
 CREATE INDEX IF NOT EXISTS idx_revoked_refresh_tokens_expires_at
     ON revoked_refresh_tokens(expires_at);
 
+CREATE TABLE IF NOT EXISTS password_resets (
+    token_id   UUID PRIMARY KEY,
+    user_id    UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    otp_hash   TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at    TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_password_resets_user_id
+    ON password_resets(user_id);
+CREATE INDEX IF NOT EXISTS idx_password_resets_expires_at
+    ON password_resets(expires_at);
+
 CREATE TABLE IF NOT EXISTS model_prices (
     id                                       BIGSERIAL PRIMARY KEY,
     provider                                 TEXT NOT NULL,

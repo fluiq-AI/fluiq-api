@@ -1,19 +1,29 @@
-from datetime import datetime, timezone
+import logging
+import secrets
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 
+import config
 from db_queues.postgresql.auth import (
+    consume_password_reset,
+    create_password_reset,
     email_exists,
+    fetch_active_password_reset,
     get_user_by_email,
     is_refresh_token_revoked,
     register_user,
     revoke_refresh_token,
+    update_user_password,
 )
+from shared.email import email_service
 from shared.model import (
+    ForgotPasswordResponse,
     LoginResponse,
     LogoutResponse,
     RefreshResponse,
     RegisterResponse,
+    ResetPasswordResponse,
     UserPublic,
 )
 
@@ -26,7 +36,16 @@ from .helper import (
     _validate_password,
     _verify_password,
 )
-from .model import LoginPayload, LogoutPayload, RefreshPayload, RegisterPayload
+from .model import (
+    ForgotPasswordPayload,
+    LoginPayload,
+    LogoutPayload,
+    RefreshPayload,
+    RegisterPayload,
+    ResetPasswordPayload,
+)
+
+logger = logging.getLogger(__name__)
 
 auth_router = APIRouter()
 
@@ -151,3 +170,84 @@ async def logout(payload: LogoutPayload) -> LogoutResponse:
     expires_at = datetime.fromtimestamp(claims["exp"], tz=timezone.utc)
     await revoke_refresh_token(jti=jti, expires_at=expires_at)
     return LogoutResponse(ok=True)
+
+
+def _generate_otp(length: int) -> str:
+    upper = 10 ** length
+    return f"{secrets.randbelow(upper):0{length}d}"
+
+
+@auth_router.post(
+    "/forgot-password",
+    status_code=status.HTTP_200_OK,
+    response_model=ForgotPasswordResponse,
+)
+async def forgot_password(
+    payload: ForgotPasswordPayload, background_tasks: BackgroundTasks
+) -> ForgotPasswordResponse:
+    """Issue a one-time reset code for the email if it exists.
+
+    The response is identical whether or not the email is registered to
+    avoid leaking account existence. Email delivery is dispatched in a
+    background task so the response is fast and resilient to SMTP delays.
+    """
+    email = _normalize_email(payload.email)
+    result = await get_user_by_email(email)
+    if result is not None:
+        user, _ = result
+        otp = _generate_otp(config.PASSWORD_RESET_OTP_LENGTH)
+        otp_hash = _hash_password(otp)
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            minutes=config.PASSWORD_RESET_EXPIRE_MINUTES
+        )
+        await create_password_reset(
+            user_id=user.user_id, otp_hash=otp_hash, expires_at=expires_at
+        )
+        reset_url = (
+            f"{config.FRONTEND_BASE_URL}/reset-password"
+            f"?email={email}&otp={otp}"
+        )
+        background_tasks.add_task(
+            email_service.send_password_reset_email,
+            to=email,
+            name=user.name,
+            otp=otp,
+            reset_url=reset_url,
+            expires_in_minutes=config.PASSWORD_RESET_EXPIRE_MINUTES,
+        )
+    else:
+        logger.info("[auth] forgot-password requested for unknown email")
+    return ForgotPasswordResponse(ok=True)
+
+
+@auth_router.post(
+    "/reset-password",
+    status_code=status.HTTP_200_OK,
+    response_model=ResetPasswordResponse,
+)
+async def reset_password(payload: ResetPasswordPayload) -> ResetPasswordResponse:
+    email = _normalize_email(payload.email)
+    _validate_password(payload.new_password)
+
+    result = await get_user_by_email(email)
+    invalid = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Invalid or expired reset code",
+    )
+    if result is None:
+        raise invalid
+    user, _ = result
+
+    active = await fetch_active_password_reset(user.user_id)
+    if active is None:
+        raise invalid
+    token_id, otp_hash, _expires_at = active
+    if not _verify_password(payload.otp, otp_hash):
+        raise invalid
+    if not await consume_password_reset(token_id):
+        raise invalid
+
+    await update_user_password(
+        user_id=user.user_id, hashed_password=_hash_password(payload.new_password)
+    )
+    return ResetPasswordResponse(ok=True)
