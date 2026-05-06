@@ -1,9 +1,9 @@
 import asyncio
 import logging
-import smtplib
-from email.message import EmailMessage
+import requests
 from email.utils import formataddr
 from typing import Optional
+import re
 
 import config
 
@@ -11,33 +11,19 @@ logger = logging.getLogger(__name__)
 
 
 class EmailService:
-    """Async wrapper around stdlib smtplib for transactional emails.
-
-    When ``SMTP_HOST`` is empty the message body is logged instead of
-    being delivered, so local development works without an SMTP server.
-    """
-
     def __init__(
         self,
-        host: str = config.SMTP_HOST,
-        port: int = config.SMTP_PORT,
-        username: str = config.SMTP_USER,
-        password: str = config.SMTP_PASSWORD,
-        use_tls: bool = config.SMTP_USE_TLS,
+        api_key: str = config.RESEND_API_KEY,
         from_email: str = config.SMTP_FROM_EMAIL,
         from_name: str = config.SMTP_FROM_NAME,
     ) -> None:
-        self.host = host
-        self.port = port
-        self.username = username
-        self.password = password
-        self.use_tls = use_tls
+        self.api_key = api_key
         self.from_email = from_email
         self.from_name = from_name
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.host)
+        return bool(self.api_key)
 
     async def send_email(
         self,
@@ -46,40 +32,32 @@ class EmailService:
         html: str,
         text: Optional[str] = None,
     ) -> None:
-        message = EmailMessage()
-        message["From"] = formataddr((self.from_name, self.from_email))
-        message["To"] = to
-        message["Subject"] = subject
-        message.set_content(text or _html_to_text(html))
-        message.add_alternative(html, subtype="html")
-
         if not self.is_configured:
             logger.info(
-                "[EMAIL][dev] SMTP not configured; would send to=%s subject=%r\n%s",
+                "[EMAIL][dev] Resend not configured; would send to=%s subject=%r\n%s",
                 to, subject, text or html,
             )
             return
 
-        await asyncio.to_thread(self._send_sync, message)
+        await asyncio.to_thread(self._send_sync, to, subject, html, text)
 
-    def _send_sync(self, message: EmailMessage) -> None:
+    def _send_sync(self, to: str, subject: str, html: str, text: Optional[str]) -> None:
         try:
-            if self.port == 465:
-                with smtplib.SMTP_SSL(self.host, self.port, timeout=15) as smtp:
-                    if self.username:
-                        smtp.login(self.username, self.password)
-                    smtp.send_message(message)
-            else:
-                with smtplib.SMTP(self.host, self.port, timeout=15) as smtp:
-                    smtp.ehlo()
-                    if self.use_tls:
-                        smtp.starttls()
-                        smtp.ehlo()
-                    if self.username:
-                        smtp.login(self.username, self.password)
-                    smtp.send_message(message)
-            logger.info("[EMAIL] sent to=%s subject=%r", message["To"], message["Subject"])
-        except Exception as exc:
+            response = requests.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={
+                    "from": formataddr((self.from_name, self.from_email)),
+                    "to": [to],
+                    "subject": subject,
+                    "html": html,
+                    "text": text or _html_to_text(html),
+                },
+                timeout=15,
+            )
+            response.raise_for_status()
+            logger.info("[EMAIL] sent to=%s subject=%r", to, subject)
+        except requests.HTTPError as exc:
             logger.exception("[EMAIL] delivery failed: %s", exc)
             raise
 
@@ -116,11 +94,9 @@ class EmailService:
 
 
 def _html_to_text(html: str) -> str:
-    import re
     return re.sub(r"<[^>]+>", "", html).strip()
 
 
 email_service = EmailService()
-
 
 __all__ = ["EmailService", "email_service"]

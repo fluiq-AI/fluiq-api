@@ -29,13 +29,9 @@ POSTGRES_PASSWORD_RESET_TABLE = os.getenv(
     "POSTGRES_PASSWORD_RESET_TABLE", "password_resets"
 )
 
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() in ("1", "true", "yes")
 SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "no-reply@getfluiq.com")
 SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Fluiq")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 
 PASSWORD_RESET_OTP_LENGTH = int(os.getenv("PASSWORD_RESET_OTP_LENGTH", "6"))
 PASSWORD_RESET_EXPIRE_MINUTES = int(os.getenv("PASSWORD_RESET_EXPIRE_MINUTES", "15"))
