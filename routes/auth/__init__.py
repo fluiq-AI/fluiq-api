@@ -286,8 +286,8 @@ def _build_session_redirect(user, organization, user_id: str, org_id: str) -> Re
     refresh_token, refresh_expires_in = _create_refresh_token(user_id=user_id, org_id=org_id)
 
     session = {
-        "user": user.model_dump(),
-        "organization": organization.model_dump(),
+        "user": user.model_dump(mode="json"),
+        "organization": organization.model_dump(mode="json"),
         "access_token": access_token,
         "token_type": "bearer",
         "expires_in": expires_in,
