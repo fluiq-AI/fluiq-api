@@ -1,7 +1,7 @@
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
-
+from urllib.parse import quote
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 
 import config
@@ -209,7 +209,7 @@ async def forgot_password(
         )
         reset_url = (
             f"{config.FRONTEND_BASE_URL}/reset-password"
-            f"?email={email}&otp={otp}"
+            f"?email={quote(email)}&otp={otp}"
         )
         background_tasks.add_task(
             email_service.send_password_reset_email,
