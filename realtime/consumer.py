@@ -16,8 +16,8 @@ import uuid
 from typing import Optional
 
 from aiokafka import AIOKafkaConsumer
-from aiokafka.helpers import create_ssl_context
-from os import PathLike
+# from aiokafka.helpers import create_ssl_context
+# from os import PathLike
 from .broker import trace_broker
 from .running_registry import running_registry
 
@@ -28,17 +28,17 @@ class TraceConsumer:
     def __init__(
         self,
         bootstrap_servers: str = config.KAFKA_BOOTSTRAP_SERVERS,
-        kafka_cafile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_CA_FILE,
-        kafka_certfile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_CERT_FILE,
-        kafka_keyfile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_KEY_FILE,
-        kafka_security_protocol: str = config.KAFKA_SECURITY_PROTOCOL,
+        # kafka_cafile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_CA_FILE,
+        # kafka_certfile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_CERT_FILE,
+        # kafka_keyfile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_KEY_FILE,
+        # kafka_security_protocol: str = config.KAFKA_SECURITY_PROTOCOL,
         topic: str = config.KAFKA_TRACE_PERSISTED_TOPIC,
     ) -> None:
         self.bootstrap_servers = bootstrap_servers
-        self.kafka_cafile = kafka_cafile
-        self.kafka_certfile = kafka_certfile
-        self.kafka_keyfile = kafka_keyfile
-        self.kafka_security_protocol = kafka_security_protocol
+        # self.kafka_cafile = kafka_cafile
+        # self.kafka_certfile = kafka_certfile
+        # self.kafka_keyfile = kafka_keyfile
+        # self.kafka_security_protocol = kafka_security_protocol
         self.topic = topic
         self._consumer: Optional[AIOKafkaConsumer] = None
         self._task: Optional[asyncio.Task] = None
@@ -48,16 +48,16 @@ class TraceConsumer:
         if self._consumer is not None:
             return
         
-        context = create_ssl_context(
-            cafile=self.kafka_cafile,
-            certfile=self.kafka_certfile,
-            keyfile=self.kafka_keyfile
-        )
+        # context = create_ssl_context(
+        #     cafile=self.kafka_cafile,
+        #     certfile=self.kafka_certfile,
+        #     keyfile=self.kafka_keyfile
+        # )
         self._consumer = AIOKafkaConsumer(
             self.topic,
             bootstrap_servers=self.bootstrap_servers,
-            security_protocol=self.kafka_security_protocol,
-            ssl_context=context,
+            # security_protocol=self.kafka_security_protocol,
+            # ssl_context=context,
             group_id=self._group_id,
             value_deserializer=lambda b: json.loads(b.decode("utf-8")),
             enable_auto_commit=False,

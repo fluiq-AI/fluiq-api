@@ -5,23 +5,16 @@ services:
       dockerfile: Dockerfile
     container_name: fluiq-api
     ports:
-      - "8000:8000"
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_TRACE_TOPIC: traces
-      KAFKA_EVAL_TOPIC: evaluations
-      POSTGRES_DSN: postgresql://fluiq:fluiq@postgres:5432/fluiq
-      POSTGRES_USER_TABLE: users
-      JWT_SECRET: asjdhasjxnhsagdsdskhfaskdnua21eysadbsacnldsfgjs
-      JWT_ALGORITHM: HS256
-      JWT_EXPIRE_MINUTES: 60
-      JWT_REFRESH_EXPIRE_DAYS: 7
-      CLICKHOUSE_HOST: clickhouse
-      CLICKHOUSE_PORT: 8123
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ""
-      CLICKHOUSE_DATABASE: fluiq
-      CLICKHOUSE_TRACE_TABLE: traces
+      - "8080:8080"
+    env_file:
+      - .env.development
+    depends_on:
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
+      postgres:
+        condition: service_started
     volumes:
       - .:/app
     networks:
