@@ -1,9 +1,9 @@
 import hashlib
-import os
 import secrets
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+import bcrypt
 
 import asyncpg
 import config
@@ -304,6 +304,31 @@ async def delete_api_key(org_id: uuid.UUID, key_id: uuid.UUID) -> bool:
             )
     return row is not None
 
+async def find_or_create_oauth_user(
+    name: str,
+    email: str,
+) -> tuple | None:
+    """
+    Look up a user by email. If found, return them.
+    If not, register them with a random secure password (OAuth users never use it).
+    Returns (User, Organization) or None on failure.
+    """
+    from db_queues.postgresql.auth import get_user_by_email, register_user
+
+    result = await get_user_by_email(email)
+    if result is not None:
+        return result  # existing user — just log them in
+
+    # New user — create account with random password they'll never use
+    random_password = secrets.token_urlsafe(32)
+    hashed = bcrypt.hashpw(random_password.encode(), bcrypt.gensalt()).decode()
+
+    return await register_user(
+        name=name,
+        email=email,
+        hashed_password=hashed,
+        user_type="Free",
+    )
 
 __all__ = [
     "email_exists",

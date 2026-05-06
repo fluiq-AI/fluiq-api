@@ -1,10 +1,15 @@
-import logging
-import secrets
-from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
-
+import json
+import httpx
+import base64
 import config
+import secrets
+import logging
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote, urlencode
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Cookie, Request
+from fastapi.responses import RedirectResponse
+
+
 from db_queues.postgresql.auth import (
     consume_password_reset,
     create_password_reset,
@@ -15,6 +20,7 @@ from db_queues.postgresql.auth import (
     register_user,
     revoke_refresh_token,
     update_user_password,
+    find_or_create_oauth_user
 )
 from shared.email import email_service
 from shared.model import (
@@ -256,3 +262,247 @@ async def reset_password(payload: ResetPasswordPayload) -> ResetPasswordResponse
         user_id=user.user_id, hashed_password=_hash_password(payload.new_password)
     )
     return ResetPasswordResponse(ok=True)
+
+# ── OAUTH ────────────────────────────────────────────────────────────────────
+
+GOOGLE_AUTH_URL   = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL  = "https://oauth2.googleapis.com/token"
+GOOGLE_USER_URL   = "https://www.googleapis.com/oauth2/v3/userinfo"
+
+GITHUB_AUTH_URL   = "https://github.com/login/oauth/authorize"
+GITHUB_TOKEN_URL  = "https://github.com/login/oauth/access_token"
+GITHUB_USER_URL   = "https://api.github.com/user"
+GITHUB_EMAILS_URL = "https://api.github.com/user/emails"
+
+COOKIE_NAME = "oauth_state"
+COOKIE_MAX_AGE = 600 
+
+def _build_session_redirect(user, organization, user_id: str, org_id: str) -> RedirectResponse:
+    """
+    Build a redirect to the frontend /auth/callback with the full session
+    encoded as base64 JSON so the frontend can hydrate the Redux store.
+    """
+    access_token, expires_in = _create_access_token(user_id=user_id, org_id=org_id)
+    refresh_token, refresh_expires_in = _create_refresh_token(user_id=user_id, org_id=org_id)
+
+    session = {
+        "user": user.model_dump(),
+        "organization": organization.model_dump(),
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+        "refresh_token": refresh_token,
+        "refresh_expires_in": refresh_expires_in,
+    }
+
+    encoded = base64.urlsafe_b64encode(json.dumps(session).encode()).decode()
+    url = f"{config.FRONTEND_BASE_URL}/auth/callback?session={encoded}"
+    return RedirectResponse(url=url, status_code=302)
+
+
+def _error_redirect(message: str) -> RedirectResponse:
+    from urllib.parse import quote
+    url = f"{config.FRONTEND_BASE_URL}/login?error={quote(message)}"
+    return RedirectResponse(url=url, status_code=302)
+
+
+@auth_router.get("/oauth/google")
+async def google_login():
+    if not config.GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=501, detail="Google OAuth not configured")
+
+    state = secrets.token_urlsafe(32)
+    callback_url = f"{config.API_BASE_URL}/auth/oauth/google/callback"
+
+    params = {
+        "client_id": config.GOOGLE_CLIENT_ID,
+        "redirect_uri": callback_url,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "access_type": "offline",
+        "prompt": "select_account",
+    }
+
+    response = RedirectResponse(
+        url=f"{GOOGLE_AUTH_URL}?{urlencode(params)}",
+        status_code=302,
+    )
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=state,
+        max_age=COOKIE_MAX_AGE,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
+    return response
+
+
+@auth_router.get("/oauth/google/callback")
+async def google_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    oauth_state: str | None = Cookie(default=None),
+):
+    if error or not code:
+        return _error_redirect("Google sign-in was cancelled")
+
+    if not state or state != oauth_state:
+        return _error_redirect("Invalid OAuth state — please try again")
+
+    callback_url = f"{config.API_BASE_URL}/auth/oauth/google/callback"
+
+    async with httpx.AsyncClient() as client:
+        # Exchange code for tokens
+        token_resp = await client.post(GOOGLE_TOKEN_URL, data={
+            "code": code,
+            "client_id": config.GOOGLE_CLIENT_ID,
+            "client_secret": config.GOOGLE_CLIENT_SECRET,
+            "redirect_uri": callback_url,
+            "grant_type": "authorization_code",
+        })
+        if token_resp.status_code != 200:
+            logger.error("[oauth/google] token exchange failed: %s", token_resp.text)
+            return _error_redirect("Google authentication failed")
+
+        google_access_token = token_resp.json().get("access_token")
+
+        # Fetch user info
+        user_resp = await client.get(
+            GOOGLE_USER_URL,
+            headers={"Authorization": f"Bearer {google_access_token}"},
+        )
+        if user_resp.status_code != 200:
+            return _error_redirect("Could not fetch Google profile")
+
+        profile = user_resp.json()
+
+    email = profile.get("email")
+    name = profile.get("name") or profile.get("email", "").split("@")[0]
+
+    if not email:
+        return _error_redirect("Google account has no email address")
+
+    result = await find_or_create_oauth_user(name=name, email=email)
+    if result is None:
+        return _error_redirect("Could not create account")
+
+    user, organization = result
+    resp = _build_session_redirect(
+        user=user,
+        organization=organization,
+        user_id=str(user.user_id),
+        org_id=str(user.org_id),
+    )
+    resp.delete_cookie(COOKIE_NAME)
+    return resp
+
+
+# ── GitHub ────────────────────────────────────────────────────────────────────
+
+@auth_router.get("/oauth/github")
+async def github_login():
+    if not config.GITHUB_CLIENT_ID:
+        raise HTTPException(status_code=501, detail="GitHub OAuth not configured")
+
+    state = secrets.token_urlsafe(32)
+    callback_url = f"{config.API_BASE_URL}/auth/oauth/github/callback"
+
+    params = {
+        "client_id": config.GITHUB_CLIENT_ID,
+        "redirect_uri": callback_url,
+        "scope": "read:user user:email",
+        "state": state,
+    }
+
+    response = RedirectResponse(
+        url=f"{GITHUB_AUTH_URL}?{urlencode(params)}",
+        status_code=302,
+    )
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=state,
+        max_age=COOKIE_MAX_AGE,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
+    return response
+
+
+@auth_router.get("/oauth/github/callback")
+async def github_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    oauth_state: str | None = Cookie(default=None),
+):
+    if error or not code:
+        return _error_redirect("GitHub sign-in was cancelled")
+
+    if not state or state != oauth_state:
+        return _error_redirect("Invalid OAuth state — please try again")
+
+    callback_url = f"{config.API_BASE_URL}/auth/oauth/github/callback"
+
+    async with httpx.AsyncClient() as client:
+        # Exchange code for access token
+        token_resp = await client.post(
+            GITHUB_TOKEN_URL,
+            data={
+                "client_id": config.GITHUB_CLIENT_ID,
+                "client_secret": config.GITHUB_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": callback_url,
+            },
+            headers={"Accept": "application/json"},
+        )
+        if token_resp.status_code != 200:
+            logger.error("[oauth/github] token exchange failed: %s", token_resp.text)
+            return _error_redirect("GitHub authentication failed")
+
+        github_access_token = token_resp.json().get("access_token")
+        auth_header = {"Authorization": f"Bearer {github_access_token}"}
+
+        # Fetch profile
+        user_resp = await client.get(GITHUB_USER_URL, headers=auth_header)
+        if user_resp.status_code != 200:
+            return _error_redirect("Could not fetch GitHub profile")
+
+        profile = user_resp.json()
+        email = profile.get("email")
+
+        # GitHub may not expose email in profile — fetch from emails endpoint
+        if not email:
+            emails_resp = await client.get(GITHUB_EMAILS_URL, headers=auth_header)
+            if emails_resp.status_code == 200:
+                emails = emails_resp.json()
+                primary = next(
+                    (e["email"] for e in emails if e.get("primary") and e.get("verified")),
+                    None,
+                )
+                email = primary
+
+    if not email:
+        return _error_redirect(
+            "Your GitHub account has no verified email. "
+            "Please add a public email in GitHub settings."
+        )
+
+    name = profile.get("name") or profile.get("login") or email.split("@")[0]
+
+    result = await find_or_create_oauth_user(name=name, email=email)
+    if result is None:
+        return _error_redirect("Could not create account")
+
+    user, organization = result
+    resp = _build_session_redirect(
+        user=user,
+        organization=organization,
+        user_id=str(user.user_id),
+        org_id=str(user.org_id),
+    )
+    resp.delete_cookie(COOKIE_NAME)
+    return resp
