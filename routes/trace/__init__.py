@@ -121,6 +121,9 @@ async def ingestion(payload: IngestPayload):
 async def list_traces(
     session: dict = Depends(get_current_session),
     key_id: Optional[uuid.UUID] = Query(default=None),
+    agent_key: Optional[str] = Query(default=None),
+    agent_kind: Optional[str] = Query(default=None),
+    root_trace_id: Optional[uuid.UUID] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
 ) -> TraceListResponse:
@@ -128,7 +131,8 @@ async def list_traces(
 
     When `key_id` is omitted, traces from all of the org's API keys are
     returned. When provided, results are filtered to that key (404 if the
-    key does not belong to the org).
+    key does not belong to the org). When `agent_key` and `agent_kind` are
+    provided, only root traces for that agent are returned.
     """
     org_id = uuid.UUID(session["org_id"])
     organization = await get_organization(org_id)
@@ -154,6 +158,9 @@ async def list_traces(
     rows = await clickhouse_client.fetch_traces(
         organization_id=org_id,
         api_key_prefix=selected_prefix,
+        agent_key=agent_key,
+        agent_kind=agent_kind,
+        root_trace_id=root_trace_id,
         limit=limit,
         offset=offset,
     )

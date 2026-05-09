@@ -8,13 +8,6 @@ services:
       - "8080:8080"
     env_file:
       - .env.development
-    depends_on:
-      kafka:
-        condition: service_healthy
-      clickhouse:
-        condition: service_started
-      postgres:
-        condition: service_started
     volumes:
       - .:/app
     networks:

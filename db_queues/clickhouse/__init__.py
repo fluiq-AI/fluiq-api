@@ -53,6 +53,9 @@ class ClickHouseClient:
         self,
         organization_id: uuid.UUID,
         api_key_prefix: Optional[str] = None,
+        agent_key: Optional[str] = None,
+        agent_kind: Optional[str] = None,
+        root_trace_id: Optional[uuid.UUID] = None,
         limit: int = 100,
         offset: int = 0,
         table: Optional[str] = None,
@@ -82,6 +85,27 @@ class ClickHouseClient:
         if api_key_prefix is not None:
             where += " AND t.api_key_prefix = {prefix:String}"
             params["prefix"] = api_key_prefix
+        if root_trace_id is not None:
+            where += " AND t.root_trace_id = {root_trace_id:UUID}"
+            params["root_trace_id"] = str(root_trace_id)
+        if agent_key is not None:
+            where += " AND t.trace_id = t.root_trace_id"
+            params["agent_key"] = agent_key
+            if agent_kind == "function":
+                where += " AND JSONExtractString(toString(t.event), 'function') = {agent_key:String}"
+            elif agent_kind == "chain":
+                where += " AND JSONExtractString(toString(t.event), 'name') = {agent_key:String}"
+            elif agent_kind == "langgraph_node":
+                where += " AND JSONExtractString(JSONExtractRaw(toString(t.event), 'langgraph'), 'langgraph_node') = {agent_key:String}"
+            elif agent_kind == "llm":
+                where += " AND concat(c.provider, ':', c.model) = {agent_key:String}"
+            else:
+                where += (
+                    " AND ("
+                    "JSONExtractString(toString(t.event), 'function') = {agent_key:String}"
+                    " OR JSONExtractString(toString(t.event), 'name') = {agent_key:String}"
+                    ")"
+                )
         result = await self._client.query(
             f"SELECT t.api_key_prefix, t.event, t.ingested_at, "
             f"       c.total_cost, c.currency, "
@@ -258,75 +282,68 @@ GROUP BY kind
         table: Optional[str] = None,
         costs_table: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """Aggregate cost/latency/tokens per "agent" across all history.
+        """Aggregate cost/latency/tokens per agent across all history.
 
-        An agent is identified by the *root* trace's stable name:
-          1. event.function           — @trace-decorated entrypoints
-          2. event.name               — LangChain root chain / runnable name
-          3. event.langgraph.langgraph_node — LangGraph entry node
-          4. <integration>:<model>    — fallback for un-decorated LLM calls
-                                        (chain_id has no matching trace row)
+        An agent is any root trace that has an explicit identifier:
+          1. event.function                     — @trace-decorated entrypoints
+          2. event.name                         — LangChain root chain / runnable
+          3. event.langgraph.langgraph_node     — LangGraph entry node
 
-        ``runs`` counts distinct ``root_trace_id``s — one per agent invocation.
+        Raw un-decorated LLM calls (provider:model only) are excluded — they
+        are not agents, just leaf cost records.
+
+        Cost and token metrics come from a LEFT JOIN on trace_costs so agents
+        without LLM calls (e.g. pure function traces) still appear with 0 cost.
+        ``runs`` counts distinct root traces — one per agent invocation.
         """
         if self._client is None:
             await self.start()
         target = table or self.default_table
         costs_target = costs_table or config.CLICKHOUSE_TRACE_COSTS_TABLE
         params = {"org_id": str(organization_id), "limit": limit}
-        # The root trace's own ingestion timestamp is a better "last_run"
-        # signal than the leaf cost row's, but root may be missing (synthetic
-        # chain_id) — fall back to the cost row's ingested_at via greatest().
         result = await self._client.query(
             f"""
-WITH joined AS (
+WITH roots AS (
     SELECT
-        c.organization_id            AS organization_id,
-        c.root_trace_id              AS root_trace_id,
-        c.input_tokens               AS leaf_input_tokens,
-        c.cached_input_tokens        AS leaf_cached_input_tokens,
-        c.output_tokens              AS leaf_output_tokens,
-        c.total_cost                 AS leaf_total_cost,
-        c.provider                   AS leaf_provider,
-        c.model                      AS leaf_model,
-        c.ingested_at                AS leaf_ingested_at,
-        t.ingested_at                AS root_ingested_at,
-        JSONExtractString(toString(t.event), 'function')    AS root_function,
-        JSONExtractString(toString(t.event), 'name')        AS root_name,
-        JSONExtractString(toString(t.event), 'integration') AS root_integration,
-        JSONExtractString(JSONExtractRaw(toString(t.event), 'langgraph'),
-                          'langgraph_node')                 AS root_lg_node,
-        JSONExtractFloat(toString(t.event), 'latency')      AS root_latency
-    FROM {costs_target} AS c
-    LEFT JOIN {target} AS t
-        ON c.organization_id = t.organization_id
-       AND c.root_trace_id   = t.trace_id
-    WHERE c.organization_id = {{org_id:UUID}}
+        trace_id,
+        ingested_at,
+        JSONExtractString(toString(event), 'function')                                    AS fn,
+        JSONExtractString(toString(event), 'name')                                        AS nm,
+        JSONExtractString(toString(event), 'integration')                                 AS intg,
+        JSONExtractString(JSONExtractRaw(toString(event), 'langgraph'), 'langgraph_node') AS lg_node,
+        JSONExtractFloat(toString(event), 'latency')                                      AS latency
+    FROM {target}
+    WHERE organization_id = {{org_id:UUID}}
+      AND trace_id = root_trace_id
+      AND (
+            JSONExtractString(toString(event), 'function') != ''
+         OR JSONExtractString(toString(event), 'name') != ''
+         OR JSONExtractString(JSONExtractRaw(toString(event), 'langgraph'), 'langgraph_node') != ''
+      )
+),
+costs AS (
+    SELECT
+        root_trace_id,
+        sum(total_cost)                                          AS run_cost,
+        sum(input_tokens + cached_input_tokens + output_tokens) AS run_tokens
+    FROM {costs_target}
+    WHERE organization_id = {{org_id:UUID}}
+    GROUP BY root_trace_id
 )
 SELECT
-    multiIf(
-        root_function   != '', root_function,
-        root_name       != '', root_name,
-        root_lg_node    != '', root_lg_node,
-        concat(leaf_provider, ':', leaf_model)
-    )                                                AS agent_key,
-    multiIf(
-        root_function   != '', 'function',
-        root_name       != '', 'chain',
-        root_lg_node    != '', 'langgraph_node',
-        'llm'
-    )                                                AS agent_kind,
-    if(root_integration != '', root_integration, leaf_provider) AS integration,
-    uniqExact(root_trace_id)                         AS runs,
-    sum(leaf_total_cost)                             AS total_cost,
-    sum(leaf_total_cost) / uniqExact(root_trace_id)  AS avg_cost_per_run,
-    sum(leaf_input_tokens + leaf_cached_input_tokens + leaf_output_tokens) AS total_tokens,
-    avgIf(root_latency, root_latency > 0)            AS avg_latency,
-    max(greatest(coalesce(root_ingested_at, toDateTime64(0, 3, 'UTC')),
-                 leaf_ingested_at))                  AS last_run
-FROM joined
+    multiIf(fn != '', fn, nm != '', nm, lg_node)                       AS agent_key,
+    multiIf(fn != '', 'function', nm != '', 'chain', 'langgraph_node') AS agent_kind,
+    intg                                                                AS integration,
+    count()                                                             AS runs,
+    sum(ifNull(c.run_cost, 0))                                         AS total_cost,
+    sum(ifNull(c.run_cost, 0)) / count()                               AS avg_cost_per_run,
+    toUInt64(sum(ifNull(c.run_tokens, 0)))                             AS total_tokens,
+    avgIf(r.latency, r.latency > 0)                                    AS avg_latency,
+    max(r.ingested_at)                                                  AS last_run
+FROM roots AS r
+LEFT JOIN costs AS c ON r.trace_id = c.root_trace_id
 GROUP BY agent_key, agent_kind, integration
-ORDER BY total_cost DESC
+ORDER BY last_run DESC
 LIMIT {{limit:UInt32}}
 """,
             parameters=params,
@@ -339,7 +356,7 @@ LIMIT {{limit:UInt32}}
             ) = row
             rows.append({
                 "agent_key": agent_key or "",
-                "agent_kind": agent_kind or "llm",
+                "agent_kind": agent_kind or "function",
                 "integration": integration or "",
                 "runs": int(runs or 0),
                 "total_cost": float(total_cost) if total_cost is not None else 0.0,
