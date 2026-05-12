@@ -56,6 +56,7 @@ class ClickHouseClient:
         agent_key: Optional[str] = None,
         agent_kind: Optional[str] = None,
         root_trace_id: Optional[uuid.UUID] = None,
+        roots_only: bool = False,
         limit: int = 100,
         offset: int = 0,
         table: Optional[str] = None,
@@ -88,6 +89,14 @@ class ClickHouseClient:
         if root_trace_id is not None:
             where += " AND t.root_trace_id = {root_trace_id:UUID}"
             params["root_trace_id"] = str(root_trace_id)
+        if roots_only:
+            where += (
+                " AND (t.trace_id = t.root_trace_id"
+                f" OR t.root_trace_id NOT IN ("
+                f"   SELECT trace_id FROM {target}"
+                "    WHERE organization_id = {org_id:UUID}"
+                " ))"
+            )
         if agent_key is not None:
             where += " AND t.trace_id = t.root_trace_id"
             params["agent_key"] = agent_key

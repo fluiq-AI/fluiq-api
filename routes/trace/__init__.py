@@ -124,6 +124,7 @@ async def list_traces(
     agent_key: Optional[str] = Query(default=None),
     agent_kind: Optional[str] = Query(default=None),
     root_trace_id: Optional[uuid.UUID] = Query(default=None),
+    roots_only: bool = Query(default=False),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
 ) -> TraceListResponse:
@@ -161,6 +162,7 @@ async def list_traces(
         agent_key=agent_key,
         agent_kind=agent_kind,
         root_trace_id=root_trace_id,
+        roots_only=roots_only,
         limit=limit,
         offset=offset,
     )
@@ -185,6 +187,12 @@ async def list_traces(
             tid = entry["trace_id"]
             if tid in seen:
                 continue
+            # When roots_only is requested, skip in-flight spans (those
+            # whose root_trace_id differs from their own trace_id).
+            if roots_only:
+                rtid = entry.get("event", {}).get("root_trace_id")
+                if rtid and rtid != tid:
+                    continue
             ingested_ms = entry.get("ingested_at_ms")
             ingested_at = (
                 datetime.fromtimestamp(ingested_ms / 1000.0, tz=timezone.utc)
