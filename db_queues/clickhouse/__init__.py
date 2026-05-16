@@ -376,6 +376,178 @@ LIMIT {{limit:UInt32}}
             })
         return rows
 
+    async def fetch_optimization_profile(
+        self,
+        organization_id: uuid.UUID,
+        window_hours: int = 168,
+        min_calls: int = 10,
+        top_n: int = 10,
+        table: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Analyse recent LLM traces to build a Redis cache profile.
+
+        Returns the top-N most-called models (minimum ``min_calls`` in the
+        window) and an ``estimated_hit_rate`` — the share of calls whose
+        (model, messages) combination appeared more than once and therefore
+        *would* have been served from cache.
+        """
+        if self._client is None:
+            await self.start()
+        target = table or self.default_table
+        params = {
+            "org_id": str(organization_id),
+            "window": int(window_hours),
+            "min_calls": int(min_calls),
+            "top_n": int(top_n),
+        }
+        # Step 1: find per-model call counts
+        model_result = await self._client.query(
+            f"""
+SELECT
+    JSONExtractString(toString(event), 'model') AS model,
+    count()                                      AS call_count
+FROM {target}
+WHERE organization_id = {{org_id:UUID}}
+  AND JSONExtractString(toString(event), 'type') = 'llm'
+  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+GROUP BY model
+HAVING call_count >= {{min_calls:UInt32}}
+ORDER BY call_count DESC
+LIMIT {{top_n:UInt32}}
+""",
+            parameters=params,
+        )
+        # Step 2: estimate overall repeat rate (calls with duplicate prompt hash)
+        repeat_result = await self._client.query(
+            f"""
+SELECT
+    sum(call_count)       AS total_calls,
+    sumIf(call_count, call_count > 1) AS repeating_calls
+FROM (
+    SELECT
+        cityHash64(
+            JSONExtractString(toString(event), 'model'),
+            toString(JSONExtractRaw(toString(event), 'messages'))
+        ) AS prompt_hash,
+        count() AS call_count
+    FROM {target}
+    WHERE organization_id = {{org_id:UUID}}
+      AND JSONExtractString(toString(event), 'type') = 'llm'
+      AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+    GROUP BY prompt_hash
+)
+""",
+            parameters=params,
+        )
+        models: list[str] = []
+        for model, _ in model_result.result_rows:
+            if model:
+                models.append(model)
+        total_calls, repeating_calls = 0, 0
+        if repeat_result.result_rows:
+            row = repeat_result.result_rows[0]
+            total_calls = int(row[0] or 0)
+            repeating_calls = int(row[1] or 0)
+        estimated_hit_rate = (repeating_calls / total_calls) if total_calls else 0.0
+        return {
+            "models": models,
+            "estimated_hit_rate": round(estimated_hit_rate, 4),
+            "window_hours": window_hours,
+        }
+
+    async def fetch_recent_evals(
+        self,
+        organization_id: uuid.UUID,
+        window_minutes: int = 30,
+        limit: int = 200,
+        table: Optional[str] = None,
+        evals_table: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Return evaluation scores for the last ``window_minutes`` of traces.
+
+        Used by the CI eval gate to surface quality regressions on a PR.
+        Each row is ``{trace_id, metric, score, evaluator, judge_model}``.
+        """
+        if self._client is None:
+            await self.start()
+        target = table or self.default_table
+        evals_target = evals_table or config.CLICKHOUSE_EVALUATIONS_TABLE
+        params = {
+            "org_id": str(organization_id),
+            "window": int(window_minutes),
+            "limit": int(limit),
+        }
+        result = await self._client.query(
+            f"""
+SELECT
+    e.trace_id,
+    e.metric,
+    e.score,
+    e.evaluator,
+    e.judge_model
+FROM {evals_target} AS e
+INNER JOIN {target} AS t
+    ON e.organization_id = t.organization_id
+   AND e.trace_id = t.trace_id
+WHERE e.organization_id = {{org_id:UUID}}
+  AND t.ingested_at >= now() - toIntervalMinute({{window:UInt32}})
+ORDER BY t.ingested_at DESC
+LIMIT {{limit:UInt32}}
+""",
+            parameters=params,
+        )
+        rows: list[dict[str, Any]] = []
+        for trace_id, metric, score, evaluator, judge_model in result.result_rows:
+            rows.append({
+                "trace_id": str(trace_id) if trace_id else None,
+                "metric": metric or "",
+                "score": float(score) if score is not None else None,
+                "evaluator": evaluator or "",
+                "judge_model": judge_model or "",
+            })
+        return rows
+
+    async def insert_evaluations(
+        self,
+        organization_id: uuid.UUID,
+        trace_id: str,
+        results: dict[str, dict[str, Any]],
+        judge_model: str,
+        table: Optional[str] = None,
+    ) -> None:
+        """Insert one row per metric into the evaluations table.
+
+        Called by the /evaluate endpoint after running LLM-as-judge scoring.
+        Fails silently — evaluation storage must not block the SDK response.
+        """
+        if self._client is None:
+            await self.start()
+        evals_target = table or config.CLICKHOUSE_EVALUATIONS_TABLE
+        rows = [
+            [
+                str(organization_id),
+                trace_id,
+                metric,
+                float(data.get("score", 0.0)),
+                "fluiq.eval",
+                judge_model,
+            ]
+            for metric, data in results.items()
+        ]
+        if rows:
+            await self._client.insert(
+                evals_target,
+                rows,
+                column_names=[
+                    "organization_id",
+                    "trace_id",
+                    "metric",
+                    "score",
+                    "evaluator",
+                    "judge_model",
+                ],
+            )
+
 
 clickhouse_client = ClickHouseClient()
 
