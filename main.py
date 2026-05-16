@@ -9,8 +9,10 @@ from realtime import trace_consumer
 from routes import trace, auth
 from routes.agents import router as agents_router
 from routes.api_keys import api_keys_router
+from routes.evaluate import evaluate_router
 from routes.optimize import optimize_router
 from routes.quota import quota_router
+from routes.secure import router as secure_router
 
 
 @asynccontextmanager
@@ -41,7 +43,9 @@ app.add_middleware(
 app.include_router(trace.router, prefix="/api/v1")
 app.include_router(agents_router, prefix="/api/v1")
 app.include_router(quota_router, prefix="/api/v1")
+app.include_router(evaluate_router, prefix="/api/v1")
 app.include_router(optimize_router, prefix="/api/v1")
+app.include_router(secure_router, prefix="/api/v1")
 app.include_router(auth.auth_router, prefix="/auth")
 app.include_router(api_keys_router, prefix="/api-keys")
 
