@@ -74,3 +74,81 @@ CREATE INDEX IF NOT EXISTS idx_model_prices_provider_model
     ON model_prices(provider, model);
 CREATE INDEX IF NOT EXISTS idx_model_prices_provider_model_modality
     ON model_prices(provider, model, modality);
+
+ALTER TABLE users DROP CONSTRAINT users_user_type_check;
+
+ALTER TABLE users ADD CONSTRAINT users_user_type_check CHECK (user_type IN ('Free', 'Starter', 'Team', 'Growth', 'Enterprise', 'Admin'));
+
+CREATE TABLE IF NOT EXISTS prompts (
+    prompt_id   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id      UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    name        TEXT        NOT NULL,
+    slug        TEXT        NOT NULL,
+    template    TEXT        NOT NULL,
+    model       TEXT,
+    variables   JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    is_deployed BOOLEAN     NOT NULL DEFAULT FALSE,
+    deployed_at TIMESTAMPTZ,
+    version     INTEGER     NOT NULL DEFAULT 1,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ,
+    UNIQUE (org_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_prompts_org_id ON prompts(org_id);
+CREATE INDEX IF NOT EXISTS idx_prompts_org_slug ON prompts(org_id, slug);
+
+CREATE TABLE IF NOT EXISTS prompt_versions (
+    version_id  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    prompt_id   UUID        NOT NULL REFERENCES prompts(prompt_id) ON DELETE CASCADE,
+    org_id      UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    version     INTEGER     NOT NULL,
+    name        TEXT        NOT NULL,
+    template    TEXT        NOT NULL,
+    model       TEXT,
+    variables   JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_versions_prompt_id ON prompt_versions(prompt_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_versions_prompt_version ON prompt_versions(prompt_id, version);
+
+-- Stores a snapshot of the prompt at the moment it was promoted to each named
+-- environment. One row per (prompt, environment). On re-deploy the row is
+-- replaced via ON CONFLICT DO UPDATE so the history stays in prompt_versions.
+CREATE TABLE IF NOT EXISTS prompt_environments (
+    env_id      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    prompt_id   UUID        NOT NULL REFERENCES prompts(prompt_id) ON DELETE CASCADE,
+    org_id      UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    environment TEXT        NOT NULL CHECK (environment IN ('development', 'staging', 'production')),
+    version     INTEGER     NOT NULL,
+    template    TEXT        NOT NULL,
+    model       TEXT,
+    variables   JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    deployed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (prompt_id, environment)
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_environments_prompt_id ON prompt_environments(prompt_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_environments_org_env  ON prompt_environments(org_id, environment);
+
+-- Datasets: named collections of input/output pairs for evaluation
+CREATE TABLE IF NOT EXISTS datasets (
+    dataset_id  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id      UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    name        TEXT        NOT NULL,
+    description TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ,
+    UNIQUE (org_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_datasets_org_id ON datasets(org_id);
+
+CREATE TABLE IF NOT EXISTS dataset_examples (
+    example_id      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    dataset_id      UUID        NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
+    org_id          UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    input           TEXT        NOT NULL,
+    expected_output TEXT,
+    metadata        JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dataset_examples_dataset_id ON dataset_examples(dataset_id);
+CREATE INDEX IF NOT EXISTS idx_dataset_examples_org_id     ON dataset_examples(org_id);

@@ -118,17 +118,18 @@ class ClickHouseClient:
         result = await self._client.query(
             f"SELECT t.api_key_prefix, t.event, t.ingested_at, "
             f"       c.total_cost, c.currency, "
-            f"       e.metrics, e.scores, e.evaluators, e.judge_models "
+            f"       e.metrics, e.scores, e.evaluators, e.judge_models, e.details_list "
             f"FROM {target} AS t "
             f"LEFT JOIN {costs_target} AS c "
             f"  ON t.organization_id = c.organization_id "
             f" AND t.trace_id = c.trace_id "
             f"LEFT JOIN ("
             f"   SELECT organization_id, trace_id, "
-            f"          groupArray(metric)      AS metrics, "
-            f"          groupArray(score)       AS scores, "
-            f"          groupArray(evaluator)   AS evaluators, "
-            f"          groupArray(judge_model) AS judge_models "
+            f"          groupArray(metric)            AS metrics, "
+            f"          groupArray(score)             AS scores, "
+            f"          groupArray(evaluator)         AS evaluators, "
+            f"          groupArray(judge_model)       AS judge_models, "
+            f"          groupArray(toString(details)) AS details_list "
             f"   FROM {evals_target} "
             f"   WHERE organization_id = {{org_id:UUID}} "
             f"   GROUP BY organization_id, trace_id"
@@ -143,7 +144,7 @@ class ClickHouseClient:
         rows: list[dict[str, Any]] = []
         for (
             prefix, event, ingested_at, total_cost, currency,
-            metrics, scores, evaluators, judge_models,
+            metrics, scores, evaluators, judge_models, details_list,
         ) in result.result_rows:
             if isinstance(event, str):
                 try:
@@ -166,18 +167,37 @@ class ClickHouseClient:
                 scores_l = list(scores or [])
                 evaluators_l = list(evaluators or [])
                 judges_l = list(judge_models or [])
+                details_l = list(details_list or [])
                 for i, metric in enumerate(metrics_l):
                     score_v = scores_l[i] if i < len(scores_l) else None
                     try:
                         score_f = float(score_v) if score_v is not None else None
                     except (TypeError, ValueError):
                         score_f = None
+                    raw_details = details_l[i] if i < len(details_l) else None
+                    if isinstance(raw_details, str):
+                        try:
+                            parsed_details: Any = json.loads(raw_details)
+                        except (json.JSONDecodeError, ValueError):
+                            parsed_details = None
+                    else:
+                        parsed_details = raw_details or None
+                    evaluator_v = evaluators_l[i] if i < len(evaluators_l) else ""
                     evaluations.append({
                         "metric": metric,
                         "score": score_f,
-                        "evaluator": evaluators_l[i] if i < len(evaluators_l) else "",
+                        "evaluator": evaluator_v,
                         "judge_model": judges_l[i] if i < len(judges_l) else "",
+                        "details": parsed_details,
                     })
+                    # Merge security scan details directly into the event so the
+                    # SecurityPanel can read them without a separate API call.
+                    if (
+                        evaluator_v == "fluiq.security"
+                        and metric == "security_scan"
+                        and isinstance(parsed_details, dict)
+                    ):
+                        parsed.update(parsed_details)
             rows.append({
                 "api_key_prefix": prefix,
                 "event": parsed,
@@ -224,13 +244,14 @@ class ClickHouseClient:
         window_hours: int = 24,
         table: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Aggregate cache hit/miss counts emitted by ``trace=True`` caches.
+        """Aggregate cache hit/miss counts from two sources:
 
-        Cache spans are stored alongside regular traces with
-        ``event.type == 'cache'`` and integer ``cache_hits`` / ``cache_misses``
-        counters (batches of N for embeddings, 1/0 for prompts). The
-        rollup totals each over the last ``window_hours`` and groups by
-        ``cache_kind`` so the dashboard can surface per-cache hit rates.
+        1. Legacy explicit cache spans (``event.type == 'cache'``) emitted by
+           vectorstore integrations with integer ``cache_hits``/``cache_misses``
+           counters.
+        2. LLM optimize traces (``event.type == 'llm'``) emitted by
+           ``fluiq.optimize()`` with a boolean ``cache_hit`` field set on every
+           LLM completion that went through the optimize path.
         """
         if self._client is None:
             await self.start()
@@ -239,7 +260,9 @@ class ClickHouseClient:
             "org_id": str(organization_id),
             "window": int(window_hours),
         }
-        result = await self._client.query(
+
+        # --- Source 1: legacy vectorstore cache spans ---
+        legacy_result = await self._client.query(
             f"""
 SELECT
     JSONExtractString(toString(event), 'cache_kind')      AS kind,
@@ -254,25 +277,89 @@ GROUP BY kind
 """,
             parameters=params,
         )
+
+        # --- Source 2: LLM optimize hits/misses from fluiq.optimize() ---
+        llm_result = await self._client.query(
+            f"""
+SELECT
+    lower(JSONExtractString(toString(event), 'integration')) AS kind,
+    countIf(JSONExtractBool(toString(event), 'cache_hit') = 1) AS hits,
+    countIf(JSONExtractBool(toString(event), 'cache_hit') = 0) AS misses,
+    count()                                                    AS calls
+FROM {target}
+WHERE organization_id = {{org_id:UUID}}
+  AND JSONExtractString(toString(event), 'type') = 'llm'
+  AND JSONHas(toString(event), 'cache_hit')
+  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+GROUP BY kind
+""",
+            parameters=params,
+        )
+
+        # --- Source 3: @fluiq.trace function hits/misses from fluiq.optimize() ---
+        fn_result = await self._client.query(
+            f"""
+SELECT
+    JSONExtractString(toString(event), 'function')             AS kind,
+    countIf(JSONExtractBool(toString(event), 'cache_hit') = 1) AS hits,
+    countIf(JSONExtractBool(toString(event), 'cache_hit') = 0) AS misses,
+    count()                                                    AS calls
+FROM {target}
+WHERE organization_id = {{org_id:UUID}}
+  AND JSONExtractString(toString(event), 'type') = 'function'
+  AND JSONHas(toString(event), 'cache_hit')
+  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+GROUP BY kind
+""",
+            parameters=params,
+        )
+
+        # --- Source 4: vectorstore cache hits/misses (FAISS, Chroma, Pinecone, etc.) ---
+        vs_result = await self._client.query(
+            f"""
+SELECT
+    lower(JSONExtractString(toString(event), 'integration')) AS kind,
+    countIf(JSONExtractBool(toString(event), 'cache_hit') = 1) AS hits,
+    countIf(JSONExtractBool(toString(event), 'cache_hit') = 0) AS misses,
+    count()                                                    AS calls
+FROM {target}
+WHERE organization_id = {{org_id:UUID}}
+  AND JSONExtractString(toString(event), 'type') = 'vectorstore'
+  AND JSONHas(toString(event), 'cache_hit')
+  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+GROUP BY kind
+""",
+            parameters=params,
+        )
+
         per_kind: list[dict[str, Any]] = []
         total_hits = 0
         total_misses = 0
         total_calls = 0
-        for kind, hits, misses, calls in result.result_rows:
-            h = int(hits or 0)
-            m = int(misses or 0)
-            c = int(calls or 0)
-            total_hits += h
-            total_misses += m
-            total_calls += c
-            lookups = h + m
-            per_kind.append({
-                "kind": kind or "unknown",
-                "hits": h,
-                "misses": m,
-                "calls": c,
-                "hit_rate": (h / lookups) if lookups else 0.0,
-            })
+
+        def _add_rows(rows: list) -> None:
+            nonlocal total_hits, total_misses, total_calls
+            for kind, hits, misses, calls in rows:
+                h = int(hits or 0)
+                m = int(misses or 0)
+                c = int(calls or 0)
+                total_hits += h
+                total_misses += m
+                total_calls += c
+                lookups = h + m
+                per_kind.append({
+                    "kind": kind or "unknown",
+                    "hits": h,
+                    "misses": m,
+                    "calls": c,
+                    "hit_rate": (h / lookups) if lookups else 0.0,
+                })
+
+        _add_rows(legacy_result.result_rows)
+        _add_rows(llm_result.result_rows)
+        _add_rows(fn_result.result_rows)
+        _add_rows(vs_result.result_rows)
+
         total_lookups = total_hits + total_misses
         return {
             "window_hours": int(window_hours),
@@ -287,7 +374,8 @@ GROUP BY kind
     async def fetch_agent_summary(
         self,
         organization_id: uuid.UUID,
-        limit: int = 100,
+        limit: int = 50,
+        offset: int = 0,
         table: Optional[str] = None,
         costs_table: Optional[str] = None,
     ) -> list[dict[str, Any]]:
@@ -309,7 +397,7 @@ GROUP BY kind
             await self.start()
         target = table or self.default_table
         costs_target = costs_table or config.CLICKHOUSE_TRACE_COSTS_TABLE
-        params = {"org_id": str(organization_id), "limit": limit}
+        params = {"org_id": str(organization_id), "limit": limit, "offset": offset}
         result = await self._client.query(
             f"""
 WITH roots AS (
@@ -354,6 +442,7 @@ LEFT JOIN costs AS c ON r.trace_id = c.root_trace_id
 GROUP BY agent_key, agent_kind, integration
 ORDER BY last_run DESC
 LIMIT {{limit:UInt32}}
+OFFSET {{offset:UInt32}}
 """,
             parameters=params,
         )

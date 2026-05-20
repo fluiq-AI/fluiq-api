@@ -1,14 +1,14 @@
 """Server-side LLM judge for the /evaluate endpoint.
 
-Runs one OpenAI chat completion per metric using a structured JSON prompt.
-The judge key is read from JUDGE_OPENAI_API_KEY (falls back to OPENAI_API_KEY).
+Runs one Anthropic message per metric using a structured JSON prompt.
+The judge key is read from JUDGE_ANTHROPIC_API_KEY (falls back to ANTHROPIC_API_KEY).
 """
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Any
+from config import ANTHROPIC_API_KEY
 
 SUPPORTED_METRICS = frozenset({
     "hallucination",
@@ -89,22 +89,20 @@ def _clamp(v: Any) -> float:
         return 0.0
 
 
-def _call_openai(prompt: str, model: str) -> str:
-    from openai import OpenAI
+def _call_anthropic(prompt: str, model: str) -> str:
+    import anthropic
 
-    key = os.getenv("JUDGE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-    client = OpenAI(api_key=key)
-    resp = client.chat.completions.create(
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    resp = client.messages.create(
         model=model,
-        temperature=0.0,
-        messages=[
-            {"role": "system", "content": _SYSTEM},
-            {"role": "user",   "content": prompt},
-        ],
-        response_format={"type": "json_object"},
         max_tokens=256,
+        temperature=0.0,
+        system=_SYSTEM,
+        messages=[
+            {"role": "user", "content": prompt},
+        ],
     )
-    return resp.choices[0].message.content or "{}"
+    return resp.content[0].text if resp.content else "{}"
 
 
 def run_metrics(
@@ -113,7 +111,7 @@ def run_metrics(
     response: str,
     prompt: str = "",
     context: str = "",
-    judge_model: str = "gpt-4o-mini",
+    judge_model: str = "claude-haiku-4-5-20251001",
 ) -> dict[str, dict[str, Any]]:
     """Evaluate each metric with an LLM judge call.
 
@@ -132,7 +130,7 @@ def run_metrics(
             context=context or prompt,
         )
         try:
-            raw = _call_openai(judge_prompt, judge_model)
+            raw = _call_anthropic(judge_prompt, judge_model)
             data = _parse(raw)
             results[metric] = {
                 "score":  _clamp(data.get("score")),
