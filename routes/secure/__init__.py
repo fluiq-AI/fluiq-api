@@ -1,26 +1,31 @@
-"""fluiq-api  —  POST /api/v1/secure  &  POST /api/v1/secure/check
+"""fluiq-api  —  POST /api/v1/secure/check
 
-POST /api/v1/secure       — full post-call scan (PII + all attack types)
-POST /api/v1/secure/check — lightweight pre-call check (attack patterns only, fast)
+Lightweight pre-call guard.  Publishes the prompt to the evaluator worker via
+Kafka (priority path) for a full scan (PII + secrets + semantic + patterns).
+Falls back to fast pattern-only matching if the worker doesn't reply within
+KAFKA_SECURITY_CHECK_TIMEOUT seconds.
 
-Both require Team tier or above; return 402 for Free accounts.
+Requires Team tier or above.
 """
 from __future__ import annotations
 
+import logging
 from typing import List, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
+import config
 from db_queues.postgresql.auth import resolve_api_key, get_org_tier
+from db_queues.kafka import kafka_queue, wait_for_reply
 from . import scanners
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _SECURE_TIERS = {"Team", "Growth", "Enterprise"}
 
-
-# ── Auth helper ───────────────────────────────────────────────────────────────
 
 async def _resolve_and_gate(api_key: str) -> None:
     if not api_key:
@@ -35,88 +40,10 @@ async def _resolve_and_gate(api_key: str) -> None:
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail=(
                 f"fluiq.secure() requires Team plan or above "
-                f"(current plan: {tier}). Upgrade at app.getfluiq.com/billing."
+                f"(current plan: {tier}). Upgrade at getfluiq.com/dashboard."
             ),
         )
 
-
-# ── POST /secure  (full post-call scan) ───────────────────────────────────────
-
-class SecureRequest(BaseModel):
-    api_key:      str
-    prompt:       str       = ""
-    response:     str       = ""
-    tool_outputs: List[str] = []
-    context_docs: List[str] = []
-
-
-class SecureResponse(BaseModel):
-    # PII
-    prompt_redacted:       str
-    response_redacted:     str
-    pii_entities_prompt:   List[str]
-    pii_entities_response: List[str]
-    # Attacks
-    injection_detected:    bool
-    injection_patterns:    List[str]
-    jailbreak_detected:    bool
-    jailbreak_patterns:    List[str]
-    skeleton_key_detected: bool
-    skeleton_key_patterns: List[str]
-    # Secrets
-    secrets_detected:      bool
-    secret_types:          List[str]
-    # Indirect injection
-    indirect_injection_detected: bool
-    indirect_injection_sources:  List[str]
-    # Semantic
-    semantic_attack_score: float
-    # Aggregate
-    security_risk_level:   str
-    security_risk_score:   float
-    should_block:          bool
-
-
-@router.post("/secure", response_model=SecureResponse)
-async def secure_scan(payload: SecureRequest) -> SecureResponse:
-    """Full post-call scan: PII, jailbreak, injection, skeleton key, secrets,
-    indirect injection in tool outputs and context docs.
-
-    Returns enriched security fields.  When ``should_block`` is ``True``
-    the caller should substitute the redacted versions before persisting.
-    """
-    await _resolve_and_gate(payload.api_key)
-
-    r = scanners.scan(
-        prompt       = payload.prompt,
-        response     = payload.response,
-        tool_outputs = payload.tool_outputs,
-        context_docs = payload.context_docs,
-    )
-
-    return SecureResponse(
-        prompt_redacted             = r.prompt_redacted,
-        response_redacted           = r.response_redacted,
-        pii_entities_prompt         = r.pii_entities_prompt,
-        pii_entities_response       = r.pii_entities_response,
-        injection_detected          = r.injection_detected,
-        injection_patterns          = r.injection_patterns,
-        jailbreak_detected          = r.jailbreak_detected,
-        jailbreak_patterns          = r.jailbreak_patterns,
-        skeleton_key_detected       = r.skeleton_key_detected,
-        skeleton_key_patterns       = r.skeleton_key_patterns,
-        secrets_detected            = r.secrets_detected,
-        secret_types                = r.secret_types,
-        indirect_injection_detected = r.indirect_injection_detected,
-        indirect_injection_sources  = r.indirect_injection_sources,
-        semantic_attack_score       = r.semantic_attack_score,
-        security_risk_level         = r.security_risk_level,
-        security_risk_score         = r.security_risk_score,
-        should_block                = r.should_block,
-    )
-
-
-# ── POST /secure/check  (lightweight pre-call guard) ─────────────────────────
 
 class CheckRequest(BaseModel):
     api_key: str
@@ -132,15 +59,35 @@ class CheckResponse(BaseModel):
 
 @router.post("/secure/check", response_model=CheckResponse)
 async def pre_call_check(payload: CheckRequest) -> CheckResponse:
-    """Lightweight pre-call guard.  Runs attack-pattern + semantic checks on
-    the *prompt only* (no response text required).  Designed to be fast
-    enough to call on every LLM request when ``fluiq.secure(mode='block')``
-    is active.
+    """Pre-call security guard.
 
-    Returns ``allow=False`` when the risk level is HIGH so the SDK can raise
-    ``FluiqSecurityError`` before the LLM call is made.
+    Sends the prompt to the evaluator worker for a full scan (PII, secrets,
+    semantic classifier, attack patterns).  If the worker replies within the
+    configured timeout the full result is returned.  On timeout the endpoint
+    falls back to the fast pattern-only check so the LLM call is never blocked
+    indefinitely by a slow or unavailable worker.
     """
     await _resolve_and_gate(payload.api_key)
+
+    # Priority path: full scan via the evaluator worker
+    correlation_id = uuid4().hex
+    try:
+        await kafka_queue.add_job(
+            {
+                "operation":      "security_check_sync",
+                "prompt":         payload.prompt,
+                "correlation_id": correlation_id,
+            },
+            topic=config.KAFKA_EVAL_TOPIC,
+        )
+        result = await wait_for_reply(correlation_id, timeout=config.KAFKA_SECURITY_CHECK_TIMEOUT)
+        if result is not None:
+            return CheckResponse(**result)
+    except Exception:
+        logger.exception("[SECURE] Kafka full-scan failed, falling back to pattern check")
+
+    # Fallback: fast pattern-only check (no PII / secrets / semantic)
+    logger.warning("[SECURE] Falling back to pattern-only check for correlation_id=%s", correlation_id)
     r = scanners.check(payload.prompt)
     return CheckResponse(
         allow        = r.allow,

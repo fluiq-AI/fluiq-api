@@ -115,10 +115,10 @@ async def get_optimization_profile(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail=(
                 f"fluiq.optimize() requires Team plan or above "
-                f"(current plan: {tier}). Upgrade at app.getfluiq.com/billing."
+                f"(current plan: {tier}). Upgrade at getfluiq.com/dashboard."
             ),
         )
-    if not config.REDIS_URL:
+    if not config.REDIS_SDK_URL:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Redis is not configured on this deployment.",
@@ -134,7 +134,7 @@ async def get_optimization_profile(
     key_prefix = f"fluiq:{org_id.hex[:8]}:"
 
     return ProfileResponse(
-        redis_url=config.REDIS_URL,
+        redis_url=config.REDIS_SDK_URL,
         key_prefix=key_prefix,
         models=profile["models"],
         ttl_seconds=config.REDIS_DEFAULT_TTL_SECONDS,

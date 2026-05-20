@@ -21,6 +21,7 @@ API_KEY_LIMITS: dict[str, int] = {
     "Team": 5,
     "Growth": 15,
     "Enterprise": 50,
+    "Admin": 0,
 }
 
 
@@ -304,6 +305,120 @@ async def delete_api_key(org_id: uuid.UUID, key_id: uuid.UUID) -> bool:
             )
     return row is not None
 
+async def get_user_by_id(user_id: uuid.UUID) -> Optional[UserModel]:
+    async with postgres_client.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT * FROM {config.POSTGRES_USER_TABLE} WHERE user_id = $1",
+            user_id,
+        )
+    if row is None:
+        return None
+    return UserModel(**dict(row))
+
+
+async def get_platform_stats() -> dict:
+    async with postgres_client.acquire() as conn:
+        total_users = await conn.fetchval(
+            f"SELECT COUNT(*) FROM {config.POSTGRES_USER_TABLE}"
+        )
+        total_orgs = await conn.fetchval(
+            f"SELECT COUNT(*) FROM {config.POSTGRES_ORG_TABLE}"
+        )
+        type_rows = await conn.fetch(
+            f"SELECT user_type, COUNT(*) AS count "
+            f"FROM {config.POSTGRES_USER_TABLE} GROUP BY user_type"
+        )
+    by_type = {row["user_type"]: int(row["count"]) for row in type_rows}
+    return {
+        "total_users": int(total_users),
+        "total_orgs": int(total_orgs),
+        "users_by_type": by_type,
+    }
+
+
+async def admin_list_users(
+    page: int = 1,
+    limit: int = 50,
+    search: str = "",
+    user_type_filter: Optional[str] = None,
+) -> tuple[list[dict], int]:
+    offset = (page - 1) * limit
+    params: list = []
+    idx = 1
+    conditions: list[str] = []
+
+    if search:
+        conditions.append(f"(u.email ILIKE ${idx} OR u.name ILIKE ${idx})")
+        params.append(f"%{search}%")
+        idx += 1
+    if user_type_filter:
+        conditions.append(f"u.user_type = ${idx}")
+        params.append(user_type_filter)
+        idx += 1
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    async with postgres_client.acquire() as conn:
+        total = int(await conn.fetchval(
+            f"SELECT COUNT(*) FROM {config.POSTGRES_USER_TABLE} u {where}",
+            *params,
+        ))
+        rows = await conn.fetch(
+            f"SELECT u.user_id, u.email, u.name, u.user_type, u.org_id, u.created_at, "
+            f"o.name AS org_name "
+            f"FROM {config.POSTGRES_USER_TABLE} u "
+            f"LEFT JOIN {config.POSTGRES_ORG_TABLE} o ON o.org_id = u.org_id "
+            f"{where} "
+            f"ORDER BY u.created_at DESC "
+            f"LIMIT ${idx} OFFSET ${idx + 1}",
+            *params, limit, offset,
+        )
+    return [dict(row) for row in rows], total
+
+
+async def admin_update_user_type(user_id: uuid.UUID, new_type: str) -> bool:
+    new_limit = API_KEY_LIMITS.get(new_type, 1)
+    async with postgres_client.acquire() as conn:
+        async with conn.transaction():
+            user_row = await conn.fetchrow(
+                f"UPDATE {config.POSTGRES_USER_TABLE} "
+                f"SET user_type = $2, updated_at = NOW() "
+                f"WHERE user_id = $1 RETURNING org_id",
+                user_id, new_type,
+            )
+            if user_row is None:
+                return False
+            await conn.execute(
+                f"UPDATE {config.POSTGRES_ORG_TABLE} "
+                f"SET api_key_limit = $2, updated_at = NOW() "
+                f"WHERE org_id = $1",
+                user_row["org_id"], new_limit,
+            )
+    return True
+
+
+async def admin_list_organizations(
+    page: int = 1,
+    limit: int = 50,
+) -> tuple[list[dict], int]:
+    offset = (page - 1) * limit
+    async with postgres_client.acquire() as conn:
+        total = int(await conn.fetchval(
+            f"SELECT COUNT(*) FROM {config.POSTGRES_ORG_TABLE}"
+        ))
+        rows = await conn.fetch(
+            f"SELECT o.org_id, o.name AS org_name, o.user_id, "
+            f"o.api_key_usage, o.api_key_limit, o.created_at, "
+            f"u.email AS owner_email, u.name AS owner_name, u.user_type AS owner_type "
+            f"FROM {config.POSTGRES_ORG_TABLE} o "
+            f"LEFT JOIN {config.POSTGRES_USER_TABLE} u ON u.user_id = o.user_id "
+            f"ORDER BY o.created_at DESC "
+            f"LIMIT $1 OFFSET $2",
+            limit, offset,
+        )
+    return [dict(row) for row in rows], total
+
+
 async def find_or_create_oauth_user(
     name: str,
     email: str,
@@ -334,6 +449,7 @@ __all__ = [
     "email_exists",
     "register_user",
     "get_user_by_email",
+    "get_user_by_id",
     "revoke_refresh_token",
     "is_refresh_token_revoked",
     "update_user_password",
@@ -345,9 +461,9 @@ __all__ = [
     "resolve_api_key",
     "create_api_key",
     "delete_api_key",
-    "config.POSTGRES_USER_TABLE",
-    "config.POSTGRES_ORG_TABLE",
-    "config.POSTGRES_REVOKED_TOKEN_TABLE",
-    "config.POSTGRES_PASSWORD_RESET_TABLE",
+    "get_platform_stats",
+    "admin_list_users",
+    "admin_update_user_type",
+    "admin_list_organizations",
     "API_KEY_LIMITS",
 ]

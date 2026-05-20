@@ -14,7 +14,8 @@ router = APIRouter()
 @router.get("/agents/summary", response_model=AgentSummaryResponse)
 async def agent_summary(
     session: dict = Depends(get_current_session),
-    limit: int = Query(default=100, ge=1, le=1000),
+    limit: int = Query(default=50, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
 ) -> AgentSummaryResponse:
     """Aggregate cost / token / latency metrics per agent across all history.
 
@@ -34,6 +35,7 @@ async def agent_summary(
     rows = await clickhouse_client.fetch_agent_summary(
         organization_id=org_id,
         limit=limit,
+        offset=offset,
     )
     return AgentSummaryResponse(
         agents=[AgentSummaryRow(**row) for row in rows],

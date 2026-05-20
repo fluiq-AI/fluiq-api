@@ -78,6 +78,11 @@ async def ingestion(payload: IngestPayload):
         trace_id = str(uuid.uuid4())
         event["trace_id"] = trace_id
 
+    # Strip SDK-embedded configs before persisting the trace. These are only
+    # meaningful for the evaluator worker and must not reach ClickHouse.
+    eval_config     = event.pop("_eval_config",     None)
+    security_config = event.pop("_security_config", None)
+
     # ``status="running"`` is a live-progress signal emitted before the
     # actual call completes; the same trace_id will land again with the
     # final event. Don't bump quota here (would double-count) and skip
@@ -100,11 +105,23 @@ async def ingestion(payload: IngestPayload):
 
     eval_skipped = False
     if not is_running and _is_retrieval_event(event):
+        # Vectorstore retrieval → auto ContextPrecision eval
         if quota.eval_over:
             eval_skipped = True
         else:
             await kafka_queue.add_job(
                 job,
+                topic=config.KAFKA_EVAL_TOPIC,
+                key=str(org_id),
+            )
+            bump_eval_count(org_id)
+    elif not is_running and eval_config and event.get("type") == "llm":
+        # SDK warn-mode eval: fan out to worker with the requested metrics
+        if quota.eval_over:
+            eval_skipped = True
+        else:
+            await kafka_queue.add_job(
+                {**job, "eval_config": eval_config, "operation": "sdk_llm"},
                 topic=config.KAFKA_EVAL_TOPIC,
                 key=str(org_id),
             )

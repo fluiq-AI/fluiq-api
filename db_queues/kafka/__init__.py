@@ -75,4 +75,15 @@ class KafkaQueue:
 
 kafka_queue = KafkaQueue()
 
-__all__ = ["KafkaQueue", "kafka_queue", "KAFKA_BOOTSTRAP_SERVERS", "KAFKA_TRACE_TOPIC"]
+from db_queues.kafka.reply_consumer import (
+    security_reply_consumer,
+    wait_for_reply,
+    playground_reply_consumer,
+    wait_for_playground_reply,
+)
+
+__all__ = [
+    "KafkaQueue", "kafka_queue",
+    "security_reply_consumer", "wait_for_reply",
+    "playground_reply_consumer", "wait_for_playground_reply",
+]

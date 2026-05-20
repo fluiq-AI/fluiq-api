@@ -12,6 +12,7 @@ class EvaluationScore(BaseModel):
     score: float | None = None
     evaluator: str = ""
     judge_model: str = ""
+    details: dict[str, Any] | None = None
 
 
 class TraceRecord(BaseModel):
