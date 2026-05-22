@@ -64,7 +64,7 @@ class SecurityReplyConsumer:
             group_id=f"fluiq-api-security-reply-{uuid4().hex}",
             value_deserializer=lambda b: json.loads(b.decode("utf-8")),
             auto_offset_reset="latest",
-            enable_auto_commit=True,
+            enable_auto_commit=False,
         )
         await self._consumer.start()
         self._task = asyncio.create_task(self._consume())
@@ -163,7 +163,7 @@ class PlaygroundReplyConsumer:
             group_id=f"fluiq-api-playground-reply-{uuid4().hex}",
             value_deserializer=lambda b: json.loads(b.decode("utf-8")),
             auto_offset_reset="latest",
-            enable_auto_commit=True,
+            enable_auto_commit=False,
         )
         await self._consumer.start()
         self._task = asyncio.create_task(self._consume())
