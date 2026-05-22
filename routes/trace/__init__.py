@@ -127,6 +127,13 @@ async def ingestion(payload: IngestPayload):
             )
             bump_eval_count(org_id)
 
+    if not is_running and security_config:
+        await kafka_queue.add_job(
+            {**job, "security_config": security_config, "operation": "sdk_security"},
+            topic=config.KAFKA_EVAL_TOPIC,
+            key=str(org_id),
+        )
+
     return {
         "ok": True,
         "trace_id": trace_id,
