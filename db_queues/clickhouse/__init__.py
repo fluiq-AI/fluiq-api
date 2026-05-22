@@ -62,6 +62,7 @@ class ClickHouseClient:
         table: Optional[str] = None,
         costs_table: Optional[str] = None,
         evaluations_table: Optional[str] = None,
+        security_table: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Return traces for an organization, optionally filtered by key prefix.
 
@@ -77,6 +78,7 @@ class ClickHouseClient:
         target = table or self.default_table
         costs_target = costs_table or config.CLICKHOUSE_TRACE_COSTS_TABLE
         evals_target = evaluations_table or config.CLICKHOUSE_EVALUATIONS_TABLE
+        security_target = security_table or config.CLICKHOUSE_SECURITY_TABLE
         where = "t.organization_id = {org_id:UUID}"
         params: dict[str, Any] = {
             "org_id": str(organization_id),
@@ -118,7 +120,16 @@ class ClickHouseClient:
         result = await self._client.query(
             f"SELECT t.api_key_prefix, t.event, t.ingested_at, "
             f"       c.total_cost, c.currency, "
-            f"       e.metrics, e.scores, e.evaluators, e.judge_models, e.details_list "
+            f"       e.metrics, e.scores, e.evaluators, e.judge_models, e.details_list, "
+            f"       s.security_risk_level, s.security_risk_score, s.should_block, "
+            f"       s.injection_detected, s.injection_patterns, "
+            f"       s.jailbreak_detected, s.jailbreak_patterns, "
+            f"       s.skeleton_key_detected, s.skeleton_key_patterns, "
+            f"       s.secrets_detected, s.secret_types, "
+            f"       s.indirect_injection_detected, s.indirect_injection_sources, "
+            f"       s.semantic_attack_score, "
+            f"       s.pii_entities_prompt, s.pii_entities_response, "
+            f"       s.prompt_redacted, s.response_redacted, s.scan_latency "
             f"FROM {target} AS t "
             f"LEFT JOIN {costs_target} AS c "
             f"  ON t.organization_id = c.organization_id "
@@ -136,6 +147,9 @@ class ClickHouseClient:
             f") AS e "
             f"  ON t.organization_id = e.organization_id "
             f" AND t.trace_id = e.trace_id "
+            f"LEFT JOIN {security_target} AS s "
+            f"  ON t.organization_id = s.organization_id "
+            f" AND t.trace_id = s.trace_id "
             f"WHERE {where} "
             f"ORDER BY t.ingested_at DESC "
             f"LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}",
@@ -145,6 +159,15 @@ class ClickHouseClient:
         for (
             prefix, event, ingested_at, total_cost, currency,
             metrics, scores, evaluators, judge_models, details_list,
+            sec_risk_level, sec_risk_score, sec_should_block,
+            sec_injection, sec_injection_patterns,
+            sec_jailbreak, sec_jailbreak_patterns,
+            sec_skeleton, sec_skeleton_patterns,
+            sec_secrets, sec_secret_types,
+            sec_indirect, sec_indirect_sources,
+            sec_semantic_score,
+            sec_pii_prompt, sec_pii_response,
+            sec_prompt_redacted, sec_response_redacted, sec_scan_latency,
         ) in result.result_rows:
             if isinstance(event, str):
                 try:
@@ -161,6 +184,29 @@ class ClickHouseClient:
                     cost = float(total_cost)
                 except (TypeError, ValueError):
                     cost = None
+            # Merge security scan fields directly into the event for the SecurityPanel.
+            if sec_risk_level:
+                parsed.update({
+                    "security_risk_level":         sec_risk_level,
+                    "security_risk_score":         float(sec_risk_score) if sec_risk_score is not None else None,
+                    "should_block":                bool(sec_should_block),
+                    "injection_detected":          bool(sec_injection),
+                    "injection_patterns":          list(sec_injection_patterns or []),
+                    "jailbreak_detected":          bool(sec_jailbreak),
+                    "jailbreak_patterns":          list(sec_jailbreak_patterns or []),
+                    "skeleton_key_detected":       bool(sec_skeleton),
+                    "skeleton_key_patterns":       list(sec_skeleton_patterns or []),
+                    "secrets_detected":            bool(sec_secrets),
+                    "secret_types":                list(sec_secret_types or []),
+                    "indirect_injection_detected": bool(sec_indirect),
+                    "indirect_injection_sources":  list(sec_indirect_sources or []),
+                    "semantic_attack_score":       float(sec_semantic_score) if sec_semantic_score is not None else None,
+                    "pii_entities_prompt":         list(sec_pii_prompt or []),
+                    "pii_entities_response":       list(sec_pii_response or []),
+                    "prompt_redacted":             sec_prompt_redacted or None,
+                    "response_redacted":           sec_response_redacted or None,
+                    "scan_latency":                float(sec_scan_latency) if sec_scan_latency is not None else None,
+                })
             evaluations: list[dict[str, Any]] = []
             if metrics:
                 metrics_l = list(metrics)
@@ -190,14 +236,6 @@ class ClickHouseClient:
                         "judge_model": judges_l[i] if i < len(judges_l) else "",
                         "details": parsed_details,
                     })
-                    # Merge security scan details directly into the event so the
-                    # SecurityPanel can read them without a separate API call.
-                    if (
-                        evaluator_v == "fluiq.security"
-                        and metric == "security_scan"
-                        and isinstance(parsed_details, dict)
-                    ):
-                        parsed.update(parsed_details)
             rows.append({
                 "api_key_prefix": prefix,
                 "event": parsed,
