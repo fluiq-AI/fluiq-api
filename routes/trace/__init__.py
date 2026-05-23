@@ -151,6 +151,11 @@ async def list_traces(
     roots_only: bool = Query(default=False),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
+    sort: str = Query(default="newest"),
+    status: str = Query(default="all"),
+    security: str = Query(default="all"),
+    integration: str = Query(default="all"),
+    quality: str = Query(default="all"),
 ) -> TraceListResponse:
     """Return traces for the caller's organization.
 
@@ -189,6 +194,11 @@ async def list_traces(
         roots_only=roots_only,
         limit=limit,
         offset=offset,
+        sort=sort,
+        status=status,
+        security=security,
+        integration=integration,
+        quality=quality,
     )
     persisted = [TraceRecord(**row) for row in rows]
     # In-flight runs only surface on the first page; subsequent pages page
@@ -197,7 +207,7 @@ async def list_traces(
     # for connections that landed on a different replica won't appear
     # here, which is the same trade-off the SSE broker already makes.
     running: list[TraceRecord] = []
-    if offset == 0:
+    if offset == 0 and status in ("all", "running"):
         in_flight = await running_registry.list_for(
             organization_id=str(org_id),
             api_key_prefix=selected_prefix,
