@@ -152,3 +152,14 @@ CREATE TABLE IF NOT EXISTS dataset_examples (
 );
 CREATE INDEX IF NOT EXISTS idx_dataset_examples_dataset_id ON dataset_examples(dataset_id);
 CREATE INDEX IF NOT EXISTS idx_dataset_examples_org_id     ON dataset_examples(org_id);
+
+-- Feedback collected when a user deletes their account.
+-- user_id is NOT a FK so the record survives after the user row is removed.
+CREATE TABLE IF NOT EXISTS account_deletion_feedback (
+    feedback_id UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID        NOT NULL,
+    email       TEXT        NOT NULL,
+    reason      TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_deletion_feedback_created_at ON account_deletion_feedback(created_at);

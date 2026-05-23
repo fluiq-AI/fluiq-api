@@ -1,4 +1,5 @@
 import json
+import uuid
 import httpx
 import base64
 import config
@@ -6,22 +7,27 @@ import secrets
 import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlencode
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Cookie, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Cookie, Request
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from typing import Optional
 
 
 from db_queues.postgresql.auth import (
     consume_password_reset,
     create_password_reset,
+    delete_user_account,
     email_exists,
     fetch_active_password_reset,
     get_user_by_email,
     is_refresh_token_revoked,
     register_user,
     revoke_refresh_token,
+    store_deletion_feedback,
     update_user_password,
-    find_or_create_oauth_user
+    find_or_create_oauth_user,
 )
+from db_queues.clickhouse import clickhouse_client
 from shared.email import email_service
 from shared.model import (
     ForgotPasswordResponse,
@@ -41,6 +47,7 @@ from .helper import (
     _normalize_email,
     _validate_password,
     _verify_password,
+    get_current_session,
 )
 from .model import (
     ForgotPasswordPayload,
@@ -262,6 +269,42 @@ async def reset_password(payload: ResetPasswordPayload) -> ResetPasswordResponse
         user_id=user.user_id, hashed_password=_hash_password(payload.new_password)
     )
     return ResetPasswordResponse(ok=True)
+
+# ── ACCOUNT DELETION ─────────────────────────────────────────────────────────
+
+class DeleteAccountPayload(BaseModel):
+    reason: Optional[str] = None
+
+
+class DeleteAccountResponse(BaseModel):
+    ok: bool = True
+
+
+@auth_router.delete(
+    "/delete-account",
+    status_code=status.HTTP_200_OK,
+    response_model=DeleteAccountResponse,
+)
+async def delete_account(
+    payload: DeleteAccountPayload,
+    session: dict = Depends(get_current_session),
+) -> DeleteAccountResponse:
+    from db_queues.postgresql.auth import get_user_by_id
+
+    user_id = uuid.UUID(session["sub"])
+    org_id = uuid.UUID(session["org_id"])
+
+    user = await get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    await store_deletion_feedback(user_id=user_id, email=user.email, reason=payload.reason)
+    await clickhouse_client.delete_org_data(org_id)
+    await delete_user_account(user_id=user_id, org_id=org_id)
+
+    logger.info("[auth] account deleted for user %s org %s", user_id, org_id)
+    return DeleteAccountResponse(ok=True)
+
 
 # ── OAUTH ────────────────────────────────────────────────────────────────────
 

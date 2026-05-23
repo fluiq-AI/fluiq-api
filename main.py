@@ -1,7 +1,8 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from db_queues.clickhouse import clickhouse_client
 from db_queues.kafka import kafka_queue, security_reply_consumer, playground_reply_consumer
 from db_queues.postgresql import postgres_client
@@ -53,6 +54,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 app.include_router(admin_router, prefix="/admin")
 app.include_router(trace.router, prefix="/api/v1")

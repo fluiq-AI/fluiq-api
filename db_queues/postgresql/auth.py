@@ -445,6 +445,38 @@ async def find_or_create_oauth_user(
         user_type="Free",
     )
 
+async def store_deletion_feedback(
+    user_id: uuid.UUID,
+    email: str,
+    reason: Optional[str],
+) -> None:
+    """Persist the reason a user deleted their account before their row is removed."""
+    async with postgres_client.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO account_deletion_feedback (user_id, email, reason) "
+            "VALUES ($1, $2, $3)",
+            user_id, email, reason or None,
+        )
+
+
+async def delete_user_account(user_id: uuid.UUID, org_id: uuid.UUID) -> None:
+    """Delete a user and their organization atomically.
+
+    Delete user first (removes the FK reference to org), then org (cascades
+    prompts, datasets, etc. via ON DELETE CASCADE).
+    """
+    async with postgres_client.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                f"DELETE FROM {config.POSTGRES_USER_TABLE} WHERE user_id = $1",
+                user_id,
+            )
+            await conn.execute(
+                f"DELETE FROM {config.POSTGRES_ORG_TABLE} WHERE org_id = $1",
+                org_id,
+            )
+
+
 __all__ = [
     "email_exists",
     "register_user",
@@ -465,5 +497,7 @@ __all__ = [
     "admin_list_users",
     "admin_update_user_type",
     "admin_list_organizations",
+    "store_deletion_feedback",
+    "delete_user_account",
     "API_KEY_LIMITS",
 ]

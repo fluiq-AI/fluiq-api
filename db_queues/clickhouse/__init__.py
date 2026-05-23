@@ -676,6 +676,27 @@ LIMIT {{limit:UInt32}}
             )
 
 
+    async def delete_org_data(self, organization_id: uuid.UUID) -> None:
+        """Delete all ClickHouse rows belonging to an organization.
+
+        Uses ALTER TABLE … DELETE mutations which are the standard way to
+        remove rows from MergeTree tables. The mutations run asynchronously
+        inside ClickHouse — the method fires all four and returns immediately.
+        """
+        org_str = str(organization_id)
+        tables = [
+            config.CLICKHOUSE_TRACE_TABLE,
+            config.CLICKHOUSE_TRACE_COSTS_TABLE,
+            config.CLICKHOUSE_EVALUATIONS_TABLE,
+            config.CLICKHOUSE_SECURITY_TABLE,
+        ]
+        for table in tables:
+            await self._client.command(
+                f"ALTER TABLE {table} DELETE WHERE organization_id = '{org_str}'"
+            )
+        logger.info("[CLICKHOUSE] Queued deletion mutations for org %s", org_str)
+
+
 clickhouse_client = ClickHouseClient()
 
 __all__ = [
