@@ -50,6 +50,7 @@ class CheckRequest(BaseModel):
     api_key:  str
     prompt:   str
     trace_id: Optional[str] = None
+    context:  Optional[dict] = None
 
 
 class CheckResponse(BaseModel):
@@ -64,18 +65,21 @@ async def _publish_blocked_trace(
     prefix: str,
     trace_id: str,
     result: CheckResponse,
+    context: Optional[dict] = None,
 ) -> None:
     try:
-        event = {
-            "trace_id":    trace_id,
-            "type":        "llm",
-            "status":      "blocked",
-            "success":     False,
-            "output":      result.block_reason,
+        event: dict = {
+            "trace_id":     trace_id,
+            "type":         "llm",
+            "status":       "blocked",
+            "success":      False,
+            "output":       result.block_reason,
             "block_reason": result.block_reason,
-            "risk_level":  result.risk_level,
+            "risk_level":   result.risk_level,
             "attack_types": result.attack_types,
         }
+        if context:
+            event.update({k: v for k, v in context.items() if v is not None})
         await kafka_queue.add_job(
             {
                 "organization_id": str(org_id),
@@ -121,7 +125,7 @@ async def pre_call_check(payload: CheckRequest) -> CheckResponse:
         if result is not None:
             response = CheckResponse(**result)
             if not response.allow and payload.trace_id:
-                await _publish_blocked_trace(str(org_id), prefix, payload.trace_id, response)
+                await _publish_blocked_trace(str(org_id), prefix, payload.trace_id, response, payload.context)
             return response
     except Exception:
         logger.exception("[SECURE] Kafka full-scan failed, falling back to pattern check")
@@ -136,5 +140,5 @@ async def pre_call_check(payload: CheckRequest) -> CheckResponse:
         attack_types = r.attack_types,
     )
     if not response.allow and payload.trace_id:
-        await _publish_blocked_trace(str(org_id), prefix, payload.trace_id, response)
+        await _publish_blocked_trace(str(org_id), prefix, payload.trace_id, response, payload.context)
     return response
