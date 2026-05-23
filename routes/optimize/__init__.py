@@ -1,11 +1,14 @@
 """fluiq-api  —  /api/v1/optimize/*
 
-GET  /cache-stats  — dashboard: cache hit/miss totals (JWT auth)
-GET  /profile      — SDK: optimization profile + Redis URL (API key auth, paid)
-GET  /evals        — CI: recent evaluation scores for eval gate (API key auth)
+GET  /cache-stats   — dashboard: cache hit/miss totals (JWT auth)
+GET  /profile       — SDK: optimization profile (API key auth, paid)
+GET  /cache/{key}   — SDK: proxy Redis GET (API key auth)
+POST /cache         — SDK: proxy Redis SET (API key auth)
+GET  /evals         — CI: recent evaluation scores for eval gate (API key auth)
 """
+import json
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 import config
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -86,7 +89,7 @@ async def get_cache_stats(
 # ── GET /profile  (SDK, API key auth, paid tier) ──────────────────────────────
 
 class ProfileResponse(BaseModel):
-    redis_url: str
+    redis_url: Optional[str] = None
     key_prefix: str
     models: list[str]
     ttl_seconds: int
@@ -141,6 +144,81 @@ async def get_optimization_profile(
         estimated_hit_rate=profile["estimated_hit_rate"],
         window_hours=profile["window_hours"],
     )
+
+
+# ── Lazy async Redis client ───────────────────────────────────────────────────
+
+_redis_client: Any = None
+
+
+def _get_redis() -> Any:
+    global _redis_client
+    if _redis_client is None:
+        import redis.asyncio as aioredis
+        _redis_client = aioredis.from_url(
+            config.REDIS_URL,
+            decode_responses=True,
+        )
+    return _redis_client
+
+
+def _org_cache_key(org_id: uuid.UUID, key: str) -> str:
+    return f"fluiq:{org_id.hex[:8]}:{key}"
+
+
+# ── GET /cache/{key}  (SDK proxy, API key auth) ───────────────────────────────
+
+@optimize_router.get("/cache/{key}")
+async def get_cache_entry(
+    key: str,
+    x_api_key: str = Header(..., alias="x-api-key"),
+) -> dict:
+    """Proxy a Redis GET for the SDK.  Namespaced by org; no tier check needed
+    (only reachable after a successful /profile fetch which already tier-gates)."""
+    org_id, _ = await _resolve_api_key_and_org(x_api_key)
+    if not config.REDIS_URL:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Cache unavailable")
+    try:
+        r = _get_redis()
+        raw = await r.get(_org_cache_key(org_id, key))
+        if raw is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="miss")
+        return {"value": json.loads(raw)}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="miss")
+
+
+# ── POST /cache  (SDK proxy, API key auth) ────────────────────────────────────
+
+class CacheSetRequest(BaseModel):
+    key: str
+    value: Any
+    ttl: Optional[int] = None
+
+
+@optimize_router.post("/cache", status_code=204)
+async def set_cache_entry(
+    body: CacheSetRequest,
+    x_api_key: str = Header(..., alias="x-api-key"),
+) -> None:
+    """Proxy a Redis SET for the SDK.  Namespaced by org; fire-and-forget from
+    the SDK side — the response is not awaited by the caller."""
+    org_id, _ = await _resolve_api_key_and_org(x_api_key)
+    if not config.REDIS_URL:
+        return
+    try:
+        r = _get_redis()
+        full_key = _org_cache_key(org_id, body.key)
+        serialized = json.dumps(body.value)
+        effective_ttl = body.ttl if body.ttl is not None else config.REDIS_DEFAULT_TTL_SECONDS
+        if effective_ttl:
+            await r.setex(full_key, effective_ttl, serialized)
+        else:
+            await r.set(full_key, serialized)
+    except Exception:
+        pass
 
 
 # ── GET /evals  (CI eval gate, API key auth) ──────────────────────────────────
@@ -203,6 +281,7 @@ __all__ = [
     "CacheStatsResponse",
     "CacheKindStats",
     "ProfileResponse",
+    "CacheSetRequest",
     "EvalsResponse",
     "EvalEntry",
 ]
