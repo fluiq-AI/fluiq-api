@@ -50,17 +50,17 @@ class SecurityReplyConsumer:
             logger.warning("[KAFKA] KAFKA_SECURITY_REPLY_TOPIC not set — reply consumer disabled")
             return
         
-        context = create_ssl_context(
-            cafile=self.kafka_cafile,
-            certfile=self.kafka_certfile,
-            keyfile=self.kafka_keyfile
-        )
+        # context = create_ssl_context(
+        #     cafile=self.kafka_cafile,
+        #     certfile=self.kafka_certfile,
+        #     keyfile=self.kafka_keyfile
+        # )
         
         self._consumer = AIOKafkaConsumer(
             self.default_topic,
             bootstrap_servers=self.bootstrap_servers,
-            security_protocol=self.kafka_security_protocol,
-            ssl_context=context,
+            # security_protocol=self.kafka_security_protocol,
+            # ssl_context=context,
             group_id=f"fluiq-api-security-reply-{uuid4().hex}",
             value_deserializer=lambda b: json.loads(b.decode("utf-8")),
             auto_offset_reset="latest",
@@ -149,16 +149,16 @@ class PlaygroundReplyConsumer:
             logger.warning("[KAFKA] KAFKA_PLAYGROUND_REPLY_TOPIC not set — playground reply consumer disabled")
             return
 
-        context = create_ssl_context(
-            cafile=self.kafka_cafile,
-            certfile=self.kafka_certfile,
-            keyfile=self.kafka_keyfile
-        )
+        # context = create_ssl_context(
+        #     cafile=self.kafka_cafile,
+        #     certfile=self.kafka_certfile,
+        #     keyfile=self.kafka_keyfile
+        # )
 
         self._consumer = AIOKafkaConsumer(
             self.default_topic,
-            security_protocol=self.kafka_security_protocol,
-            ssl_context=context,
+            # security_protocol=self.kafka_security_protocol,
+            # ssl_context=context,
             bootstrap_servers=self.bootstrap_servers,
             group_id=f"fluiq-api-playground-reply-{uuid4().hex}",
             value_deserializer=lambda b: json.loads(b.decode("utf-8")),

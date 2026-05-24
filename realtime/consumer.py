@@ -48,16 +48,16 @@ class TraceConsumer:
         if self._consumer is not None:
             return
         
-        context = create_ssl_context(
-            cafile=self.kafka_cafile,
-            certfile=self.kafka_certfile,
-            keyfile=self.kafka_keyfile
-        )
+        # context = create_ssl_context(
+        #     cafile=self.kafka_cafile,
+        #     certfile=self.kafka_certfile,
+        #     keyfile=self.kafka_keyfile
+        # )
         self._consumer = AIOKafkaConsumer(
             self.topic,
             bootstrap_servers=self.bootstrap_servers,
-            security_protocol=self.kafka_security_protocol,
-            ssl_context=context,
+            # security_protocol=self.kafka_security_protocol,
+            # ssl_context=context,
             group_id=self._group_id,
             value_deserializer=lambda b: json.loads(b.decode("utf-8")),
             enable_auto_commit=False,
