@@ -67,6 +67,43 @@ class PostgresClient:
             raise RuntimeError("PostgresClient pool not started; call start() first")
         return self._pool.acquire()
 
+    async def fetch_price(
+        self,
+        provider: str,
+        model: str,
+        modality: str = "Text",
+    ) -> Optional[dict]:
+        """Return the model_prices row for (provider, model, modality) or None.
+
+        Falls back to any modality when an exact modality match is not found.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT *
+                FROM model_prices
+                WHERE LOWER(provider) = LOWER($1)
+                  AND LOWER(model)    = LOWER($2)
+                  AND LOWER(modality) = LOWER($3)
+                ORDER BY id
+                LIMIT 1
+                """,
+                provider, model, modality,
+            )
+            if row is None:
+                row = await conn.fetchrow(
+                    """
+                    SELECT *
+                    FROM model_prices
+                    WHERE LOWER(provider) = LOWER($1)
+                      AND LOWER(model)    = LOWER($2)
+                    ORDER BY id
+                    LIMIT 1
+                    """,
+                    provider, model,
+                )
+        return dict(row) if row is not None else None
+
 
 postgres_client = PostgresClient()
 

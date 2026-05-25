@@ -12,7 +12,10 @@ Supported metrics: hallucination, faithfulness, relevance,
 """
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -21,6 +24,7 @@ from pydantic import BaseModel
 import config
 from db_queues.clickhouse import clickhouse_client
 from db_queues.kafka import kafka_queue, wait_for_playground_reply
+from db_queues.postgresql import postgres_client as pg_client
 from db_queues.postgresql.auth import resolve_api_key
 from realtime import trace_broker
 from routes.auth.helper import get_current_session
@@ -227,6 +231,118 @@ async def evaluate_playground(
         passed=result.get("passed", True),
         failures=result.get("failures") or [],
     )
+
+
+# ── Model comparison ──────────────────────────────────────────────────────────
+
+_ALLOWED_COMPARE_MODELS = frozenset({
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-6",
+    "claude-opus-4-7",
+})
+
+_MILLION = Decimal(1_000_000)
+
+
+def _d(value: Any) -> Decimal:
+    if value in (None, ""):
+        return Decimal(0)
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+async def _estimate_compare_cost(
+    model: str, in_tok: int, out_tok: int, cached_tok: int = 0
+) -> Optional[float]:
+    price = await pg_client.fetch_price("Anthropic", model, "Text")
+    if price is None:
+        return None
+
+    billable = max(in_tok - cached_tok, 0)
+    threshold = price.get("long_context_consider_token_greater_than")
+    long_ctx = bool(threshold) and in_tok > int(threshold)
+
+    if long_ctx:
+        in_rate     = _d(price.get("long_context_input_per_million"))
+        cached_rate = _d(price.get("long_context_cached_input_per_million"))
+        out_rate    = _d(price.get("long_context_output_per_million"))
+    else:
+        in_rate     = _d(price.get("input_token_cost_per_million"))
+        cached_rate = _d(price.get("cached_input_token_cost_per_million"))
+        out_rate    = _d(price.get("output_token_cost_per_million"))
+
+    total = (
+        Decimal(billable) * in_rate
+        + Decimal(cached_tok) * cached_rate
+        + Decimal(out_tok) * out_rate
+    ) / _MILLION
+    return float(round(total, 8))
+
+
+class CompareModelResult(BaseModel):
+    model:         str
+    output:        Optional[str]   = None
+    latency_ms:    Optional[int]   = None
+    input_tokens:  Optional[int]   = None
+    output_tokens: Optional[int]   = None
+    cost_usd:      Optional[float] = None
+    error:         Optional[str]   = None
+
+
+class CompareRequest(BaseModel):
+    prompt: str       = ""
+    models: List[str] = []
+
+
+class CompareResponse(BaseModel):
+    results: List[CompareModelResult]
+
+
+async def _run_one(prompt: str, model: str) -> CompareModelResult:
+    import anthropic
+    client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+    t0 = time.monotonic()
+    try:
+        resp = await client.messages.create(
+            model=model,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        output     = resp.content[0].text if resp.content else ""
+        in_tok     = resp.usage.input_tokens  if resp.usage else None
+        out_tok    = resp.usage.output_tokens if resp.usage else None
+        cached_tok = (getattr(resp.usage, "cache_read_input_tokens", None) or 0) if resp.usage else 0
+        cost_usd   = None
+        if in_tok is not None and out_tok is not None:
+            cost_usd = await _estimate_compare_cost(model, in_tok, out_tok, cached_tok)
+        return CompareModelResult(
+            model=model, output=output, latency_ms=latency_ms,
+            input_tokens=in_tok, output_tokens=out_tok, cost_usd=cost_usd,
+        )
+    except Exception as exc:
+        return CompareModelResult(
+            model=model,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            error=str(exc),
+        )
+
+
+@evaluate_router.post("/evaluate/compare", response_model=CompareResponse)
+async def evaluate_compare(
+    payload: CompareRequest,
+    session: dict = Depends(get_current_session),
+) -> CompareResponse:
+    """Run the same prompt against multiple Claude models in parallel."""
+    if not payload.prompt.strip():
+        raise HTTPException(status_code=422, detail="Prompt is required")
+    valid = [m for m in payload.models if m in _ALLOWED_COMPARE_MODELS]
+    if not valid:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No valid models. Allowed: {sorted(_ALLOWED_COMPARE_MODELS)}",
+        )
+    results = await asyncio.gather(*[_run_one(payload.prompt, m) for m in valid])
+    return CompareResponse(results=list(results))
 
 
 __all__ = ["evaluate_router", "EvaluateRequest", "EvaluateResponse"]

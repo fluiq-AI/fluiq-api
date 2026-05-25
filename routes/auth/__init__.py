@@ -81,7 +81,7 @@ async def register(payload: RegisterPayload) -> RegisterResponse:
         name=payload.name,
         email=email,
         hashed_password=_hash_password(payload.password),
-        user_type="Free",
+        user_type="Team",
     )
     if result is None:
         raise HTTPException(
