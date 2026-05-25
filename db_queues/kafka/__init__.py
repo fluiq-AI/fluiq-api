@@ -33,16 +33,16 @@ class KafkaQueue:
         if self._producer is not None:
             return
 
-        # context = create_ssl_context(
-        #     cafile=self.kafka_cafile,
-        #     certfile=self.kafka_certfile,
-        #     keyfile=self.kafka_keyfile
-        # )
+        context = create_ssl_context(
+            cafile=self.kafka_cafile,
+            certfile=self.kafka_certfile,
+            keyfile=self.kafka_keyfile
+        )
 
         self._producer = AIOKafkaProducer(
             bootstrap_servers=self.bootstrap_servers,
-            # security_protocol=self.kafka_security_protocol,
-            # ssl_context=context,
+            security_protocol=self.kafka_security_protocol,
+            ssl_context=context,
             value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
             key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else k,
             acks="all",
