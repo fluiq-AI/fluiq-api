@@ -276,6 +276,39 @@ async def get_recent_evals(
     )
 
 
+# ── GET /prompt-cache-stats  (dashboard, JWT auth) ────────────────────────────
+
+class PromptCacheStatsResponse(BaseModel):
+    window_hours: int
+    anthropic_cache_read_tokens: int
+    anthropic_cache_creation_tokens: int
+    provider_cached_tokens: int   # OpenAI + Gemini cached tokens
+    total_cached_tokens: int
+    calls: int
+    calls_with_hit: int
+
+
+@optimize_router.get("/prompt-cache-stats", response_model=PromptCacheStatsResponse)
+async def get_prompt_cache_stats(
+    session: dict = Depends(get_current_session),
+    window_hours: int = Query(default=24, ge=1, le=720),
+) -> PromptCacheStatsResponse:
+    """Return provider-level prompt cache token counts over the last ``window_hours``.
+
+    Aggregates Anthropic cache_read / cache_creation tokens and OpenAI
+    cached_tokens emitted by SDK-instrumented LLM calls.
+    """
+    org_id = uuid.UUID(session["org_id"])
+    organization = await get_organization(org_id)
+    if organization is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+    stats = await clickhouse_client.fetch_prompt_cache_stats(
+        organization_id=org_id,
+        window_hours=window_hours,
+    )
+    return PromptCacheStatsResponse(**stats)
+
+
 __all__ = [
     "optimize_router",
     "CacheStatsResponse",
@@ -284,4 +317,5 @@ __all__ = [
     "CacheSetRequest",
     "EvalsResponse",
     "EvalEntry",
+    "PromptCacheStatsResponse",
 ]

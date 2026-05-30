@@ -163,3 +163,28 @@ CREATE TABLE IF NOT EXISTS account_deletion_feedback (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_deletion_feedback_created_at ON account_deletion_feedback(created_at);
+
+-- Per-org guardrail policies — one row per (org, slug); "default" is the fallback
+CREATE TABLE IF NOT EXISTS guardrail_policies (
+    org_id            UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    slug              TEXT        NOT NULL DEFAULT 'default'
+                      CHECK (slug ~ '^[a-z0-9][a-z0-9\-_]{0,62}$'),
+    block_threshold   TEXT        NOT NULL DEFAULT 'high'
+                      CHECK (block_threshold IN ('medium', 'high')),
+    warn_threshold    TEXT        NOT NULL DEFAULT 'medium'
+                      CHECK (warn_threshold IN ('low', 'medium', 'high')),
+    block_categories  TEXT[]      NOT NULL DEFAULT '{}',
+    custom_deny_list  TEXT[]      NOT NULL DEFAULT '{}',
+    custom_allow_list TEXT[]      NOT NULL DEFAULT '{}',
+    alert_webhook     TEXT,
+    alert_on          TEXT[]      NOT NULL DEFAULT '{high}',
+    scan_responses    BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ,
+    PRIMARY KEY (org_id, slug)
+);
+-- Migrations for existing deployments
+ALTER TABLE guardrail_policies ADD COLUMN IF NOT EXISTS slug          TEXT    NOT NULL DEFAULT 'default';
+ALTER TABLE guardrail_policies ADD COLUMN IF NOT EXISTS scan_responses BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE guardrail_policies DROP CONSTRAINT IF EXISTS guardrail_policies_pkey;
+ALTER TABLE guardrail_policies ADD CONSTRAINT guardrail_policies_pkey PRIMARY KEY (org_id, slug);

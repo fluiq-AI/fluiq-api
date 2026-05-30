@@ -9,8 +9,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sse_starlette.sse import EventSourceResponse
 
 from db_queues.clickhouse import clickhouse_client
-from db_queues.kafka import kafka_queue
+from db_queues.kafka import kafka_queue, wait_for_reply
 from db_queues.postgresql.auth import get_organization, resolve_api_key
+from db_queues.postgresql.guardrails import get_policy
 from realtime import running_registry, trace_broker
 from routes.auth.helper import get_current_session
 from shared.quotas import (
@@ -78,45 +79,72 @@ async def ingestion(payload: IngestPayload):
         trace_id = str(uuid.uuid4())
         event["trace_id"] = trace_id
 
-    # Strip SDK-embedded configs before persisting the trace. These are only
-    # meaningful for the evaluator worker and must not reach ClickHouse.
+    # Strip SDK-embedded configs before persisting the trace.
     eval_config     = event.pop("_eval_config",     None)
     security_config = event.pop("_security_config", None)
 
-    # ``status="running"`` is a live-progress signal emitted before the
-    # actual call completes; the same trace_id will land again with the
-    # final event. Don't bump quota here (would double-count) and skip
-    # the evaluations fan-out (no inputs/outputs to score yet).
     is_running = event.get("status") == "running"
 
+    # ── Response gate ──────────────────────────────────────────────────────────
+    # Runs BEFORE Kafka publish so the result is embedded in the stored event.
+    # When scan_responses=True for this org, scan the response synchronously and
+    # stamp event["response_gate_blocked"]=True if flagged — this reaches ClickHouse.
+    response_gated = False
+    ingest_extra: dict = {}
+
+    if not is_running and security_config and event.get("type") == "llm":
+        _resp = event.get("response") or event.get("output") or ""
+        if isinstance(_resp, list):
+            _resp = " ".join(str(x) for x in _resp if x)
+        elif not isinstance(_resp, str):
+            _resp = str(_resp) if _resp else ""
+
+        if _resp:
+            _guardrail = security_config.get("guardrail", "default")
+            policy = await get_policy(org_id, slug=_guardrail)
+            if policy.scan_responses:
+                correlation_id = str(uuid.uuid4())
+                try:
+                    await kafka_queue.add_job(
+                        {
+                            "operation":      "response_gate_check",
+                            "response":       _resp,
+                            "correlation_id": correlation_id,
+                        },
+                        topic=config.KAFKA_EVAL_TOPIC,
+                    )
+                    gate = await wait_for_reply(correlation_id, timeout=3.0)
+                    if gate and gate.get("response_blocked"):
+                        event["response_gate_blocked"] = True  # persisted in ClickHouse
+                        ingest_extra = {
+                            "response_blocked": True,
+                            "block_reason":     gate.get("block_reason"),
+                            "risk_level":       gate.get("risk_level", "high"),
+                            "attack_types":     gate.get("attack_types", []),
+                        }
+                        response_gated = True
+                except Exception:
+                    pass  # fail open
+
+    # ── Kafka publish ──────────────────────────────────────────────────────────
     job = {
         "organization_id": str(org_id),
-        "api_key_prefix": prefix,
-        "trace_id": trace_id,
-        "event": event,
+        "api_key_prefix":  prefix,
+        "trace_id":        trace_id,
+        "event":           event,
     }
-    await kafka_queue.add_job(
-        job,
-        topic=config.KAFKA_TRACE_TOPIC,
-        key=str(org_id),
-    )
+    await kafka_queue.add_job(job, topic=config.KAFKA_TRACE_TOPIC, key=str(org_id))
     if not is_running:
         bump_trace_count(org_id)
 
     eval_skipped = False
     if not is_running and _is_retrieval_event(event):
-        # Vectorstore retrieval → auto ContextPrecision eval
         if quota.eval_over:
             eval_skipped = True
         else:
-            await kafka_queue.add_job(
-                job,
-                topic=config.KAFKA_EVAL_TOPIC,
-                key=str(org_id),
-            )
+            await kafka_queue.add_job(job, topic=config.KAFKA_EVAL_TOPIC, key=str(org_id))
             bump_eval_count(org_id)
     elif not is_running and eval_config and event.get("type") == "llm":
-        # SDK warn-mode eval: fan out to worker with the requested metrics
         if quota.eval_over:
             eval_skipped = True
         else:
@@ -128,17 +156,12 @@ async def ingestion(payload: IngestPayload):
             bump_eval_count(org_id)
 
     if not is_running and security_config:
-        await kafka_queue.add_job(
-            {**job, "security_config": security_config, "operation": "sdk_security"},
-            topic=config.KAFKA_EVAL_TOPIC,
-            key=str(org_id),
-        )
+        security_job = {**job, "security_config": security_config, "operation": "sdk_security"}
+        if response_gated:
+            security_job["response_gated"] = True
+        await kafka_queue.add_job(security_job, topic=config.KAFKA_EVAL_TOPIC, key=str(org_id))
 
-    return {
-        "ok": True,
-        "trace_id": trace_id,
-        "eval_skipped": eval_skipped,
-    }
+    return {"ok": True, "trace_id": trace_id, "eval_skipped": eval_skipped, **ingest_extra}
 
 
 @router.get("/traces", response_model=TraceListResponse)

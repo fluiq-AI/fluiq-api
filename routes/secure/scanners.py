@@ -15,23 +15,39 @@ def _compile(patterns: list[str]) -> list[tuple[str, re.Pattern]]:
     return [(p, re.compile(re.escape(p), re.IGNORECASE)) for p in patterns]
 
 
+def _preprocess(text: str) -> str:
+    """Strip HTML/XML markup before pattern matching so attackers cannot hide
+    injection payloads inside comments or tags (indirect injection via RAG)."""
+    # Strip HTML comments first (<!-- ... -->)
+    text = re.sub(r'<!--.*?-->', ' ', text, flags=re.DOTALL)
+    # Strip XML/HTML tags
+    text = re.sub(r'<[^>]+>', ' ', text)
+    # Collapse whitespace so multi-space gaps don't prevent matching
+    return ' '.join(text.split())
+
+
 _INJECTION_PATTERNS: list[str] = [
     "ignore previous instructions", "ignore all previous instructions",
     "ignore all instructions", "ignore your instructions",
-    "ignore your previous instructions", "disregard your",
-    "disregard all previous", "disregard the above", "disregard all instructions",
+    "ignore your previous instructions", "ignore above", "ignore the above",
+    "disregard your", "disregard all previous", "disregard the above",
+    "disregard all instructions",
     "override system", "override your instructions", "override the system prompt",
     "forget everything", "forget all previous instructions",
     "forget what you were told", "forget your previous",
     "do not follow", "do not follow your instructions",
     "### instruction", "###instruction", "[system]:", "[instructions]:",
-    "<|system|>", "<|im_start|>system", "new instruction:", "begin new instructions",
-    "start fresh", "reset your instructions", "clear your context",
-    "from now on", "from this point on", "starting now", "henceforth",
+    "<|system|>", "<|im_start|>system",
+    "new instruction:", "new instructions:", "new instructions",
+    "begin new instructions", "start fresh", "reset your instructions",
+    "clear your context", "from now on", "from this point on",
+    "starting now", "henceforth",
     "repeat the above", "print the above", "reveal your system prompt",
+    "reveal all system", "reveal system configuration", "reveal configuration",
     "show me your instructions", "what are your instructions",
     "tell me your system prompt", "output your system prompt",
     "repeat back your prompt", "{{", "{%",
+    "system configuration details", "new task:", "end of user input",
 ]
 
 _JAILBREAK_PATTERNS: list[str] = [
@@ -94,6 +110,11 @@ def check(prompt: str) -> CheckResult:
     if not prompt or not prompt.strip():
         return CheckResult(allow=True, block_reason=None, risk_level="clean", attack_types=[])
 
+    # Scan both the raw text and the markup-stripped version so that payloads
+    # hidden in HTML comments or XML tags (indirect injection via RAG) are caught.
+    normalized = _preprocess(prompt)
+    scan_targets = {prompt, normalized} if normalized != prompt else {prompt}
+
     attack_types: list[str] = []
     detected = False
 
@@ -102,7 +123,11 @@ def check(prompt: str) -> CheckResult:
         ("jailbreak",        _JAILBREAK_COMPILED),
         ("skeleton_key",     _SKELETON_COMPILED),
     ):
-        if any(rx.search(prompt) for _, rx in compiled):
+        if any(
+            rx.search(target)
+            for target in scan_targets
+            for _, rx in compiled
+        ):
             attack_types.append(label)
             detected = True
 

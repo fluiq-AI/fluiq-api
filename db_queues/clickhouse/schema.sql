@@ -86,3 +86,20 @@ CREATE TABLE IF NOT EXISTS fluiq.security_scans
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ingested_at)
 ORDER BY (organization_id, trace_id, ingested_at);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    event_id        UUID,
+    organization_id String,
+    actor           String,
+    event_type      LowCardinality(String),
+    http_method     LowCardinality(String),
+    http_path       String,
+    http_status     UInt16,
+    ip_address      String,
+    latency_ms      UInt32,
+    metadata        String,
+    row_hash        String,
+    created_at      DateTime64(3)
+) ENGINE = MergeTree()
+ORDER BY (organization_id, created_at)
+TTL created_at + INTERVAL 10 YEAR;
