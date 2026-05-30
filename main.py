@@ -6,11 +6,14 @@ from fastapi.responses import JSONResponse
 from db_queues.clickhouse import clickhouse_client
 from db_queues.kafka import kafka_queue, security_reply_consumer, playground_reply_consumer
 from db_queues.postgresql import postgres_client
+from middleware.audit import AuditMiddleware
 from realtime import trace_consumer
 from routes import trace, auth
 from routes.admin import admin_router
 from routes.agents import router as agents_router
 from routes.api_keys import api_keys_router
+from routes.audit import audit_router
+from routes.guardrails import guardrails_router
 from routes.evaluate import evaluate_router
 from routes.optimize import optimize_router
 from routes.datasets import datasets_router
@@ -47,6 +50,7 @@ if config.FRONTEND_BASE_URL:
     if config.FRONTEND_BASE_URL.startswith("https://") and not config.FRONTEND_BASE_URL.startswith("https://www."):
         _allowed_origins.append("https://www." + config.FRONTEND_BASE_URL.removeprefix("https://"))
 
+app.add_middleware(AuditMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins or ["*"],
@@ -60,6 +64,8 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 app.include_router(admin_router, prefix="/admin")
+app.include_router(audit_router, prefix="/api/v1")
+app.include_router(guardrails_router, prefix="/api/v1")
 app.include_router(trace.router, prefix="/api/v1")
 app.include_router(agents_router, prefix="/api/v1")
 app.include_router(quota_router, prefix="/api/v1")

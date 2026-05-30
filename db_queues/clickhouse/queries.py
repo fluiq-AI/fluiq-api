@@ -1,7 +1,10 @@
 """ClickHouse query methods — mixed into ClickHouseClient via inheritance."""
+import hashlib
+import hmac
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import config
@@ -260,6 +263,20 @@ WHERE organization_id = {{org_id:UUID}}
 GROUP BY kind
 """, parameters=params)
 
+        mcp_result = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT
+    JSONExtractString(toString(event), 'kind')                 AS kind,
+    countIf(JSONExtractBool(toString(event), 'cache_hit') = 1) AS hits,
+    countIf(JSONExtractBool(toString(event), 'cache_hit') = 0) AS misses,
+    count()                                                    AS calls
+FROM {target}
+WHERE organization_id = {{org_id:UUID}}
+  AND JSONExtractString(toString(event), 'type') = 'mcp'
+  AND JSONHas(toString(event), 'cache_hit')
+  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+GROUP BY kind
+""", parameters=params)
+
         per_kind: list[dict[str, Any]] = []
         total_hits = total_misses = total_calls = 0
 
@@ -279,6 +296,7 @@ GROUP BY kind
         _add_rows(llm_result.result_rows)
         _add_rows(fn_result.result_rows)
         _add_rows(vs_result.result_rows)
+        _add_rows(mcp_result.result_rows)
 
         total_lookups = total_hits + total_misses
         return {
@@ -286,6 +304,71 @@ GROUP BY kind
             "hits": total_hits, "misses": total_misses, "calls": total_calls,
             "hit_rate": (total_hits / total_lookups) if total_lookups else 0.0,
             "per_kind": per_kind,
+        }
+
+    # ── Prompt cache stats ────────────────────────────────────────────────────
+
+    async def fetch_prompt_cache_stats(
+        self,
+        organization_id: uuid.UUID,
+        window_hours: int = 24,
+        table: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Return aggregated provider-level prompt cache token counts.
+
+        Sums ``prompt_cache_read_tokens`` / ``prompt_cache_creation_tokens``
+        (Anthropic) and ``prompt_cached_tokens`` (OpenAI, Gemini) from LLM
+        traces.  Only traces that carry at least one of these fields are
+        included so the ``calls`` figure represents instrumented calls only.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target = table or self.default_table  # type: ignore[attr-defined]
+        params = {"org_id": str(organization_id), "window": int(window_hours)}
+
+        result = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT
+    sum(JSONExtractInt(toString(event), 'prompt_cache_read_tokens'))    AS anthropic_read,
+    sum(JSONExtractInt(toString(event), 'prompt_cache_creation_tokens')) AS anthropic_creation,
+    sum(JSONExtractInt(toString(event), 'prompt_cached_tokens'))         AS provider_cached,
+    count()                                                              AS calls,
+    countIf(
+        JSONExtractInt(toString(event), 'prompt_cache_read_tokens') > 0
+        OR JSONExtractInt(toString(event), 'prompt_cached_tokens') > 0
+    )                                                                    AS calls_with_hit
+FROM {target}
+WHERE organization_id = {{org_id:UUID}}
+  AND JSONExtractString(toString(event), 'type') = 'llm'
+  AND (
+        JSONHas(toString(event), 'prompt_cache_read_tokens')
+     OR JSONHas(toString(event), 'prompt_cached_tokens')
+  )
+  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+""", parameters=params)
+
+        if not result.result_rows:
+            return {
+                "window_hours": int(window_hours),
+                "anthropic_cache_read_tokens": 0,
+                "anthropic_cache_creation_tokens": 0,
+                "provider_cached_tokens": 0,
+                "total_cached_tokens": 0,
+                "calls": 0,
+                "calls_with_hit": 0,
+            }
+
+        row = result.result_rows[0]
+        anthropic_read, anthropic_creation, provider_cached, calls, calls_with_hit = (
+            int(v or 0) for v in row
+        )
+        return {
+            "window_hours": int(window_hours),
+            "anthropic_cache_read_tokens": anthropic_read,
+            "anthropic_cache_creation_tokens": anthropic_creation,
+            "provider_cached_tokens": provider_cached,
+            "total_cached_tokens": anthropic_read + provider_cached,
+            "calls": calls,
+            "calls_with_hit": calls_with_hit,
         }
 
     # ── Agents ────────────────────────────────────────────────────────────────
@@ -483,6 +566,109 @@ LIMIT {{limit:UInt32}}
                 evals_target, rows,
                 column_names=["organization_id", "trace_id", "metric", "score", "evaluator", "judge_model"],
             )
+
+    # ── Audit log ─────────────────────────────────────────────────────────────
+
+    async def insert_audit_event(
+        self,
+        organization_id: str,
+        actor: str,
+        event_type: str,
+        http_method: str,
+        http_path: str,
+        http_status: int,
+        ip_address: str,
+        latency_ms: int,
+        metadata: dict[str, Any],
+        hmac_secret: str,
+        table: Optional[str] = None,
+    ) -> None:
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        audit_table = table or config.CLICKHOUSE_AUDIT_TABLE
+        event_id   = str(uuid.uuid4())
+        created_at = datetime.now(timezone.utc)
+        ts_iso     = created_at.isoformat()
+
+        msg = f"{event_id}|{organization_id}|{event_type}|{actor}|{ts_iso}"
+        row_hash = hmac.new(hmac_secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+        await self._client.insert(  # type: ignore[attr-defined]
+            audit_table,
+            [[
+                event_id,
+                organization_id,
+                actor,
+                event_type,
+                http_method,
+                http_path,
+                int(http_status),
+                ip_address,
+                int(latency_ms),
+                json.dumps(metadata, default=str),
+                row_hash,
+                created_at,
+            ]],
+            column_names=[
+                "event_id", "organization_id", "actor", "event_type",
+                "http_method", "http_path", "http_status", "ip_address",
+                "latency_ms", "metadata", "row_hash", "created_at",
+            ],
+        )
+
+    async def fetch_audit_log(
+        self,
+        organization_id: uuid.UUID,
+        event_type: Optional[str] = None,
+        actor: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+        table: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        audit_table = table or config.CLICKHOUSE_AUDIT_TABLE
+
+        where  = "organization_id = {org_id:String}"
+        params: dict[str, Any] = {
+            "org_id": str(organization_id),
+            "limit":  limit,
+            "offset": offset,
+        }
+        if event_type:
+            where += " AND event_type = {event_type:String}"
+            params["event_type"] = event_type
+        if actor:
+            where += " AND actor = {actor:String}"
+            params["actor"] = actor
+
+        result = await self._client.query(  # type: ignore[attr-defined]
+            f"SELECT event_id, organization_id, actor, event_type, "
+            f"       http_method, http_path, http_status, ip_address, "
+            f"       latency_ms, metadata, row_hash, created_at "
+            f"FROM {audit_table} "
+            f"WHERE {where} "
+            f"ORDER BY created_at DESC "
+            f"LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}",
+            parameters=params,
+        )
+        return [
+            {
+                "event_id":        str(row[0]),
+                "organization_id": str(row[1]),
+                "actor":           row[2],
+                "event_type":      row[3],
+                "http_method":     row[4],
+                "http_path":       row[5],
+                "http_status":     int(row[6]),
+                "ip_address":      row[7],
+                "latency_ms":      int(row[8]),
+                "metadata":        json.loads(row[9]) if row[9] else {},
+                "row_hash":        row[10],
+                "created_at":      row[11].isoformat() if row[11] else None,
+            }
+            for row in result.result_rows
+        ]
 
     # ── Admin ─────────────────────────────────────────────────────────────────
 
