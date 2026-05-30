@@ -57,7 +57,7 @@ async def contact(payload: ContactPayload):
       </div>
 
       <p style="margin:32px 0 0;font-size:12px;color:#94a3b8">
-        Sent via fluiq.dev contact form · Reply directly to <a href="mailto:{email}" style="color:#94a3b8">{email}</a>
+        Sent via getfluiq.com contact form · Reply directly to <a href="mailto:{email}" style="color:#94a3b8">{email}</a>
       </p>
     </div>
     """
