@@ -21,6 +21,7 @@ from routes.prompts import prompts_router
 from routes.quota import quota_router
 from routes.secure import router as secure_router
 from routes.contact import router as contact_router
+from routes.blog import blog_router
 import config
 
 @asynccontextmanager
@@ -54,6 +55,12 @@ app.add_middleware(AuditMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins or ["*"],
+    # Allow any localhost origin so (a) the frontend prerender step — which runs
+    # in a headless browser on 127.0.0.1:<random-port> during the build and
+    # fetches published blog posts from this API — passes CORS, and (b) local
+    # dev works against a deployed API. Real browsers can't spoof a localhost
+    # Origin, so this doesn't widen the production surface.
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -75,6 +82,7 @@ app.include_router(datasets_router, prefix="/api/v1")
 app.include_router(optimize_router, prefix="/api/v1/optimize")
 app.include_router(secure_router, prefix="/api/v1")
 app.include_router(contact_router, prefix="/api/v1")
+app.include_router(blog_router, prefix="/api/v1")
 app.include_router(auth.auth_router, prefix="/auth")
 app.include_router(api_keys_router, prefix="/api-keys")
 

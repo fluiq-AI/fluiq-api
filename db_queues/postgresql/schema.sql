@@ -188,3 +188,37 @@ ALTER TABLE guardrail_policies ADD COLUMN IF NOT EXISTS slug          TEXT    NO
 ALTER TABLE guardrail_policies ADD COLUMN IF NOT EXISTS scan_responses BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE guardrail_policies DROP CONSTRAINT IF EXISTS guardrail_policies_pkey;
 ALTER TABLE guardrail_policies ADD CONSTRAINT guardrail_policies_pkey PRIMARY KEY (org_id, slug);
+
+-- Blog: marketing/content posts authored in the admin panel (WYSIWYG -> HTML).
+-- Platform-wide content (not org-scoped); only Admin users can write.
+CREATE TABLE IF NOT EXISTS blog_posts (
+    post_id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug            TEXT        NOT NULL UNIQUE
+                    CHECK (slug ~ '^[a-z0-9][a-z0-9\-]{0,126}$'),
+    title           TEXT        NOT NULL,
+    excerpt         TEXT        NOT NULL DEFAULT '',
+    body_html       TEXT        NOT NULL DEFAULT '',
+    cover_image_url TEXT,
+    author          TEXT        NOT NULL DEFAULT 'Fluiq',
+    tags            TEXT[]      NOT NULL DEFAULT '{}',
+    status          TEXT        NOT NULL DEFAULT 'draft'
+                    CHECK (status IN ('draft', 'published')),
+    seo_title       TEXT,
+    seo_description TEXT,
+    reading_minutes INTEGER     NOT NULL DEFAULT 1,
+    published_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_blog_posts_status_pub
+    ON blog_posts(status, published_at DESC);
+
+-- Blog media stored directly in Postgres (bytea) and served via the API.
+CREATE TABLE IF NOT EXISTS blog_media (
+    media_id     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    filename     TEXT        NOT NULL,
+    content_type TEXT        NOT NULL,
+    data         BYTEA       NOT NULL,
+    byte_size    INTEGER     NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

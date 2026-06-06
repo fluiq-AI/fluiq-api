@@ -36,6 +36,12 @@ PASSWORD_RESET_OTP_LENGTH = int(os.getenv("PASSWORD_RESET_OTP_LENGTH"))
 PASSWORD_RESET_EXPIRE_MINUTES = int(os.getenv("PASSWORD_RESET_EXPIRE_MINUTES"))
 FRONTEND_BASE_URL = (os.getenv("FRONTEND_BASE_URL") or "").rstrip("/")
 
+# Render "Deploy Hook" URL for the frontend static site. When a blog post is
+# published / updated / unpublished we POST here to trigger a rebuild, which
+# re-runs the prerender step so the post is baked into static HTML for SEO.
+# Optional — publishing still works (fails open) when this is unset.
+RENDER_DEPLOY_HOOK_URL = os.getenv("RENDER_DEPLOY_HOOK_URL")
+
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST")
 CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT"))
 CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER")
