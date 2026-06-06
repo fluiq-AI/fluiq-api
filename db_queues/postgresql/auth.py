@@ -442,7 +442,7 @@ async def find_or_create_oauth_user(
         name=name,
         email=email,
         hashed_password=hashed,
-        user_type="Team",
+        user_type="Free",
     )
 
 async def store_deletion_feedback(
