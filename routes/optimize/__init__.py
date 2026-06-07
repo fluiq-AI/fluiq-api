@@ -11,12 +11,12 @@ import uuid
 from typing import Any, Optional
 
 import config
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from db_queues.clickhouse import clickhouse_client
 from db_queues.postgresql.auth import get_organization, get_org_tier, resolve_api_key
-from routes.auth.helper import get_current_session
+from routes.auth.helper import extract_api_key, get_current_session
 
 _OPTIMIZE_TIERS = {"Team", "Growth", "Enterprise"}
 
@@ -99,7 +99,7 @@ class ProfileResponse(BaseModel):
 
 @optimize_router.get("/profile", response_model=ProfileResponse)
 async def get_optimization_profile(
-    x_api_key: str = Header(..., alias="x-api-key"),
+    api_key: Optional[str] = Depends(extract_api_key),
     window_hours: int = Query(default=168, ge=1, le=720),
     min_calls: int = Query(default=10, ge=1),
 ) -> ProfileResponse:
@@ -112,7 +112,7 @@ async def get_optimization_profile(
 
     Requires Team plan or above.  Free accounts receive 402.
     """
-    org_id, tier = await _resolve_api_key_and_org(x_api_key)
+    org_id, tier = await _resolve_api_key_and_org(api_key)
     if tier not in _OPTIMIZE_TIERS:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -171,11 +171,11 @@ def _org_cache_key(org_id: uuid.UUID, key: str) -> str:
 @optimize_router.get("/cache/{key}")
 async def get_cache_entry(
     key: str,
-    x_api_key: str = Header(..., alias="x-api-key"),
+    api_key: Optional[str] = Depends(extract_api_key),
 ) -> dict:
     """Proxy a Redis GET for the SDK.  Namespaced by org; no tier check needed
     (only reachable after a successful /profile fetch which already tier-gates)."""
-    org_id, _ = await _resolve_api_key_and_org(x_api_key)
+    org_id, _ = await _resolve_api_key_and_org(api_key)
     if not config.REDIS_URL:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Cache unavailable")
     try:
@@ -201,11 +201,11 @@ class CacheSetRequest(BaseModel):
 @optimize_router.post("/cache", status_code=204)
 async def set_cache_entry(
     body: CacheSetRequest,
-    x_api_key: str = Header(..., alias="x-api-key"),
+    api_key: Optional[str] = Depends(extract_api_key),
 ) -> None:
     """Proxy a Redis SET for the SDK.  Namespaced by org; fire-and-forget from
     the SDK side — the response is not awaited by the caller."""
-    org_id, _ = await _resolve_api_key_and_org(x_api_key)
+    org_id, _ = await _resolve_api_key_and_org(api_key)
     if not config.REDIS_URL:
         return
     try:
@@ -242,7 +242,7 @@ class EvalsResponse(BaseModel):
 
 @optimize_router.get("/evals", response_model=EvalsResponse)
 async def get_recent_evals(
-    x_api_key: str = Header(..., alias="x-api-key"),
+    api_key: Optional[str] = Depends(extract_api_key),
     window_minutes: int = Query(default=30, ge=1, le=1440),
     threshold: float = Query(default=0.7, ge=0.0, le=1.0),
     limit: int = Query(default=200, ge=1, le=1000),
@@ -255,7 +255,7 @@ async def get_recent_evals(
     Auth: SDK API key in ``x-api-key`` header (no login required — safe for CI).
     No tier gating — all accounts with at least one evaluation can use this.
     """
-    org_id, _ = await _resolve_api_key_and_org(x_api_key)
+    org_id, _ = await _resolve_api_key_and_org(api_key)
     rows = await clickhouse_client.fetch_recent_evals(
         organization_id=org_id,
         window_minutes=window_minutes,

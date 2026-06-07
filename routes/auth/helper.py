@@ -7,8 +7,9 @@ import bcrypt
 import jwt
 import config
 from email_validator import EmailNotValidError, validate_email
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from typing import Optional
 
 PASSWORD_MIN_LENGTH = 8
 _PASSWORD_LETTER_RE = re.compile(r"[A-Za-z]")
@@ -135,3 +136,28 @@ def get_current_session(
 ) -> dict:
     """FastAPI dependency: decode Bearer access token; return JWT claims."""
     return _decode_access_token(credentials.credentials)
+
+
+# ── SDK API-key auth ───────────────────────────────────────────────────────────
+
+# auto_error=False so a missing header doesn't 403 before we can fall back to the
+# legacy x-api-key header / request body and raise our own 401.
+_api_key_bearer = HTTPBearer(auto_error=False)
+
+
+def extract_api_key(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_api_key_bearer),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+) -> Optional[str]:
+    """FastAPI dependency: pull the SDK API key out of the request.
+
+    The current SDK sends it as an ``Authorization: Bearer <key>`` header.
+    Falls back to the legacy ``x-api-key`` header for older SDK builds. Returns
+    ``None`` when neither is present so body-based routes can fall back to a
+    payload field before raising 401.
+    """
+    if credentials and credentials.credentials:
+        return credentials.credentials
+    if x_api_key:
+        return x_api_key
+    return None
