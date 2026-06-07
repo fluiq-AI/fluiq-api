@@ -27,7 +27,7 @@ from db_queues.kafka import kafka_queue, wait_for_playground_reply
 from db_queues.postgresql import postgres_client as pg_client
 from db_queues.postgresql.auth import resolve_api_key
 from realtime import trace_broker
-from routes.auth.helper import get_current_session
+from routes.auth.helper import extract_api_key, get_current_session
 from .judge import run_metrics, SUPPORTED_METRICS
 
 evaluate_router = APIRouter()
@@ -47,7 +47,7 @@ async def _resolve_org(api_key: str) -> uuid.UUID:
 # ── Request / response models ─────────────────────────────────────────────────
 
 class EvaluateRequest(BaseModel):
-    api_key:     str
+    api_key:     Optional[str]       = None
     trace_id:    Optional[str]       = None
     model:       str                 = ""
     prompt:      str                 = ""
@@ -76,7 +76,10 @@ class EvaluateResponse(BaseModel):
 # ── POST /evaluate ────────────────────────────────────────────────────────────
 
 @evaluate_router.post("/evaluate", response_model=EvaluateResponse)
-async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
+async def evaluate(
+    payload: EvaluateRequest,
+    api_key: Optional[str] = Depends(extract_api_key),
+) -> EvaluateResponse:
     """Run LLM-as-judge evaluation for a prompt/response pair.
 
     Called by the SDK after each LLM call when ``fluiq.eval()`` is active.
@@ -84,7 +87,7 @@ async def evaluate(payload: EvaluateRequest) -> EvaluateResponse:
     Results are stored in ClickHouse and returned synchronously so the SDK
     can enforce thresholds.
     """
-    org_id = await _resolve_org(payload.api_key)
+    org_id = await _resolve_org(api_key or payload.api_key)
 
     valid_metrics = [m for m in payload.metrics if m in SUPPORTED_METRICS]
     if not valid_metrics:

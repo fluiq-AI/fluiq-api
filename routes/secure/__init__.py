@@ -22,13 +22,14 @@ from typing import List, Optional
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 import config
 from db_queues.postgresql.auth import resolve_api_key, get_org_tier
 from db_queues.postgresql.guardrails import get_policy, GuardrailPolicy
 from db_queues.kafka import kafka_queue, wait_for_reply
+from routes.auth.helper import extract_api_key
 from . import scanners
 
 logger = logging.getLogger(__name__)
@@ -57,7 +58,7 @@ async def _resolve_and_gate(api_key: str) -> tuple:
 
 
 class CheckRequest(BaseModel):
-    api_key:   str
+    api_key:   Optional[str] = None
     prompt:    str
     trace_id:  Optional[str] = None
     context:   Optional[dict] = None
@@ -178,9 +179,12 @@ async def _publish_blocked_trace(
 # ── Route ─────────────────────────────────────────────────────────────────────
 
 @router.post("/secure/check", response_model=CheckResponse)
-async def pre_call_check(payload: CheckRequest) -> CheckResponse:
+async def pre_call_check(
+    payload: CheckRequest,
+    api_key: Optional[str] = Depends(extract_api_key),
+) -> CheckResponse:
     """Pre-call security guard with per-org guardrail policy."""
-    org_id, prefix = await _resolve_and_gate(payload.api_key)
+    org_id, prefix = await _resolve_and_gate(api_key or payload.api_key)
     policy = await get_policy(org_id, slug=payload.guardrail or "default")
 
     # 1. Allow-list short-circuit

@@ -16,7 +16,7 @@ import re
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, field_validator
 
 from db_queues.postgresql.auth import resolve_api_key
@@ -35,7 +35,7 @@ from db_queues.postgresql.prompts import (
     undeploy_from_environment,
     update_prompt,
 )
-from routes.auth.helper import get_current_session
+from routes.auth.helper import extract_api_key, get_current_session
 
 prompts_router = APIRouter()
 
@@ -224,16 +224,30 @@ async def restore_prompt_version(
 # ── API-key-authenticated fetch (for SDK) ─────────────────────────────────────
 
 @prompts_router.get("/prompts/fetch/{slug}")
-async def fetch_prompt(slug: str, api_key: str, env: str = "production"):
+async def fetch_prompt(
+    slug: str,
+    env: str = "production",
+    api_key: Optional[str] = Depends(extract_api_key),
+    api_key_query: Optional[str] = Query(default=None, alias="api_key"),
+):
     """Fetch a deployed prompt by slug + environment. Used by the SDK.
 
     ``env`` defaults to ``production``. Falls back to the legacy ``is_deployed``
     flag when no environment row exists and env is ``production``.
+
+    The API key arrives as an ``Authorization: Bearer`` header; the ``api_key``
+    query parameter is still honoured for older SDK builds.
     """
     if env not in VALID_ENVIRONMENTS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"env must be one of: {', '.join(sorted(VALID_ENVIRONMENTS))}",
+        )
+    api_key = api_key or api_key_query
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key required",
         )
     resolved = await resolve_api_key(api_key)
     if resolved is None:

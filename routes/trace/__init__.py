@@ -13,7 +13,7 @@ from db_queues.kafka import kafka_queue, wait_for_reply
 from db_queues.postgresql.auth import get_organization, resolve_api_key
 from db_queues.postgresql.guardrails import get_policy
 from realtime import running_registry, trace_broker
-from routes.auth.helper import get_current_session
+from routes.auth.helper import extract_api_key, get_current_session
 from shared.quotas import (
     bump_eval_count,
     bump_trace_count,
@@ -45,13 +45,17 @@ def _is_retrieval_event(event: dict) -> bool:
 
 
 @router.post("/ingest")
-async def ingestion(payload: IngestPayload):
-    if not payload.api_key:
+async def ingestion(
+    payload: IngestPayload,
+    api_key: Optional[str] = Depends(extract_api_key),
+):
+    api_key = api_key or payload.api_key
+    if not api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="API key required",
         )
-    resolved = await resolve_api_key(payload.api_key)
+    resolved = await resolve_api_key(api_key)
     if resolved is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
