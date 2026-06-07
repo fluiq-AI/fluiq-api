@@ -180,10 +180,18 @@ class ClickHouseQueryMixin:
     # ── Counts ────────────────────────────────────────────────────────────────
 
     async def count_rows(self, organization_id: uuid.UUID, table: str) -> int:
+        """Count rows for an org in the current calendar month (UTC).
+
+        Tier quotas are advertised per month on the pricing page, so usage is
+        scoped to the start of the current month rather than counted lifetime.
+        The window resets automatically at each month boundary.
+        """
         if self._client is None:  # type: ignore[attr-defined]
             await self.start()  # type: ignore[attr-defined]
         result = await self._client.query(  # type: ignore[attr-defined]
-            f"SELECT count() FROM {table} WHERE organization_id = {{org_id:UUID}}",
+            f"SELECT count() FROM {table} "
+            f"WHERE organization_id = {{org_id:UUID}} "
+            f"  AND ingested_at >= toStartOfMonth(now('UTC'))",
             parameters={"org_id": str(organization_id)},
         )
         rows = result.result_rows

@@ -35,7 +35,7 @@ from . import scanners
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_SECURE_TIERS = {"Team", "Growth", "Enterprise"}
+_SECURE_TIERS = {"Growth", "Enterprise"}
 
 
 async def _resolve_and_gate(api_key: str) -> tuple:
@@ -50,7 +50,7 @@ async def _resolve_and_gate(api_key: str) -> tuple:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail=(
-                f"fluiq.secure() requires Team plan or above "
+                f"fluiq.secure() requires Growth plan or above "
                 f"(current plan: {tier}). Upgrade at getfluiq.com/dashboard."
             ),
         )
