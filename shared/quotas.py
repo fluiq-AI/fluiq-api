@@ -1,14 +1,14 @@
 """Tier-based quotas for trace ingestion and automated evaluations.
 
 The pricing page advertises four tiers (Free / Team / Growth / Enterprise)
-with caps on lifetime traces and on LLM-as-judge evaluations. This module
+with per-month caps on traces and on LLM-as-judge evaluations. This module
 holds the canonical mapping plus a tiny in-process TTL cache so the hot
 ``/ingest`` path can check usage without hammering ClickHouse on every
 request.
 
 Counts are pulled from ClickHouse (``fluiq.traces`` and ``fluiq.evaluations``)
-filtered on ``organization_id``, which is the leading sort key for both
-tables, so a ``count()`` is a fast index probe.
+filtered on ``organization_id`` and the current calendar month, so usage
+resets at each month boundary in line with the advertised quotas.
 """
 from __future__ import annotations
 
@@ -22,9 +22,9 @@ from db_queues.postgresql.auth import get_org_tier
 
 UNLIMITED = -1
 
-# (trace_quota, eval_quota); -1 means unlimited.
+# (trace_quota, eval_quota) per calendar month; -1 means unlimited.
 TIER_QUOTAS: dict[str, tuple[int, int]] = {
-    "Free":       (5_000_000,   1_000),
+    "Free":       (50_000,      1_000),
     "Team":       (UNLIMITED,  10_000),
     "Growth":     (UNLIMITED, 100_000),
     "Enterprise": (UNLIMITED, UNLIMITED),
