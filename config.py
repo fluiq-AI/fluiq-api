@@ -21,6 +21,10 @@ KAFKA_SSL_KEY_FILE=os.getenv("KAFKA_SSL_KEY_FILE")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN")
 POSTGRES_POOL_MIN = int(os.getenv("POSTGRES_POOL_MIN"))
 POSTGRES_POOL_MAX = int(os.getenv("POSTGRES_POOL_MAX"))
+# Path to a CA certificate (.pem) used to verify the Postgres server's TLS
+# certificate. When set, the connection uses full verification (verify-full).
+# Leave empty/unset for local development (no CA verification).
+POSTGRES_SSL_CA_FILE = os.getenv("POSTGRES_SSL_CA_FILE")
 
 POSTGRES_USER_TABLE = os.getenv("POSTGRES_USER_TABLE")
 POSTGRES_ORG_TABLE = os.getenv("POSTGRES_ORG_TABLE")

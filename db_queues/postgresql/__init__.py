@@ -1,5 +1,6 @@
 import json
 import os
+import ssl
 import logging
 import config
 from pathlib import Path
@@ -16,6 +17,25 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _build_ssl_context() -> Optional[ssl.SSLContext]:
+    """Build a TLS context that verifies the server against POSTGRES_SSL_CA_FILE.
+
+    Returns None when no CA file is configured, so asyncpg falls back to the
+    sslmode (if any) embedded in the DSN — preserving local/dev behavior.
+    """
+    ca_file = getattr(config, "POSTGRES_SSL_CA_FILE", None)
+    if not ca_file:
+        return None
+    if not Path(ca_file).is_file():
+        raise FileNotFoundError(
+            f"POSTGRES_SSL_CA_FILE is set but the file was not found: {ca_file}"
+        )
+    ctx = ssl.create_default_context(cafile=ca_file)
+    # create_default_context already sets check_hostname=True and
+    # verify_mode=CERT_REQUIRED (equivalent to libpq sslmode=verify-full).
+    return ctx
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
@@ -41,6 +61,7 @@ class PostgresClient:
             min_size=self.pool_min,
             max_size=self.pool_max,
             init=_init_connection,
+            ssl=_build_ssl_context(),
         )
         logger.info("[POSTGRES] Connection pool started: %s", self.dsn)
         await self._apply_schema()
