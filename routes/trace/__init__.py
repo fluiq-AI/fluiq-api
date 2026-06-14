@@ -115,7 +115,7 @@ async def ingestion(
                             "response":       _resp,
                             "correlation_id": correlation_id,
                         },
-                        topic=config.KAFKA_EVAL_TOPIC,
+                        topic=config.KAFKA_SECURITY_TOPIC,
                     )
                     gate = await wait_for_reply(correlation_id, timeout=3.0)
                     if gate and gate.get("response_blocked"):
@@ -163,7 +163,7 @@ async def ingestion(
         security_job = {**job, "security_config": security_config, "operation": "sdk_security"}
         if response_gated:
             security_job["response_gated"] = True
-        await kafka_queue.add_job(security_job, topic=config.KAFKA_EVAL_TOPIC, key=str(org_id))
+        await kafka_queue.add_job(security_job, topic=config.KAFKA_SECURITY_TOPIC, key=str(org_id))
 
     return {"ok": True, "trace_id": trace_id, "eval_skipped": eval_skipped, **ingest_extra}
 

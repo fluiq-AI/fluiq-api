@@ -237,7 +237,7 @@ async def pre_call_check(
                     "block_categories": policy.block_categories,
                 },
             },
-            topic=config.KAFKA_EVAL_TOPIC,
+            topic=config.KAFKA_SECURITY_TOPIC,
         )
         result = await wait_for_reply(correlation_id, timeout=config.KAFKA_SECURITY_CHECK_TIMEOUT)
         if result is not None:

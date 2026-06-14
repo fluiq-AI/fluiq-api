@@ -5,3 +5,4 @@ output.json
 .env.development
 .env.production
 scripts
+ecs-task-def.json
