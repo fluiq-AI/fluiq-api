@@ -19,8 +19,6 @@ from uuid import uuid4
 
 from aiokafka import AIOKafkaConsumer
 import config
-from aiokafka.helpers import create_ssl_context
-from os import PathLike
 
 logger = logging.getLogger(__name__)
 
@@ -31,40 +29,25 @@ class SecurityReplyConsumer:
     def __init__(self, 
                 bootstrap_servers: str = config.KAFKA_BOOTSTRAP_SERVERS,
                 default_topic: str = config.KAFKA_SECURITY_REPLY_TOPIC,
-                kafka_cafile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_CA_FILE,
-                kafka_certfile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_CERT_FILE,
-                kafka_keyfile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_KEY_FILE,
-                kafka_security_protocol: str = config.KAFKA_SECURITY_PROTOCOL
                  ) -> None:
         self._consumer: Optional[AIOKafkaConsumer] = None
         self._task: Optional[asyncio.Task] = None
         self.bootstrap_servers = bootstrap_servers
         self.default_topic = default_topic
-        self.kafka_cafile = kafka_cafile
-        self.kafka_certfile = kafka_certfile
-        self.kafka_keyfile = kafka_keyfile
-        self.kafka_security_protocol = kafka_security_protocol
         
     async def start(self) -> None:
         if not config.KAFKA_SECURITY_REPLY_TOPIC:
             logger.warning("[KAFKA] KAFKA_SECURITY_REPLY_TOPIC not set — reply consumer disabled")
             return
         
-        # context = create_ssl_context(
-        #     cafile=self.kafka_cafile,
-        #     certfile=self.kafka_certfile,
-        #     keyfile=self.kafka_keyfile
-        # )
-        
         self._consumer = AIOKafkaConsumer(
             self.default_topic,
             bootstrap_servers=self.bootstrap_servers,
-            # security_protocol=self.kafka_security_protocol,
-            # ssl_context=context,
             group_id=f"fluiq-api-security-reply-{uuid4().hex}",
             value_deserializer=lambda b: json.loads(b.decode("utf-8")),
             auto_offset_reset="latest",
             enable_auto_commit=False,
+            **config.kafka_auth_kwargs(),
         )
         await self._consumer.start()
         self._task = asyncio.create_task(self._consume())
@@ -129,41 +112,26 @@ class PlaygroundReplyConsumer:
     def __init__(
             self,
             bootstrap_servers: str = config.KAFKA_BOOTSTRAP_SERVERS,
-                 default_topic: str = config.KAFKA_PLAYGROUND_REPLY_TOPIC,
-                kafka_cafile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_CA_FILE,
-                kafka_certfile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_CERT_FILE,
-                kafka_keyfile: str | bytes | PathLike[str] | PathLike[bytes] | None = config.KAFKA_SSL_KEY_FILE,
-                kafka_security_protocol: str = config.KAFKA_SECURITY_PROTOCOL
+            default_topic: str = config.KAFKA_PLAYGROUND_REPLY_TOPIC,
             ) -> None:
         self._consumer: Optional[AIOKafkaConsumer] = None
         self._task: Optional[asyncio.Task] = None
         self.bootstrap_servers = bootstrap_servers
         self.default_topic = default_topic
-        self.kafka_cafile = kafka_cafile
-        self.kafka_certfile = kafka_certfile
-        self.kafka_keyfile = kafka_keyfile
-        self.kafka_security_protocol = kafka_security_protocol
 
     async def start(self) -> None:
         if not config.KAFKA_PLAYGROUND_REPLY_TOPIC:
             logger.warning("[KAFKA] KAFKA_PLAYGROUND_REPLY_TOPIC not set — playground reply consumer disabled")
             return
 
-        # context = create_ssl_context(
-        #     cafile=self.kafka_cafile,
-        #     certfile=self.kafka_certfile,
-        #     keyfile=self.kafka_keyfile
-        # )
-
         self._consumer = AIOKafkaConsumer(
             self.default_topic,
-            # security_protocol=self.kafka_security_protocol,
-            # ssl_context=context,
             bootstrap_servers=self.bootstrap_servers,
             group_id=f"fluiq-api-playground-reply-{uuid4().hex}",
             value_deserializer=lambda b: json.loads(b.decode("utf-8")),
             auto_offset_reset="latest",
             enable_auto_commit=False,
+            **config.kafka_auth_kwargs(),
         )
         await self._consumer.start()
         self._task = asyncio.create_task(self._consume())
