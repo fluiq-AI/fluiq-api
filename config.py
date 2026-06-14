@@ -1,4 +1,5 @@
 import os
+import ssl
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -12,10 +13,34 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
 KAFKA_TRACE_TOPIC = os.getenv("KAFKA_TRACE_TOPIC")
 KAFKA_TRACE_PERSISTED_TOPIC = os.getenv("KAFKA_TRACE_PERSISTED_TOPIC")
 KAFKA_EVAL_TOPIC = os.getenv("KAFKA_EVAL_TOPIC")
+# Dedicated topic for the standalone security worker (separate from evals so the
+# heavy torch/spaCy security deps don't run in the evaluator).
+KAFKA_SECURITY_TOPIC = os.getenv("KAFKA_SECURITY_TOPIC")
+# PLAINTEXT (local docker) | SASL_SSL (AWS MSK SASL/SCRAM)
 KAFKA_SECURITY_PROTOCOL=os.getenv("KAFKA_SECURITY_PROTOCOL")
-KAFKA_SSL_CA_FILE=os.getenv("KAFKA_SSL_CA_FILE")
-KAFKA_SSL_CERT_FILE=os.getenv("KAFKA_SSL_CERT_FILE")
-KAFKA_SSL_KEY_FILE=os.getenv("KAFKA_SSL_KEY_FILE")
+KAFKA_SASL_MECHANISM=os.getenv("KAFKA_SASL_MECHANISM", "SCRAM-SHA-512")
+KAFKA_SASL_USERNAME=os.getenv("KAFKA_SASL_USERNAME")
+KAFKA_SASL_PASSWORD=os.getenv("KAFKA_SASL_PASSWORD")
+
+
+def kafka_auth_kwargs() -> dict:
+    """aiokafka security kwargs derived from env, shared by producer + consumers.
+
+    PLAINTEXT (default, local docker-compose) → no auth.
+    SASL_SSL → SCRAM-SHA-512 username/password over TLS (AWS MSK). MSK broker
+    certs chain to Amazon Trust Services (in the default CA bundle), so no CA
+    file is needed.
+    """
+    protocol = (KAFKA_SECURITY_PROTOCOL or "PLAINTEXT").upper()
+    if protocol == "SASL_SSL":
+        return {
+            "security_protocol": "SASL_SSL",
+            "sasl_mechanism": KAFKA_SASL_MECHANISM,
+            "sasl_plain_username": KAFKA_SASL_USERNAME,
+            "sasl_plain_password": KAFKA_SASL_PASSWORD,
+            "ssl_context": ssl.create_default_context(),
+        }
+    return {"security_protocol": "PLAINTEXT"}
 
 
 POSTGRES_DSN = os.getenv("POSTGRES_DSN")
