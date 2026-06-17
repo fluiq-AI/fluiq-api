@@ -96,16 +96,46 @@ class ClickHouseQueryMixin:
                 )
 
         # Status filter
+        #
+        # When the query returns root rows (the trace list's roots_only, or the
+        # per-agent view's agent_key), `failed`/`blocked` are subtree-aware: a
+        # root matches when it OR any descendant span (anything sharing its
+        # root_trace_id) is failed/blocked. This lets a user surface whole trace
+        # trees that contain a failure even when the root itself completed —
+        # e.g. an agent that recovered from a failed tool call. For the rare
+        # non-root fetch (paging raw spans) we keep the row-level predicate so
+        # "failed" still means the individual failing spans.
+        returning_roots = roots_only or agent_key is not None
+        blocked_pred = "JSONExtractString(toString(event), 'status') = 'blocked'"
+        failed_pred = (
+            "JSONHas(toString(event), 'success')"
+            " AND JSONExtractBool(toString(event), 'success') = 0"
+            " AND JSONExtractString(toString(event), 'status') != 'blocked'"
+        )
         if status == "running":
             where += " AND JSONExtractString(toString(t.event), 'status') = 'running'"
         elif status == "blocked":
-            where += " AND JSONExtractString(toString(t.event), 'status') = 'blocked'"
+            if returning_roots:
+                where += (
+                    " AND t.root_trace_id IN ("
+                    f"   SELECT DISTINCT root_trace_id FROM {target}"
+                    "    WHERE organization_id = {org_id:UUID}"
+                    f"      AND {blocked_pred}"
+                    " )"
+                )
+            else:
+                where += f" AND {blocked_pred.replace('event', 't.event')}"
         elif status == "failed":
-            where += (
-                " AND JSONHas(toString(t.event), 'success')"
-                " AND JSONExtractBool(toString(t.event), 'success') = 0"
-                " AND JSONExtractString(toString(t.event), 'status') != 'blocked'"
-            )
+            if returning_roots:
+                where += (
+                    " AND t.root_trace_id IN ("
+                    f"   SELECT DISTINCT root_trace_id FROM {target}"
+                    "    WHERE organization_id = {org_id:UUID}"
+                    f"      AND {failed_pred}"
+                    " )"
+                )
+            else:
+                where += f" AND {failed_pred.replace('event', 't.event')}"
         elif status == "completed":
             where += (
                 " AND JSONExtractString(toString(t.event), 'status') NOT IN ('running', 'blocked')"
@@ -202,6 +232,47 @@ class ClickHouseQueryMixin:
 
     async def count_evaluations(self, organization_id: uuid.UUID) -> int:
         return await self.count_rows(organization_id, config.CLICKHOUSE_EVALUATIONS_TABLE)
+
+    # ── Spending ────────────────────────────────────────────────────────────────
+
+    async def fetch_spending_by_day(
+        self,
+        organization_id: uuid.UUID,
+        days: int = 30,
+        table: Optional[str] = None,
+        costs_table: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Daily spend grouped by provider for the spending chart.
+
+        Aggregates server-side from ``trace_costs`` (provider + total_cost are
+        plain columns) joined to ``traces`` only for the ``ingested_at``
+        timestamp. This returns at most ``days`` × providers rows instead of
+        making the client pull ~1000 fully-joined trace rows (with the eval
+        groupArray and security joins) just to sum costs — the single heaviest
+        query on the dashboard's first paint.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target = table or self.default_table  # type: ignore[attr-defined]
+        costs_target = costs_table or config.CLICKHOUSE_TRACE_COSTS_TABLE
+        params = {"org_id": str(organization_id), "days": int(days)}
+        result = await self._client.query(  # type: ignore[attr-defined]
+            f"SELECT toString(toDate(t.ingested_at)) AS day, "
+            f"       c.provider AS provider, "
+            f"       sum(c.total_cost) AS cost "
+            f"FROM {costs_target} AS c "
+            f"INNER JOIN {target} AS t "
+            f"  ON t.organization_id = c.organization_id "
+            f" AND t.trace_id = c.trace_id "
+            f"WHERE c.organization_id = {{org_id:UUID}} "
+            f"  AND t.ingested_at >= now() - toIntervalDay({{days:UInt32}}) "
+            f"GROUP BY day, provider",
+            parameters=params,
+        )
+        return [
+            {"day": row[0], "provider": row[1] or "", "cost": float(row[2] or 0)}
+            for row in result.result_rows
+        ]
 
     # ── Cache stats ───────────────────────────────────────────────────────────
 

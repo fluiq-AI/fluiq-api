@@ -22,6 +22,17 @@ KAFKA_SASL_MECHANISM=os.getenv("KAFKA_SASL_MECHANISM", "SCRAM-SHA-512")
 KAFKA_SASL_USERNAME=os.getenv("KAFKA_SASL_USERNAME")
 KAFKA_SASL_PASSWORD=os.getenv("KAFKA_SASL_PASSWORD")
 
+# Max producer request size (bytes) and matching consumer fetch ceiling. Trace
+# events can legitimately reach a few MB (large prompts / responses / tool
+# outputs); the aiokafka + broker default of ~1MB rejected them in _serialize
+# with MessageSizeTooLargeError, surfacing as a 500 on POST /api/v1/ingest.
+# This MUST stay <= the broker `message.max.bytes` / topic `max.message.bytes`
+# and <= the consumers' fetch sizes, or producing/replicating will still fail.
+# Note: the per-message guard runs on the *uncompressed* serialized size, so
+# raising this is required even with compression enabled.
+KAFKA_MAX_REQUEST_SIZE = int(os.getenv("KAFKA_MAX_REQUEST_SIZE", str(10 * 1024 * 1024)))
+KAFKA_MAX_FETCH_BYTES = int(os.getenv("KAFKA_MAX_FETCH_BYTES", str(10 * 1024 * 1024)))
+
 
 def kafka_auth_kwargs() -> dict:
     """aiokafka security kwargs derived from env, shared by producer + consumers.

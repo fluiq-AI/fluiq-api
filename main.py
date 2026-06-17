@@ -1,3 +1,5 @@
+import logging
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -43,6 +45,8 @@ async def lifespan(app: FastAPI):
         await kafka_queue.stop()
 
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(lifespan=lifespan)
 
 _allowed_origins: list[str] = []
@@ -51,16 +55,41 @@ if config.FRONTEND_BASE_URL:
     if config.FRONTEND_BASE_URL.startswith("https://") and not config.FRONTEND_BASE_URL.startswith("https://www."):
         _allowed_origins.append("https://www." + config.FRONTEND_BASE_URL.removeprefix("https://"))
 
+# Localhost origins are allowed so (a) the frontend prerender step — which runs
+# in a headless browser on 127.0.0.1:<random-port> during the build and fetches
+# published blog posts from this API — passes CORS, and (b) local dev works
+# against a deployed API. Real browsers can't spoof a localhost Origin, so this
+# doesn't widen the production surface.
+_LOCALHOST_ORIGIN_RE = re.compile(r"https?://(localhost|127\.0\.0\.1)(:\d+)?")
+
+
+def _cors_headers_for(request: Request) -> dict[str, str]:
+    """CORS headers for an *error* response.
+
+    Starlette's ``CORSMiddleware`` only decorates responses that flow back
+    through it; a 500 produced by the outermost error layer bypasses it and
+    arrives at the browser without ``Access-Control-Allow-Origin``, which the
+    browser then reports as a (misleading) CORS failure that masks the real
+    error. We re-apply the same allow rules here so backend errors surface as
+    the actual status/body instead of a phantom CORS error.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return {}
+    if origin not in _allowed_origins and not _LOCALHOST_ORIGIN_RE.fullmatch(origin):
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Vary": "Origin",
+    }
+
+
 app.add_middleware(AuditMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins or ["*"],
-    # Allow any localhost origin so (a) the frontend prerender step — which runs
-    # in a headless browser on 127.0.0.1:<random-port> during the build and
-    # fetches published blog posts from this API — passes CORS, and (b) local
-    # dev works against a deployed API. Real browsers can't spoof a localhost
-    # Origin, so this doesn't widen the production surface.
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origin_regex=_LOCALHOST_ORIGIN_RE.pattern,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -68,7 +97,16 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+    # Log the real cause (previously swallowed) so cold-start / DB timeouts on
+    # first load are diagnosable instead of surfacing only as browser CORS noise.
+    logger.exception(
+        "Unhandled error on %s %s", request.method, request.url.path,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+        headers=_cors_headers_for(request),
+    )
 
 app.include_router(admin_router, prefix="/admin")
 app.include_router(audit_router, prefix="/api/v1")
