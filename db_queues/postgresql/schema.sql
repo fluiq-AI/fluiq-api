@@ -213,12 +213,13 @@ CREATE TABLE IF NOT EXISTS blog_posts (
 CREATE INDEX IF NOT EXISTS idx_blog_posts_status_pub
     ON blog_posts(status, published_at DESC);
 
--- Blog media stored directly in Postgres (bytea) and served via the API.
+-- Blog media stored in a private S3 bucket; only the object key lives here.
+-- The public media endpoint redirects to a short-lived presigned GET URL.
 CREATE TABLE IF NOT EXISTS blog_media (
     media_id     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     filename     TEXT        NOT NULL,
     content_type TEXT        NOT NULL,
-    data         BYTEA       NOT NULL,
+    s3_key       TEXT        NOT NULL,
     byte_size    INTEGER     NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

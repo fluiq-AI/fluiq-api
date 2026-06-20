@@ -71,6 +71,15 @@ FRONTEND_BASE_URL = (os.getenv("FRONTEND_BASE_URL") or "").rstrip("/")
 # Optional — publishing still works (fails open) when this is unset.
 RENDER_DEPLOY_HOOK_URL = os.getenv("RENDER_DEPLOY_HOOK_URL")
 
+# ── Blog media on S3 ──────────────────────────────────────────────────────────
+# Blog images live in a private S3 bucket; only the object key is stored in
+# Postgres. The public media endpoint redirects to a short-lived presigned GET
+# URL, so the bucket never needs public access. Credentials come from the ECS
+# task role (no static keys). Locally, configure AWS_* env / profile to test.
+AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
+S3_BLOG_MEDIA_BUCKET = os.getenv("S3_BLOG_MEDIA_BUCKET")
+S3_PRESIGN_TTL = int(os.getenv("S3_PRESIGN_TTL", "3600"))  # seconds
+
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST")
 CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT"))
 CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER")
