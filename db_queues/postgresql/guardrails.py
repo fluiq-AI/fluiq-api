@@ -26,6 +26,22 @@ ALL_CATEGORIES = [
     "indirect_injection",
 ]
 
+# PII entity types the worker can detect (mirrors pii._ENTITY_WEIGHTS, minus the
+# secret-key entities which are governed by `secrets_detected`). An org can list
+# any of these in `pii_ignore` to suppress them — used for warn-mode PII policy.
+PII_ENTITIES = [
+    "US_SSN",
+    "CREDIT_CARD",
+    "IBAN_CODE",
+    "CRYPTO",
+    "US_PASSPORT",
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "PERSON",
+    "LOCATION",
+    "IP_ADDRESS",
+]
+
 
 @dataclass
 class GuardrailPolicy:
@@ -36,6 +52,7 @@ class GuardrailPolicy:
     block_categories:  list[str]          = field(default_factory=list)
     custom_deny_list:  list[str]          = field(default_factory=list)
     custom_allow_list: list[str]          = field(default_factory=list)
+    pii_ignore:        list[str]          = field(default_factory=list)
     alert_webhook:     Optional[str]      = None
     alert_on:          list[str]          = field(default_factory=lambda: ["high"])
     scan_responses:    bool               = False
@@ -49,6 +66,7 @@ class GuardrailPolicy:
             "block_categories":  self.block_categories,
             "custom_deny_list":  self.custom_deny_list,
             "custom_allow_list": self.custom_allow_list,
+            "pii_ignore":        self.pii_ignore,
             "alert_webhook":     self.alert_webhook,
             "alert_on":          self.alert_on,
             "scan_responses":    self.scan_responses,
@@ -73,6 +91,7 @@ def _from_row(row, org_id: str) -> GuardrailPolicy:
         block_categories  = list(row["block_categories"] or []),
         custom_deny_list  = list(row["custom_deny_list"] or []),
         custom_allow_list = list(row["custom_allow_list"] or []),
+        pii_ignore        = list(row["pii_ignore"] or []),
         alert_webhook     = row["alert_webhook"],
         alert_on          = list(row["alert_on"] or ["high"]),
         scan_responses    = bool(row["scan_responses"]),
@@ -114,15 +133,16 @@ async def upsert_policy(org_id: uuid.UUID, policy: GuardrailPolicy) -> Guardrail
             f"""
             INSERT INTO {_TABLE}
                 (org_id, slug, block_threshold, warn_threshold, block_categories,
-                 custom_deny_list, custom_allow_list, alert_webhook, alert_on,
-                 scan_responses, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+                 custom_deny_list, custom_allow_list, pii_ignore, alert_webhook,
+                 alert_on, scan_responses, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
             ON CONFLICT (org_id, slug) DO UPDATE SET
                 block_threshold   = EXCLUDED.block_threshold,
                 warn_threshold    = EXCLUDED.warn_threshold,
                 block_categories  = EXCLUDED.block_categories,
                 custom_deny_list  = EXCLUDED.custom_deny_list,
                 custom_allow_list = EXCLUDED.custom_allow_list,
+                pii_ignore        = EXCLUDED.pii_ignore,
                 alert_webhook     = EXCLUDED.alert_webhook,
                 alert_on          = EXCLUDED.alert_on,
                 scan_responses    = EXCLUDED.scan_responses,
@@ -135,6 +155,7 @@ async def upsert_policy(org_id: uuid.UUID, policy: GuardrailPolicy) -> Guardrail
             policy.block_categories,
             policy.custom_deny_list,
             policy.custom_allow_list,
+            policy.pii_ignore,
             policy.alert_webhook,
             policy.alert_on,
             policy.scan_responses,
