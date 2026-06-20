@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS guardrail_policies (
     block_categories  TEXT[]      NOT NULL DEFAULT '{}',
     custom_deny_list  TEXT[]      NOT NULL DEFAULT '{}',
     custom_allow_list TEXT[]      NOT NULL DEFAULT '{}',
+    pii_ignore        TEXT[]      NOT NULL DEFAULT '{}',
     alert_webhook     TEXT,
     alert_on          TEXT[]      NOT NULL DEFAULT '{high}',
     scan_responses    BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -186,6 +187,7 @@ CREATE TABLE IF NOT EXISTS guardrail_policies (
 -- Migrations for existing deployments
 ALTER TABLE guardrail_policies ADD COLUMN IF NOT EXISTS slug          TEXT    NOT NULL DEFAULT 'default';
 ALTER TABLE guardrail_policies ADD COLUMN IF NOT EXISTS scan_responses BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE guardrail_policies ADD COLUMN IF NOT EXISTS pii_ignore    TEXT[]  NOT NULL DEFAULT '{}';
 ALTER TABLE guardrail_policies DROP CONSTRAINT IF EXISTS guardrail_policies_pkey;
 ALTER TABLE guardrail_policies ADD CONSTRAINT guardrail_policies_pkey PRIMARY KEY (org_id, slug);
 

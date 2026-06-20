@@ -121,6 +121,7 @@ async def ingestion(
                             "operation":      "response_gate_check",
                             "response":       _resp,
                             "correlation_id": correlation_id,
+                            "pii_ignore":     policy.pii_ignore,
                         },
                         topic=config.KAFKA_SECURITY_TOPIC,
                     )
@@ -182,7 +183,15 @@ async def ingestion(
             bump_eval_count(org_id)
 
     if not is_running and security_config:
-        security_job = {**job, "security_config": security_config, "operation": "sdk_security"}
+        # Forward the org's warn-mode PII policy so the worker suppresses ignored
+        # entity types (cached get_policy — cheap; reuses the response-gate fetch).
+        _sec_policy = await get_policy(org_id, slug=security_config.get("guardrail", "default"))
+        security_job = {
+            **job,
+            "security_config": security_config,
+            "operation":       "sdk_security",
+            "pii_ignore":      _sec_policy.pii_ignore,
+        }
         if response_gated:
             security_job["response_gated"] = True
         await kafka_queue.add_job(security_job, topic=config.KAFKA_SECURITY_TOPIC, key=str(org_id))

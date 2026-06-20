@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from db_queues.postgresql.guardrails import (
     ALL_CATEGORIES,
+    PII_ENTITIES,
     GuardrailPolicy,
     delete_policy,
     get_policy,
@@ -42,6 +43,7 @@ class GuardrailPolicyPayload(BaseModel):
     block_categories:  List[str]        = Field(default_factory=list)
     custom_deny_list:  List[str]        = Field(default_factory=list)
     custom_allow_list: List[str]        = Field(default_factory=list)
+    pii_ignore:        List[str]        = Field(default_factory=list)
     alert_webhook:     Optional[str]    = None
     alert_on:          List[str]        = Field(default_factory=lambda: ["high"])
     scan_responses:    bool             = False
@@ -91,6 +93,12 @@ async def save_policy(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Invalid alert_on values: {bad_on}",
         )
+    bad_pii = [e for e in payload.pii_ignore if e not in PII_ENTITIES]
+    if bad_pii:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unknown pii_ignore entities: {bad_pii}. Valid: {PII_ENTITIES}",
+        )
 
     deny  = [p.strip() for p in payload.custom_deny_list  if p.strip()]
     allow = [p.strip() for p in payload.custom_allow_list if p.strip()]
@@ -103,6 +111,7 @@ async def save_policy(
         block_categories  = payload.block_categories,
         custom_deny_list  = deny,
         custom_allow_list = allow,
+        pii_ignore        = sorted(set(payload.pii_ignore)),
         alert_webhook     = payload.alert_webhook or None,
         alert_on          = payload.alert_on,
         scan_responses    = payload.scan_responses,

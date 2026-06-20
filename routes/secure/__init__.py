@@ -235,6 +235,7 @@ async def pre_call_check(
                 "policy": {
                     "block_threshold":  policy.block_threshold,
                     "block_categories": policy.block_categories,
+                    "pii_ignore":       policy.pii_ignore,
                 },
             },
             topic=config.KAFKA_SECURITY_TOPIC,
