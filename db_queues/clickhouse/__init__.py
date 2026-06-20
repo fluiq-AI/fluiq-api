@@ -45,6 +45,14 @@ class ClickHouseClient(ClickHouseQueryMixin):
             password=self.password,
             database=self.database,
         )
+        # Warm the connection during startup so the first real query on the
+        # dashboard's first paint doesn't also pay the TCP/TLS + handshake cost
+        # (which, when it pushed requests past the gateway timeout, surfaced as
+        # phantom CORS errors on first login).
+        try:
+            await self._client.query("SELECT 1")
+        except Exception:
+            logger.exception("[CLICKHOUSE] Warm-up query failed")
         logger.info("[CLICKHOUSE] Client started: %s:%s/%s", self.host, self.port, self.database)
 
     async def stop(self) -> None:

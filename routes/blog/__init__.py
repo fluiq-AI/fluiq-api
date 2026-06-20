@@ -24,13 +24,16 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import (
-    APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status,
+    APIRouter, Depends, File, HTTPException, Query, UploadFile, status,
 )
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, field_validator
 
 import config
 from db_queues.postgresql import blog as blog_db
 from routes.admin import require_admin
+from shared import s3
 
 logger = logging.getLogger(__name__)
 
@@ -193,14 +196,17 @@ async def get_post(slug: str):
 
 @blog_router.get("/media/{media_id}")
 async def get_media(media_id: uuid.UUID):
+    """Redirect to a short-lived presigned S3 URL for the object.
+
+    The stable URL stored in post content is this endpoint; the presigned URL it
+    redirects to expires, so it's never baked into ``body_html``. A 307 keeps the
+    method and lets <img> tags follow the redirect transparently.
+    """
     row = await blog_db.get_media(media_id)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media not found")
-    return Response(
-        content=bytes(row["data"]),
-        media_type=row["content_type"],
-        headers={"Cache-Control": "public, max-age=31536000, immutable"},
-    )
+    url = s3.presigned_url(row["s3_key"], content_type=row["content_type"])
+    return RedirectResponse(url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
@@ -320,7 +326,14 @@ async def admin_upload_media(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="Image exceeds the 5 MB limit.",
         )
-    media_id = await blog_db.insert_media(file.filename or "upload", content_type, data)
+    filename = file.filename or "upload"
+    # Opaque, collision-free key; preserve the extension for nicer downloads.
+    ext = ""
+    if "." in filename:
+        ext = "." + re.sub(r"[^a-zA-Z0-9]", "", filename.rsplit(".", 1)[-1])[:8].lower()
+    s3_key = f"blog/{uuid.uuid4().hex}{ext}"
+    await run_in_threadpool(s3.put_object, s3_key, data, content_type)
+    media_id = await blog_db.insert_media(filename, content_type, s3_key, len(data))
     return {"media_id": str(media_id), "url": f"/api/v1/blog/media/{media_id}"}
 
 

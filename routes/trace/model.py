@@ -28,3 +28,16 @@ class TraceListResponse(BaseModel):
     traces: list[TraceRecord]
     limit: int
     offset: int
+
+
+class SpendingDay(BaseModel):
+    date: str          # YYYY-MM-DD (UTC)
+    all: float = 0.0
+    openai: float = 0.0
+    anthropic: float = 0.0
+    google: float = 0.0
+    other: float = 0.0
+
+
+class SpendingResponse(BaseModel):
+    days: list[SpendingDay]

@@ -184,15 +184,17 @@ async def delete_post(post_id: uuid.UUID) -> bool:
 
 # ── Media ─────────────────────────────────────────────────────────────────────
 
-async def insert_media(filename: str, content_type: str, data: bytes) -> uuid.UUID:
+async def insert_media(
+    filename: str, content_type: str, s3_key: str, byte_size: int
+) -> uuid.UUID:
     async with postgres_client.acquire() as conn:
         media_id = await conn.fetchval(
             """
-            INSERT INTO blog_media (filename, content_type, data, byte_size)
+            INSERT INTO blog_media (filename, content_type, s3_key, byte_size)
             VALUES ($1, $2, $3, $4)
             RETURNING media_id
             """,
-            filename, content_type, data, len(data),
+            filename, content_type, s3_key, byte_size,
         )
         return media_id
 
@@ -200,6 +202,6 @@ async def insert_media(filename: str, content_type: str, data: bytes) -> uuid.UU
 async def get_media(media_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT content_type, data FROM blog_media WHERE media_id = $1", media_id
+            "SELECT content_type, s3_key FROM blog_media WHERE media_id = $1", media_id
         )
         return dict(row) if row else None

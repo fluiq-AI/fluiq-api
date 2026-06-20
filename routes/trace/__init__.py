@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from aiokafka.errors import MessageSizeTooLargeError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sse_starlette.sse import EventSourceResponse
 
@@ -20,7 +21,13 @@ from shared.quotas import (
     get_quota_status,
 )
 
-from .model import IngestPayload, TraceListResponse, TraceRecord
+from .model import (
+    IngestPayload,
+    SpendingResponse,
+    SpendingDay,
+    TraceListResponse,
+    TraceRecord,
+)
 
 
 router = APIRouter()
@@ -137,7 +144,22 @@ async def ingestion(
         "trace_id":        trace_id,
         "event":           event,
     }
-    await kafka_queue.add_job(job, topic=config.KAFKA_TRACE_TOPIC, key=str(org_id))
+    # A trace event larger than the producer's max_request_size used to crash
+    # here with an unhandled MessageSizeTooLargeError → 500. Return an explicit
+    # 413 instead so the SDK/client gets an actionable error and we don't log a
+    # traceback for an oversized-payload condition. Guarding the trace publish is
+    # enough: the eval/security fan-outs below reuse the same `event`, so a
+    # rejected trace short-circuits before they run.
+    try:
+        await kafka_queue.add_job(job, topic=config.KAFKA_TRACE_TOPIC, key=str(org_id))
+    except MessageSizeTooLargeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                "Trace event exceeds the maximum ingestion size. Reduce the size "
+                "of prompts, responses, or tool outputs captured in this event."
+            ),
+        ) from exc
     if not is_running:
         bump_trace_count(org_id)
 
@@ -275,6 +297,44 @@ async def list_traces(
         limit=limit,
         offset=offset,
     )
+
+
+# Provider name (as stored in trace_costs) → spending-chart bucket.
+_SPEND_PROVIDER_BUCKET = {
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "google": "google",
+}
+
+
+@router.get("/traces/spending", response_model=SpendingResponse)
+async def trace_spending(
+    session: dict = Depends(get_current_session),
+    days: int = Query(default=30, ge=1, le=365),
+) -> SpendingResponse:
+    """Daily spend by provider for the dashboard spending chart.
+
+    Server-side aggregation so the chart doesn't pull ~1000 fully-joined trace
+    rows on first paint (see fetch_spending_by_day).
+    """
+    org_id = uuid.UUID(session["org_id"])
+    rows = await clickhouse_client.fetch_spending_by_day(org_id, days=days)
+
+    by_date: dict[str, SpendingDay] = {}
+    for row in rows:
+        day = row["day"]
+        if not day:
+            continue
+        bucket = _SPEND_PROVIDER_BUCKET.get((row["provider"] or "").lower(), "other")
+        cost = row["cost"]
+        entry = by_date.get(day)
+        if entry is None:
+            entry = SpendingDay(date=day)
+            by_date[day] = entry
+        setattr(entry, bucket, getattr(entry, bucket) + cost)
+        entry.all += cost
+
+    return SpendingResponse(days=sorted(by_date.values(), key=lambda d: d.date))
 
 
 SSE_HEARTBEAT_SECONDS = 15.0

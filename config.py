@@ -16,11 +16,27 @@ KAFKA_EVAL_TOPIC = os.getenv("KAFKA_EVAL_TOPIC")
 # Dedicated topic for the standalone security worker (separate from evals so the
 # heavy torch/spaCy security deps don't run in the evaluator).
 KAFKA_SECURITY_TOPIC = os.getenv("KAFKA_SECURITY_TOPIC")
+# Consumer group for the alert dispatcher. Unlike the SSE consumer (which uses a
+# per-replica UUID group so every replica sees every event), this is a STABLE
+# shared group so each enriched event is handled by exactly one replica — alerts
+# must fire once, not once-per-replica.
+KAFKA_ALERTS_GROUP_ID = os.getenv("KAFKA_ALERTS_GROUP_ID", "api-alerts")
 # PLAINTEXT (local docker) | SASL_SSL (AWS MSK SASL/SCRAM)
 KAFKA_SECURITY_PROTOCOL=os.getenv("KAFKA_SECURITY_PROTOCOL")
 KAFKA_SASL_MECHANISM=os.getenv("KAFKA_SASL_MECHANISM", "SCRAM-SHA-512")
 KAFKA_SASL_USERNAME=os.getenv("KAFKA_SASL_USERNAME")
 KAFKA_SASL_PASSWORD=os.getenv("KAFKA_SASL_PASSWORD")
+
+# Max producer request size (bytes) and matching consumer fetch ceiling. Trace
+# events can legitimately reach a few MB (large prompts / responses / tool
+# outputs); the aiokafka + broker default of ~1MB rejected them in _serialize
+# with MessageSizeTooLargeError, surfacing as a 500 on POST /api/v1/ingest.
+# This MUST stay <= the broker `message.max.bytes` / topic `max.message.bytes`
+# and <= the consumers' fetch sizes, or producing/replicating will still fail.
+# Note: the per-message guard runs on the *uncompressed* serialized size, so
+# raising this is required even with compression enabled.
+KAFKA_MAX_REQUEST_SIZE = int(os.getenv("KAFKA_MAX_REQUEST_SIZE", str(10 * 1024 * 1024)))
+KAFKA_MAX_FETCH_BYTES = int(os.getenv("KAFKA_MAX_FETCH_BYTES", str(10 * 1024 * 1024)))
 
 
 def kafka_auth_kwargs() -> dict:
@@ -56,6 +72,7 @@ POSTGRES_ORG_TABLE = os.getenv("POSTGRES_ORG_TABLE")
 POSTGRES_REVOKED_TOKEN_TABLE  = os.getenv("POSTGRES_REVOKED_TOKEN_TABLE")
 POSTGRES_PASSWORD_RESET_TABLE = os.getenv("POSTGRES_PASSWORD_RESET_TABLE")
 POSTGRES_GUARDRAILS_TABLE     = os.getenv("POSTGRES_GUARDRAILS_TABLE", "guardrail_policies")
+POSTGRES_ALERTS_TABLE         = os.getenv("POSTGRES_ALERTS_TABLE", "alert_settings")
 
 SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL")
 SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME")
@@ -70,6 +87,15 @@ FRONTEND_BASE_URL = (os.getenv("FRONTEND_BASE_URL") or "").rstrip("/")
 # re-runs the prerender step so the post is baked into static HTML for SEO.
 # Optional — publishing still works (fails open) when this is unset.
 RENDER_DEPLOY_HOOK_URL = os.getenv("RENDER_DEPLOY_HOOK_URL")
+
+# ── Blog media on S3 ──────────────────────────────────────────────────────────
+# Blog images live in a private S3 bucket; only the object key is stored in
+# Postgres. The public media endpoint redirects to a short-lived presigned GET
+# URL, so the bucket never needs public access. Credentials come from the ECS
+# task role (no static keys). Locally, configure AWS_* env / profile to test.
+AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
+S3_BLOG_MEDIA_BUCKET = os.getenv("S3_BLOG_MEDIA_BUCKET")
+S3_PRESIGN_TTL = int(os.getenv("S3_PRESIGN_TTL", "3600"))  # seconds
 
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST")
 CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT"))

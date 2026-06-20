@@ -29,6 +29,10 @@ class KafkaQueue:
             key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else k,
             acks="all",
             enable_idempotence=True,
+            # Allow multi-MB trace events; gzip shrinks the on-wire batch the
+            # broker sees (the max_request_size guard itself runs pre-compression).
+            max_request_size=config.KAFKA_MAX_REQUEST_SIZE,
+            compression_type="gzip",
             **config.kafka_auth_kwargs(),
         )
         await self._producer.start()
