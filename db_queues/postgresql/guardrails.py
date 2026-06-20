@@ -24,6 +24,10 @@ ALL_CATEGORIES = [
     "pii_detected",
     "secrets_detected",
     "indirect_injection",
+    "rag_poisoning",
+    "tool_exfiltration",
+    "tool_policy_violation",
+    "cross_agent_injection",
 ]
 
 # PII entity types the worker can detect (mirrors pii._ENTITY_WEIGHTS, minus the
@@ -53,6 +57,7 @@ class GuardrailPolicy:
     custom_deny_list:  list[str]          = field(default_factory=list)
     custom_allow_list: list[str]          = field(default_factory=list)
     pii_ignore:        list[str]          = field(default_factory=list)
+    allowed_tools:     list[str]          = field(default_factory=list)
     alert_webhook:     Optional[str]      = None
     alert_on:          list[str]          = field(default_factory=lambda: ["high"])
     scan_responses:    bool               = False
@@ -67,6 +72,7 @@ class GuardrailPolicy:
             "custom_deny_list":  self.custom_deny_list,
             "custom_allow_list": self.custom_allow_list,
             "pii_ignore":        self.pii_ignore,
+            "allowed_tools":     self.allowed_tools,
             "alert_webhook":     self.alert_webhook,
             "alert_on":          self.alert_on,
             "scan_responses":    self.scan_responses,
@@ -92,6 +98,7 @@ def _from_row(row, org_id: str) -> GuardrailPolicy:
         custom_deny_list  = list(row["custom_deny_list"] or []),
         custom_allow_list = list(row["custom_allow_list"] or []),
         pii_ignore        = list(row["pii_ignore"] or []),
+        allowed_tools     = list(row["allowed_tools"] or []),
         alert_webhook     = row["alert_webhook"],
         alert_on          = list(row["alert_on"] or ["high"]),
         scan_responses    = bool(row["scan_responses"]),
@@ -134,8 +141,8 @@ async def upsert_policy(org_id: uuid.UUID, policy: GuardrailPolicy) -> Guardrail
             INSERT INTO {_TABLE}
                 (org_id, slug, block_threshold, warn_threshold, block_categories,
                  custom_deny_list, custom_allow_list, pii_ignore, alert_webhook,
-                 alert_on, scan_responses, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+                 alert_on, scan_responses, allowed_tools, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
             ON CONFLICT (org_id, slug) DO UPDATE SET
                 block_threshold   = EXCLUDED.block_threshold,
                 warn_threshold    = EXCLUDED.warn_threshold,
@@ -146,6 +153,7 @@ async def upsert_policy(org_id: uuid.UUID, policy: GuardrailPolicy) -> Guardrail
                 alert_webhook     = EXCLUDED.alert_webhook,
                 alert_on          = EXCLUDED.alert_on,
                 scan_responses    = EXCLUDED.scan_responses,
+                allowed_tools     = EXCLUDED.allowed_tools,
                 updated_at        = NOW()
             """,
             org_id,
@@ -159,6 +167,7 @@ async def upsert_policy(org_id: uuid.UUID, policy: GuardrailPolicy) -> Guardrail
             policy.alert_webhook,
             policy.alert_on,
             policy.scan_responses,
+            policy.allowed_tools,
         )
     _CACHE[f"{org_id}:{policy.slug}"] = (policy, time.monotonic())
     return policy
