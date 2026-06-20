@@ -189,6 +189,28 @@ ALTER TABLE guardrail_policies ADD COLUMN IF NOT EXISTS scan_responses BOOLEAN N
 ALTER TABLE guardrail_policies DROP CONSTRAINT IF EXISTS guardrail_policies_pkey;
 ALTER TABLE guardrail_policies ADD CONSTRAINT guardrail_policies_pkey PRIMARY KEY (org_id, slug);
 
+-- Per-org alert settings — one row per org. Drives the Slack alert dispatcher
+-- that watches enriched eval / security events. The webhook is stored as-is;
+-- delivery is server-side only (the URL is never returned to non-owners).
+CREATE TABLE IF NOT EXISTS alert_settings (
+    org_id                  UUID        PRIMARY KEY REFERENCES organizations(org_id) ON DELETE CASCADE,
+    slack_webhook           TEXT,
+    digest                  TEXT        NOT NULL DEFAULT 'realtime'
+                            CHECK (digest IN ('realtime', 'hourly', 'daily')),
+    -- Eval alerts
+    eval_enabled            BOOLEAN     NOT NULL DEFAULT FALSE,
+    eval_metrics            TEXT[]      NOT NULL DEFAULT '{}',
+    eval_score_below        DOUBLE PRECISION NOT NULL DEFAULT 0.7,
+    eval_failure_rate_above DOUBLE PRECISION NOT NULL DEFAULT 10,
+    -- Security alerts
+    security_enabled        BOOLEAN     NOT NULL DEFAULT FALSE,
+    security_alert_on       TEXT[]      NOT NULL DEFAULT '{high}',
+    security_categories     TEXT[]      NOT NULL DEFAULT '{}',
+    security_blocked_only   BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ
+);
+
 -- Blog: marketing/content posts authored in the admin panel (WYSIWYG -> HTML).
 -- Platform-wide content (not org-scoped); only Admin users can write.
 CREATE TABLE IF NOT EXISTS blog_posts (
@@ -213,12 +235,13 @@ CREATE TABLE IF NOT EXISTS blog_posts (
 CREATE INDEX IF NOT EXISTS idx_blog_posts_status_pub
     ON blog_posts(status, published_at DESC);
 
--- Blog media stored directly in Postgres (bytea) and served via the API.
+-- Blog media stored in a private S3 bucket; only the object key lives here.
+-- The public media endpoint redirects to a short-lived presigned GET URL.
 CREATE TABLE IF NOT EXISTS blog_media (
     media_id     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     filename     TEXT        NOT NULL,
     content_type TEXT        NOT NULL,
-    data         BYTEA       NOT NULL,
+    s3_key       TEXT        NOT NULL,
     byte_size    INTEGER     NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

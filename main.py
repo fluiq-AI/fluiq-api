@@ -9,7 +9,7 @@ from db_queues.clickhouse import clickhouse_client
 from db_queues.kafka import kafka_queue, security_reply_consumer, playground_reply_consumer
 from db_queues.postgresql import postgres_client
 from middleware.audit import AuditMiddleware
-from realtime import trace_consumer
+from realtime import trace_consumer, alert_consumer
 from routes import trace, auth
 from routes.admin import admin_router
 from routes.agents import router as agents_router
@@ -24,6 +24,7 @@ from routes.quota import quota_router
 from routes.secure import router as secure_router
 from routes.contact import router as contact_router
 from routes.blog import blog_router
+from routes.alerts import alerts_router
 import config
 
 @asynccontextmanager
@@ -32,6 +33,7 @@ async def lifespan(app: FastAPI):
     await postgres_client.start()
     await clickhouse_client.start()
     await trace_consumer.start()
+    await alert_consumer.start()
     await security_reply_consumer.start()
     await playground_reply_consumer.start()
     try:
@@ -39,6 +41,7 @@ async def lifespan(app: FastAPI):
     finally:
         await playground_reply_consumer.stop()
         await security_reply_consumer.stop()
+        await alert_consumer.stop()
         await trace_consumer.stop()
         await clickhouse_client.stop()
         await postgres_client.stop()
@@ -111,6 +114,7 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
 app.include_router(admin_router, prefix="/admin")
 app.include_router(audit_router, prefix="/api/v1")
 app.include_router(guardrails_router, prefix="/api/v1")
+app.include_router(alerts_router, prefix="/api/v1")
 app.include_router(trace.router, prefix="/api/v1")
 app.include_router(agents_router, prefix="/api/v1")
 app.include_router(quota_router, prefix="/api/v1")
