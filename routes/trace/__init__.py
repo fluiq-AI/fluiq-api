@@ -191,6 +191,7 @@ async def ingestion(
             "security_config": security_config,
             "operation":       "sdk_security",
             "pii_ignore":      _sec_policy.pii_ignore,
+            "allowed_tools":   _sec_policy.allowed_tools,
         }
         if response_gated:
             security_job["response_gated"] = True

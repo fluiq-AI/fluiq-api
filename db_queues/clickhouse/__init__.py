@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from typing import Optional
 
 import clickhouse_connect
@@ -9,6 +10,28 @@ import config
 from .queries import ClickHouseQueryMixin
 
 logger = logging.getLogger(__name__)
+
+SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+
+
+def _split_statements(ddl: str) -> list[str]:
+    """Split a multi-statement .sql file into individual statements.
+
+    ClickHouse's HTTP interface runs one statement per request, so the schema
+    file (CREATE DATABASE / CREATE TABLE / ALTER …) must be split. The schema
+    contains no semicolons inside string literals, so a plain ``;`` split is
+    safe; comment-only fragments are dropped.
+    """
+    statements: list[str] = []
+    for chunk in ddl.split(";"):
+        lines = [
+            ln for ln in chunk.splitlines()
+            if ln.strip() and not ln.strip().startswith("--")
+        ]
+        stmt = "\n".join(lines).strip()
+        if stmt:
+            statements.append(stmt)
+    return statements
 
 
 class ClickHouseClient(ClickHouseQueryMixin):
@@ -53,7 +76,34 @@ class ClickHouseClient(ClickHouseQueryMixin):
             await self._client.query("SELECT 1")
         except Exception:
             logger.exception("[CLICKHOUSE] Warm-up query failed")
+        await self._apply_schema()
         logger.info("[CLICKHOUSE] Client started: %s:%s/%s", self.host, self.port, self.database)
+
+    async def _apply_schema(self) -> None:
+        """Apply schema.sql on startup, mirroring the Postgres client.
+
+        ClickHouse does not auto-run DDL, so new tables/columns (e.g. the
+        agentic-threat security columns) must be applied here. Every statement is
+        idempotent (``CREATE … IF NOT EXISTS`` / ``ADD COLUMN IF NOT EXISTS``),
+        so this is safe to run on every boot and across concurrent instances.
+        Best-effort: a single failed statement is logged and the rest continue,
+        so a transient DDL hiccup never blocks API startup.
+        """
+        if not SCHEMA_PATH.is_file():
+            logger.warning("[CLICKHOUSE] schema.sql not found at %s", SCHEMA_PATH)
+            return
+        statements = _split_statements(SCHEMA_PATH.read_text(encoding="utf-8"))
+        applied = failed = 0
+        for stmt in statements:
+            try:
+                await self._client.command(stmt)
+                applied += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning("[CLICKHOUSE] schema stmt failed (%s): %s",
+                               str(exc)[:120], stmt.splitlines()[0][:80])
+        logger.info("[CLICKHOUSE] schema applied: %d ok, %d failed (%s)",
+                    applied, failed, SCHEMA_PATH)
 
     async def stop(self) -> None:
         if self._client is None:

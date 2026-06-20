@@ -44,6 +44,7 @@ class GuardrailPolicyPayload(BaseModel):
     custom_deny_list:  List[str]        = Field(default_factory=list)
     custom_allow_list: List[str]        = Field(default_factory=list)
     pii_ignore:        List[str]        = Field(default_factory=list)
+    allowed_tools:     List[str]        = Field(default_factory=list)
     alert_webhook:     Optional[str]    = None
     alert_on:          List[str]        = Field(default_factory=lambda: ["high"])
     scan_responses:    bool             = False
@@ -102,6 +103,7 @@ async def save_policy(
 
     deny  = [p.strip() for p in payload.custom_deny_list  if p.strip()]
     allow = [p.strip() for p in payload.custom_allow_list if p.strip()]
+    tools = sorted({t.strip() for t in payload.allowed_tools if t.strip()})
 
     policy = GuardrailPolicy(
         org_id            = str(org_id),
@@ -112,6 +114,7 @@ async def save_policy(
         custom_deny_list  = deny,
         custom_allow_list = allow,
         pii_ignore        = sorted(set(payload.pii_ignore)),
+        allowed_tools     = tools,
         alert_webhook     = payload.alert_webhook or None,
         alert_on          = payload.alert_on,
         scan_responses    = payload.scan_responses,

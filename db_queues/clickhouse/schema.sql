@@ -75,6 +75,15 @@ CREATE TABLE IF NOT EXISTS fluiq.security_scans
     secret_types                 Array(String),
     indirect_injection_detected  UInt8,
     indirect_injection_sources   Array(String),
+    rag_poisoning_detected         UInt8 DEFAULT 0,
+    rag_poisoning_sources          Array(String),
+    rag_poisoning_score            Float32 DEFAULT 0,
+    tool_exfiltration_detected     UInt8 DEFAULT 0,
+    tool_exfiltration_types        Array(String),
+    tool_exfiltration_sources      Array(String),
+    tool_policy_violation_detected UInt8 DEFAULT 0,
+    tool_policy_violations         Array(String),
+    cross_agent_injection_detected UInt8 DEFAULT 0,
     semantic_attack_score        Float32,
     security_risk_level          LowCardinality(String),
     security_risk_score          Float32,
@@ -86,6 +95,17 @@ CREATE TABLE IF NOT EXISTS fluiq.security_scans
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ingested_at)
 ORDER BY (organization_id, trace_id, ingested_at);
+
+-- Migrations for existing deployments — agentic-threat signals (A.2/B.2/B.3/C.1)
+ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS rag_poisoning_detected         UInt8 DEFAULT 0;
+ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS rag_poisoning_sources          Array(String);
+ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS rag_poisoning_score            Float32 DEFAULT 0;
+ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS tool_exfiltration_detected     UInt8 DEFAULT 0;
+ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS tool_exfiltration_types        Array(String);
+ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS tool_exfiltration_sources      Array(String);
+ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS tool_policy_violation_detected UInt8 DEFAULT 0;
+ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS tool_policy_violations         Array(String);
+ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS cross_agent_injection_detected UInt8 DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS audit_log (
     event_id        UUID,
