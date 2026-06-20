@@ -25,11 +25,15 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def _client():
-    # SigV4 is required for presigned URLs to work across all regions.
+    # Pin to the regional S3 endpoint (+ virtual addressing) so presigned URLs
+    # are signed for `bucket.s3.<region>.amazonaws.com`. Without this, boto3 may
+    # emit the global `s3.amazonaws.com` host, which S3 answers with a
+    # TemporaryRedirect for non-us-east-1 buckets — breaking the SigV4 signature.
     return boto3.client(
         "s3",
         region_name=config.AWS_REGION,
-        config=Config(signature_version="s3v4"),
+        endpoint_url=f"https://s3.{config.AWS_REGION}.amazonaws.com",
+        config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
     )
 
 
