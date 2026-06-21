@@ -249,3 +249,26 @@ CREATE TABLE IF NOT EXISTS blog_media (
     byte_size    INTEGER     NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Visitor submissions from the public LLM cost calculator.
+CREATE TABLE IF NOT EXISTS model_requests (
+    id         BIGSERIAL   PRIMARY KEY,
+    provider   TEXT,
+    model      TEXT        NOT NULL,
+    email      TEXT,
+    note       TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS model_price_reports (
+    id              BIGSERIAL   PRIMARY KEY,
+    model_price_id  BIGINT,
+    provider        TEXT,
+    model           TEXT        NOT NULL,
+    reported_input  NUMERIC,
+    reported_output NUMERIC,
+    source_url      TEXT,
+    email           TEXT,
+    note            TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
