@@ -95,6 +95,13 @@ CREATE TABLE IF NOT EXISTS prompts (
     template    TEXT        NOT NULL,
     model       TEXT,
     variables   JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    -- 'completion' = ordinary prompt template (fetched via fluiq.fetch_prompt).
+    -- 'judge'      = an LLM-as-judge prompt the client references by slug in
+    --                fluiq.eval(custom_judges={...}). Judge templates use
+    --                string.Template $question/$answer/$context placeholders and
+    --                are expected to return {"score": float, "reason": str}.
+    kind        TEXT        NOT NULL DEFAULT 'completion'
+                CHECK (kind IN ('completion', 'judge')),
     is_deployed BOOLEAN     NOT NULL DEFAULT FALSE,
     deployed_at TIMESTAMPTZ,
     version     INTEGER     NOT NULL DEFAULT 1,
@@ -104,6 +111,8 @@ CREATE TABLE IF NOT EXISTS prompts (
 );
 CREATE INDEX IF NOT EXISTS idx_prompts_org_id ON prompts(org_id);
 CREATE INDEX IF NOT EXISTS idx_prompts_org_slug ON prompts(org_id, slug);
+-- Migration for existing deployments
+ALTER TABLE prompts ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'completion';
 
 CREATE TABLE IF NOT EXISTS prompt_versions (
     version_id  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),

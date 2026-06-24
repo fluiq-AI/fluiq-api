@@ -34,7 +34,7 @@ async def list_prompts(org_id: uuid.UUID) -> List[Dict[str, Any]]:
         rows = await conn.fetch(
             f"""
             SELECT p.prompt_id, p.org_id, p.name, p.slug, p.template, p.model,
-                   p.variables, p.is_deployed, p.deployed_at, p.version,
+                   p.variables, p.kind, p.is_deployed, p.deployed_at, p.version,
                    p.created_at, p.updated_at,
                    {_ENV_SUBQUERY}
             FROM prompts p
@@ -103,19 +103,37 @@ async def create_prompt(
     template: str,
     model: Optional[str],
     variables: List[str],
+    kind: str = "completion",
 ) -> Dict[str, Any]:
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO prompts
-                (org_id, name, slug, template, model, variables, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())
+                (org_id, name, slug, template, model, variables, kind, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, NOW())
             RETURNING *
             """,
             org_id, name, slug, template, model,
-            [{"name": v} for v in variables],
+            [{"name": v} for v in variables], kind,
         )
         return dict(row)
+
+
+async def get_custom_judge_template(
+    org_id: uuid.UUID, slug: str
+) -> Optional[str]:
+    """Return the live template for a client-defined judge prompt, or None.
+
+    Used by the block-mode /evaluate path to resolve custom judges referenced by
+    slug in ``fluiq.eval(custom_judges={...})``. Only ``kind = 'judge'`` rows are
+    eligible so a completion prompt can never be run as a judge by accident.
+    """
+    async with postgres_client.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT template FROM prompts WHERE org_id = $1 AND slug = $2 AND kind = 'judge'",
+            org_id, slug,
+        )
+        return row["template"] if row else None
 
 
 async def update_prompt(

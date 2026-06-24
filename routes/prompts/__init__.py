@@ -50,6 +50,15 @@ class SavePromptRequest(BaseModel):
     template:  str
     model:     Optional[str] = None
     variables: List[str]     = []
+    kind:      str           = "completion"
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, v: str) -> str:
+        v = (v or "completion").strip().lower()
+        if v not in ("completion", "judge"):
+            raise ValueError("kind must be 'completion' or 'judge'")
+        return v
 
     @field_validator("slug")
     @classmethod
@@ -104,6 +113,16 @@ async def save_prompt(
     session: dict = Depends(get_current_session),
 ):
     org_id = uuid.UUID(session["org_id"])
+    if payload.kind == "judge" and "$answer" not in payload.template:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "A judge prompt must reference the $answer placeholder. "
+                "Use $question, $answer, and $context to inject the data under "
+                "evaluation, and ask the model to return a JSON object with a "
+                "numeric \"score\" (0-1) and a \"reason\"."
+            ),
+        )
     try:
         row = await create_prompt(
             org_id=org_id,
@@ -112,6 +131,7 @@ async def save_prompt(
             template=payload.template,
             model=payload.model,
             variables=payload.variables,
+            kind=payload.kind,
         )
     except Exception as exc:
         if "unique" in str(exc).lower():
@@ -310,6 +330,7 @@ def _serialize(row: dict) -> dict:
         "template":     row["template"],
         "model":        row.get("model"),
         "variables":    row.get("variables") or [],
+        "kind":         row.get("kind") or "completion",
         "is_deployed":  bool(row.get("is_deployed", False)),
         "deployed_at":  row["deployed_at"].isoformat() if row.get("deployed_at") else None,
         "version":      row.get("version", 1),
