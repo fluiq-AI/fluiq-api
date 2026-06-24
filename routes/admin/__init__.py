@@ -2,7 +2,7 @@ import re
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import boto3
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -20,6 +20,14 @@ from db_queues.postgresql.auth import (
     admin_update_user_type,
     get_platform_stats,
     get_user_by_id,
+)
+from db_queues.postgresql.eval_prompts import (
+    get_judge_prompt,
+    list_judge_prompt_versions,
+    list_judge_prompts,
+    reset_judge_prompt,
+    restore_judge_prompt_version,
+    update_judge_prompt,
 )
 from db_queues.clickhouse import clickhouse_client
 from routes.auth.helper import get_current_session
@@ -458,6 +466,139 @@ async def infra_secrets(_session: dict = Depends(require_admin)):
         return {"parameters": await run_in_threadpool(_list)}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"SSM describe failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# LLM-as-Judge prompts (platform-global; edited here, read by the evaluator)
+# ---------------------------------------------------------------------------
+
+# Mirrors the worker's string.Template syntax: $var or ${var}.
+_PLACEHOLDER_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+
+
+def _template_identifiers(template: str) -> set[str]:
+    return {m.group(1) or m.group(2) for m in _PLACEHOLDER_RE.finditer(template)}
+
+
+class JudgePromptView(BaseModel):
+    name: str
+    template: str
+    default_template: str
+    description: Optional[str]
+    required_vars: List[str]
+    is_overridden: bool
+    version: int
+    updated_at: datetime
+
+
+class JudgePromptListResponse(BaseModel):
+    prompts: list[JudgePromptView]
+
+
+class UpdateJudgePromptRequest(BaseModel):
+    template: str
+
+
+class JudgePromptVersionView(BaseModel):
+    version_id: uuid.UUID
+    name: str
+    version: int
+    template: str
+    updated_by: Optional[uuid.UUID]
+    created_at: datetime
+
+
+class JudgePromptVersionsResponse(BaseModel):
+    versions: list[JudgePromptVersionView]
+
+
+def _validate_template(prompt_row: dict, template: str) -> None:
+    """Reject an edit that is empty or drops a required placeholder."""
+    if not template or not template.strip():
+        raise HTTPException(status_code=400, detail="Template cannot be empty.")
+    required = set(prompt_row.get("required_vars") or [])
+    missing = sorted(required - _template_identifiers(template))
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Template is missing required placeholder(s): "
+                + ", ".join(f"${{{m}}}" for m in missing)
+            ),
+        )
+
+
+@admin_router.get("/judge-prompts", response_model=JudgePromptListResponse)
+async def judge_prompts_list(
+    _session: dict = Depends(require_admin),
+) -> JudgePromptListResponse:
+    rows = await list_judge_prompts()
+    return JudgePromptListResponse(prompts=[JudgePromptView(**r) for r in rows])
+
+
+@admin_router.get("/judge-prompts/{name}", response_model=JudgePromptView)
+async def judge_prompt_get(
+    name: str,
+    _session: dict = Depends(require_admin),
+) -> JudgePromptView:
+    row = await get_judge_prompt(name)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prompt not found")
+    return JudgePromptView(**row)
+
+
+@admin_router.put("/judge-prompts/{name}", response_model=JudgePromptView)
+async def judge_prompt_update(
+    name: str,
+    body: UpdateJudgePromptRequest,
+    session: dict = Depends(require_admin),
+) -> JudgePromptView:
+    row = await get_judge_prompt(name)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prompt not found")
+    _validate_template(row, body.template)
+    updated = await update_judge_prompt(
+        name, body.template, updated_by=uuid.UUID(session["sub"])
+    )
+    return JudgePromptView(**updated)
+
+
+@admin_router.post("/judge-prompts/{name}/reset", response_model=JudgePromptView)
+async def judge_prompt_reset(
+    name: str,
+    session: dict = Depends(require_admin),
+) -> JudgePromptView:
+    updated = await reset_judge_prompt(name, updated_by=uuid.UUID(session["sub"]))
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prompt not found")
+    return JudgePromptView(**updated)
+
+
+@admin_router.get("/judge-prompts/{name}/versions", response_model=JudgePromptVersionsResponse)
+async def judge_prompt_versions(
+    name: str,
+    _session: dict = Depends(require_admin),
+) -> JudgePromptVersionsResponse:
+    rows = await list_judge_prompt_versions(name)
+    return JudgePromptVersionsResponse(versions=[JudgePromptVersionView(**r) for r in rows])
+
+
+@admin_router.post(
+    "/judge-prompts/{name}/restore/{version}", response_model=JudgePromptView
+)
+async def judge_prompt_restore(
+    name: str,
+    version: int,
+    session: dict = Depends(require_admin),
+) -> JudgePromptView:
+    updated = await restore_judge_prompt_version(
+        name, version, updated_by=uuid.UUID(session["sub"])
+    )
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Prompt or version not found"
+        )
+    return JudgePromptView(**updated)
 
 
 __all__ = ["admin_router"]
