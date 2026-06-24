@@ -208,6 +208,20 @@ async def get_org_tier(org_id: uuid.UUID) -> Optional[str]:
     return row["user_type"]
 
 
+async def get_org_eval_bonus(org_id: uuid.UUID) -> int:
+    """Return the admin-granted evaluation adjustment for an org.
+
+    Added on top of the tier's monthly evaluation quota by ``shared.quotas``.
+    Returns 0 when the org or column is absent.
+    """
+    async with postgres_client.acquire() as conn:
+        value = await conn.fetchval(
+            f"SELECT eval_quota_bonus FROM {config.POSTGRES_ORG_TABLE} WHERE org_id = $1",
+            org_id,
+        )
+    return int(value or 0)
+
+
 async def resolve_api_key(
     plaintext: str,
 ) -> Optional[tuple[uuid.UUID, str, uuid.UUID]]:
@@ -397,6 +411,42 @@ async def admin_update_user_type(user_id: uuid.UUID, new_type: str) -> bool:
     return True
 
 
+async def admin_get_user_eval_account(user_id: uuid.UUID) -> Optional[dict]:
+    """Resolve a user to their org + tier + current eval bonus.
+
+    Used by the admin Evaluations tab so an operator can look up any user and
+    see/adjust the evaluation allowance for their organization.
+    """
+    async with postgres_client.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT u.user_id, u.email, u.name, u.user_type, "
+            f"o.org_id, o.name AS org_name, o.eval_quota_bonus "
+            f"FROM {config.POSTGRES_USER_TABLE} u "
+            f"JOIN {config.POSTGRES_ORG_TABLE} o ON o.org_id = u.org_id "
+            f"WHERE u.user_id = $1",
+            user_id,
+        )
+    return dict(row) if row is not None else None
+
+
+async def admin_adjust_eval_bonus(org_id: uuid.UUID, delta: int) -> Optional[int]:
+    """Add ``delta`` evaluations to the org's bonus allowance (delta may be < 0).
+
+    The stored bonus is floored at a large negative bound so a deduction can
+    cancel a tier quota but never wrap into nonsense. Returns the new bonus,
+    or ``None`` if the org does not exist.
+    """
+    async with postgres_client.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE {config.POSTGRES_ORG_TABLE} "
+            f"SET eval_quota_bonus = GREATEST(eval_quota_bonus + $2, -1000000000), "
+            f"    updated_at = NOW() "
+            f"WHERE org_id = $1 RETURNING eval_quota_bonus",
+            org_id, delta,
+        )
+    return int(row["eval_quota_bonus"]) if row is not None else None
+
+
 async def admin_list_organizations(
     page: int = 1,
     limit: int = 50,
@@ -490,6 +540,9 @@ __all__ = [
     "consume_password_reset",
     "get_organization",
     "get_org_tier",
+    "get_org_eval_bonus",
+    "admin_get_user_eval_account",
+    "admin_adjust_eval_bonus",
     "resolve_api_key",
     "create_api_key",
     "delete_api_key",

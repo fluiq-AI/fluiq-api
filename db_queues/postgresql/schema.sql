@@ -1,16 +1,24 @@
 -- Run once against the fluiq database to provision auth tables.
 
 CREATE TABLE IF NOT EXISTS organizations (
-    org_id        UUID PRIMARY KEY,
-    name          TEXT NOT NULL,
-    user_id       UUID NOT NULL,
-    team_ids      UUID[] NOT NULL DEFAULT '{}',
-    api_keys      JSONB NOT NULL DEFAULT '[]'::jsonb,
-    api_key_limit INTEGER NOT NULL DEFAULT 1,
-    api_key_usage INTEGER NOT NULL DEFAULT 0,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at    TIMESTAMPTZ
+    org_id           UUID PRIMARY KEY,
+    name             TEXT NOT NULL,
+    user_id          UUID NOT NULL,
+    team_ids         UUID[] NOT NULL DEFAULT '{}',
+    api_keys         JSONB NOT NULL DEFAULT '[]'::jsonb,
+    api_key_limit    INTEGER NOT NULL DEFAULT 1,
+    api_key_usage    INTEGER NOT NULL DEFAULT 0,
+    -- Admin-granted adjustment (in evaluations) added on top of the tier's
+    -- monthly evaluation quota. May be negative to deduct allowance. The
+    -- effective monthly eval cap is max(0, tier_quota + eval_quota_bonus).
+    eval_quota_bonus INTEGER NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ
 );
+
+-- Migration for existing deployments (no-op once the column exists):
+ALTER TABLE organizations
+    ADD COLUMN IF NOT EXISTS eval_quota_bonus INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS users (
     user_id         UUID PRIMARY KEY,

@@ -77,7 +77,18 @@ class ClickHouseQueryMixin:
                 " ))"
             )
         if agent_key is not None:
-            where += " AND t.trace_id = t.root_trace_id"
+            # Match the agent-root definition used by fetch_agent_summary: a
+            # span is a root when it is its own root OR its root_trace_id points
+            # at a never-persisted (orphan) parent. Using strict equality here
+            # would open an empty drawer for orphan-root agents that correctly
+            # appear in the Agents list.
+            where += (
+                " AND (t.trace_id = t.root_trace_id"
+                f" OR t.root_trace_id NOT IN ("
+                f"   SELECT trace_id FROM {target}"
+                "    WHERE organization_id = {org_id:UUID}"
+                " ))"
+            )
             params["agent_key"] = agent_key
             if agent_kind == "function":
                 where += " AND JSONExtractString(toString(t.event), 'function') = {agent_key:String}"
@@ -472,7 +483,7 @@ WHERE organization_id = {{org_id:UUID}}
         result = await self._client.query(f"""  # type: ignore[attr-defined]
 WITH roots AS (
     SELECT
-        trace_id, ingested_at,
+        trace_id, root_trace_id, ingested_at,
         JSONExtractString(toString(event), 'function')                                    AS fn,
         JSONExtractString(toString(event), 'name')                                        AS nm,
         JSONExtractString(toString(event), 'integration')                                 AS intg,
@@ -480,7 +491,19 @@ WITH roots AS (
         JSONExtractFloat(toString(event), 'latency')                                      AS latency
     FROM {target}
     WHERE organization_id = {{org_id:UUID}}
-      AND trace_id = root_trace_id
+      -- A span counts as an agent root when it is its own root, OR when its
+      -- root_trace_id points at a parent that was never persisted (orphan
+      -- root: out-of-order delivery, a parent that stayed `running`/errored,
+      -- or a synthetic chain id). This mirrors the /traces roots_only rule so
+      -- a named @trace span that shows in Traces also shows in Agents instead
+      -- of disappearing because its phantom parent fails the strict equality.
+      AND (
+            trace_id = root_trace_id
+         OR root_trace_id NOT IN (
+                SELECT trace_id FROM {target}
+                WHERE organization_id = {{org_id:UUID}}
+            )
+      )
       AND (
             JSONExtractString(toString(event), 'function') != ''
          OR JSONExtractString(toString(event), 'name') != ''
@@ -507,7 +530,10 @@ SELECT
     avgIf(r.latency, r.latency > 0)                                    AS avg_latency,
     max(r.ingested_at)                                                  AS last_run
 FROM roots AS r
-LEFT JOIN costs AS c ON r.trace_id = c.root_trace_id
+-- Join on root_trace_id (not trace_id) so an orphan-root span still picks up
+-- the cost bucket for its own subtree. For true roots the two are equal, so
+-- this is a no-op there.
+LEFT JOIN costs AS c ON r.root_trace_id = c.root_trace_id
 GROUP BY agent_key, agent_kind, integration
 ORDER BY last_run DESC
 LIMIT {{limit:UInt32}}

@@ -44,6 +44,7 @@ class OrganizationModel(BaseModel):
     api_keys: Optional[list[ApiKeyModel]]
     api_key_limit: int = 1
     api_key_usage: int = 0
+    eval_quota_bonus: int = 0
     created_at: datetime
     updated_at: Optional[datetime] = None
 
