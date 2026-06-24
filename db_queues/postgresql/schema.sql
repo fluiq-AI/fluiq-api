@@ -280,3 +280,44 @@ CREATE TABLE IF NOT EXISTS model_price_reports (
     note            TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ---------------------------------------------------------------------------
+-- LLM-as-Judge prompts used by the evaluator worker.
+--
+-- Platform-global (NOT org-scoped): these are Fluiq's own internal judge
+-- prompts, edited from the Admin console so they can be reworked without a
+-- worker redeploy. The evaluator seeds the canonical defaults on startup
+-- (ON CONFLICT DO NOTHING so admin edits are never clobbered) and reads the
+-- effective ``template`` with a TTL cache, failing open to its built-in
+-- constants if a row is missing or a template is invalid.
+--
+--   name             stable key the worker renders by (e.g. 'hallucination_verify')
+--   template         effective template ($-placeholders, string.Template syntax)
+--   default_template pristine seed copy, used by "Reset to default"
+--   required_vars    JSON array of placeholder names that MUST appear; the API
+--                    rejects an edit that drops any of them
+--   is_overridden    TRUE once an admin has edited it away from the default
+CREATE TABLE IF NOT EXISTS eval_judge_prompts (
+    name             TEXT        PRIMARY KEY,
+    template         TEXT        NOT NULL,
+    default_template TEXT        NOT NULL,
+    description      TEXT,
+    required_vars    JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    is_overridden    BOOLEAN     NOT NULL DEFAULT FALSE,
+    version          INTEGER     NOT NULL DEFAULT 1,
+    updated_by       UUID,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Immutable history: one row per saved version, for rollback.
+CREATE TABLE IF NOT EXISTS eval_judge_prompt_versions (
+    version_id  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        TEXT        NOT NULL REFERENCES eval_judge_prompts(name) ON DELETE CASCADE,
+    version     INTEGER     NOT NULL,
+    template    TEXT        NOT NULL,
+    updated_by  UUID,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_eval_judge_prompt_versions_name
+    ON eval_judge_prompt_versions(name, version);
