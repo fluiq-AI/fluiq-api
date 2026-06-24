@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from db_queues.clickhouse import clickhouse_client
 from db_queues.kafka import kafka_queue, security_reply_consumer, playground_reply_consumer
 from db_queues.postgresql import postgres_client
+from db_queues.postgresql.eval_prompts import seed_judge_prompts
 from middleware.audit import AuditMiddleware
 from realtime import trace_consumer, alert_consumer
 from routes import trace, auth
@@ -32,6 +33,12 @@ import config
 async def lifespan(app: FastAPI):
     await kafka_queue.start()
     await postgres_client.start()
+    # Seed/refresh the LLM-as-Judge prompt defaults so the Admin "Judge Prompts"
+    # tab is populated from API boot, independent of the evaluator worker.
+    try:
+        await seed_judge_prompts()
+    except Exception:
+        logging.getLogger(__name__).exception("[STARTUP] judge-prompt seed failed")
     await clickhouse_client.start()
     await trace_consumer.start()
     await alert_consumer.start()
