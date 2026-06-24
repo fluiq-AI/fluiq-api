@@ -9,6 +9,38 @@ import uuid
 from typing import Any, Optional
 
 from . import postgres_client
+from .judge_prompt_defaults import JUDGE_PROMPT_DEFAULTS
+
+
+async def seed_judge_prompts() -> None:
+    """Insert/refresh the canonical judge-prompt defaults.
+
+    Idempotent and safe to run on every API startup. New prompts are inserted;
+    existing rows keep their live ``template`` if an admin has edited them
+    (``is_overridden``), but always have their ``default_template`` /
+    description / required_vars refreshed so "Reset to default" and an
+    un-edited row track the latest code defaults.
+    """
+    async with postgres_client.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO eval_judge_prompts
+                (name, template, default_template, description, required_vars)
+            VALUES ($1, $2, $2, $3, $4)
+            ON CONFLICT (name) DO UPDATE SET
+                default_template = EXCLUDED.default_template,
+                description      = EXCLUDED.description,
+                required_vars    = EXCLUDED.required_vars,
+                template = CASE
+                    WHEN eval_judge_prompts.is_overridden THEN eval_judge_prompts.template
+                    ELSE EXCLUDED.template
+                END
+            """,
+            [
+                (d["name"], d["template"], d.get("description"), d["required_vars"])
+                for d in JUDGE_PROMPT_DEFAULTS
+            ],
+        )
 
 
 async def list_judge_prompts() -> list[dict[str, Any]]:
@@ -133,6 +165,7 @@ async def restore_judge_prompt_version(
 
 
 __all__ = [
+    "seed_judge_prompts",
     "list_judge_prompts",
     "get_judge_prompt",
     "update_judge_prompt",
