@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from string import Template
 from typing import Any
 from config import ANTHROPIC_API_KEY
 
@@ -138,4 +139,52 @@ def run_metrics(
             }
         except Exception as exc:
             results[metric] = {"score": 0.0, "reason": f"judge error: {exc}"}
+    return results
+
+
+# ── Client-defined custom judges ──────────────────────────────────────────────
+
+_OUTPUT_CONTRACT = (
+    '\n\nReturn ONLY a JSON object: '
+    '{"score": <float between 0 and 1>, "reason": "<short explanation>"}'
+)
+
+
+def _ensure_output_contract(template: str) -> str:
+    """Append the score/reason JSON contract unless the template already asks for it."""
+    return template if "score" in template.lower() else template + _OUTPUT_CONTRACT
+
+
+def run_custom_judges(
+    judges: dict[str, str],
+    *,
+    response: str,
+    prompt: str = "",
+    context: str = "",
+    judge_model: str = "claude-haiku-4-5-20251001",
+) -> dict[str, dict[str, Any]]:
+    """Run client-defined judge prompts referenced by slug.
+
+    ``judges`` maps ``{slug: template}`` where the template uses ``string.Template``
+    ``$question`` / ``$answer`` / ``$context`` placeholders. Returns
+    ``{slug: {"score": float, "reason": str}}`` mirroring :func:`run_metrics`.
+    """
+    results: dict[str, dict[str, Any]] = {}
+    for slug, template in judges.items():
+        if not template or not template.strip():
+            continue
+        rendered = Template(_ensure_output_contract(template)).safe_substitute(
+            question=prompt,
+            answer=response,
+            context=context or prompt,
+        )
+        try:
+            raw = _call_anthropic(rendered, judge_model)
+            data = _parse(raw)
+            results[slug] = {
+                "score":  _clamp(data.get("score")),
+                "reason": str(data.get("reason") or ""),
+            }
+        except Exception as exc:
+            results[slug] = {"score": 0.0, "reason": f"judge error: {exc}"}
     return results

@@ -26,9 +26,10 @@ from db_queues.clickhouse import clickhouse_client
 from db_queues.kafka import kafka_queue, wait_for_playground_reply
 from db_queues.postgresql import postgres_client as pg_client
 from db_queues.postgresql.auth import resolve_api_key
+from db_queues.postgresql.prompts import get_custom_judge_template
 from realtime import trace_broker
 from routes.auth.helper import extract_api_key, get_current_session
-from .judge import run_metrics, SUPPORTED_METRICS
+from .judge import run_custom_judges, run_metrics, SUPPORTED_METRICS
 
 evaluate_router = APIRouter()
 
@@ -56,6 +57,9 @@ class EvaluateRequest(BaseModel):
     metrics:     List[str]           = ["hallucination", "relevance"]
     judge_model: str                 = "claude-haiku-4-5-20251001"
     thresholds:  Dict[str, float]    = {}
+    # Client-defined judges: {prompt_slug: threshold}. Each slug must resolve to a
+    # kind='judge' prompt saved by this org on the Prompts page.
+    custom_judges: Dict[str, float]  = {}
 
 
 class MetricResult(BaseModel):
@@ -90,7 +94,7 @@ async def evaluate(
     org_id = await _resolve_org(api_key or payload.api_key)
 
     valid_metrics = [m for m in payload.metrics if m in SUPPORTED_METRICS]
-    if not valid_metrics:
+    if not valid_metrics and not payload.custom_judges:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"No valid metrics in request. Supported: {sorted(SUPPORTED_METRICS)}",
@@ -103,6 +107,26 @@ async def evaluate(
         context=payload.context,
         judge_model=payload.judge_model,
     )
+
+    # Client-defined custom judges: resolve each slug to its saved judge template
+    # (org-scoped, kind='judge') and run it. Unknown slugs are silently skipped.
+    if payload.custom_judges:
+        templates: Dict[str, str] = {}
+        for slug in payload.custom_judges:
+            tmpl = await get_custom_judge_template(org_id, slug)
+            if tmpl:
+                templates[slug] = tmpl
+        if templates:
+            raw_results.update(run_custom_judges(
+                templates,
+                response=payload.response,
+                prompt=payload.prompt,
+                context=payload.context,
+                judge_model=payload.judge_model,
+            ))
+
+    # Custom-judge thresholds live alongside the built-in metric thresholds.
+    thresholds = {**payload.thresholds, **payload.custom_judges}
 
     # Persist to ClickHouse (best-effort)
     trace_id = payload.trace_id or str(uuid.uuid4())
@@ -142,8 +166,7 @@ async def evaluate(
         except Exception:
             pass
 
-    # Build response
-    thresholds = payload.thresholds
+    # Build response (thresholds already merged with custom_judges above)
     failures:       list[str]          = []
     metric_results: list[MetricResult] = []
 
