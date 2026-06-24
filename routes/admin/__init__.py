@@ -13,6 +13,8 @@ import config
 
 from db_queues.postgresql import postgres_client
 from db_queues.postgresql.auth import (
+    admin_adjust_eval_bonus,
+    admin_get_user_eval_account,
     admin_list_organizations,
     admin_list_users,
     admin_update_user_type,
@@ -21,6 +23,13 @@ from db_queues.postgresql.auth import (
 )
 from db_queues.clickhouse import clickhouse_client
 from routes.auth.helper import get_current_session
+from shared.quotas import (
+    DEFAULT_TIER,
+    TIER_QUOTAS,
+    UNLIMITED,
+    get_quota_status,
+    invalidate as invalidate_quota_cache,
+)
 
 admin_router = APIRouter()
 
@@ -90,6 +99,30 @@ class UpdateUserTypeResponse(BaseModel):
     ok: bool
 
 
+class UserEvalAccountResponse(BaseModel):
+    user_id: uuid.UUID
+    email: str
+    name: str
+    user_type: str
+    org_id: uuid.UUID
+    org_name: Optional[str]
+    tier: str
+    # Evaluations consumed this calendar month (ClickHouse count).
+    eval_used: int
+    # Admin-granted adjustment added on top of the tier quota (may be negative).
+    eval_bonus: int
+    # Tier's base monthly eval quota before any bonus; None means unlimited.
+    base_eval_quota: Optional[int]
+    # Effective monthly cap after the bonus; None means unlimited.
+    eval_limit: Optional[int]
+
+
+class AdjustEvalRequest(BaseModel):
+    # Evaluations to add (positive) or subtract (negative) from the org's
+    # monthly allowance. Must be non-zero.
+    delta: int
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -145,6 +178,71 @@ async def update_user(
             detail="User not found",
         )
     return UpdateUserTypeResponse(ok=True)
+
+
+async def _build_eval_account(account: dict) -> UserEvalAccountResponse:
+    """Assemble the eval-account view for a resolved user/org row."""
+    org_id: uuid.UUID = account["org_id"]
+    status_ = await get_quota_status(org_id, force_count=True)
+
+    base_quota = TIER_QUOTAS.get(status_.tier, TIER_QUOTAS[DEFAULT_TIER])[1]
+    return UserEvalAccountResponse(
+        user_id=account["user_id"],
+        email=account["email"],
+        name=account["name"],
+        user_type=account["user_type"],
+        org_id=org_id,
+        org_name=account.get("org_name"),
+        tier=status_.tier,
+        eval_used=status_.eval_count,
+        eval_bonus=int(account.get("eval_quota_bonus") or 0),
+        base_eval_quota=None if base_quota == UNLIMITED else base_quota,
+        eval_limit=None if status_.eval_quota == UNLIMITED else status_.eval_quota,
+    )
+
+
+@admin_router.get(
+    "/users/{user_id}/evaluations", response_model=UserEvalAccountResponse
+)
+async def get_user_evaluations(
+    user_id: uuid.UUID,
+    _session: dict = Depends(require_admin),
+) -> UserEvalAccountResponse:
+    account = await admin_get_user_eval_account(user_id)
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return await _build_eval_account(account)
+
+
+@admin_router.post(
+    "/users/{user_id}/evaluations", response_model=UserEvalAccountResponse
+)
+async def adjust_user_evaluations(
+    user_id: uuid.UUID,
+    body: AdjustEvalRequest,
+    _session: dict = Depends(require_admin),
+) -> UserEvalAccountResponse:
+    if body.delta == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="delta must be a non-zero integer",
+        )
+    account = await admin_get_user_eval_account(user_id)
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    org_id: uuid.UUID = account["org_id"]
+    new_bonus = await admin_adjust_eval_bonus(org_id, body.delta)
+    if new_bonus is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found"
+        )
+    # Drop the org's cached tier/bonus/counts so the new allowance takes effect
+    # immediately on the hot /ingest path instead of after the TTL window.
+    invalidate_quota_cache(org_id)
+
+    account["eval_quota_bonus"] = new_bonus
+    return await _build_eval_account(account)
 
 
 @admin_router.get("/organizations", response_model=OrgListResponse)

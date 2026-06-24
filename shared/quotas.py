@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from db_queues.clickhouse import clickhouse_client
-from db_queues.postgresql.auth import get_org_tier
+from db_queues.postgresql.auth import get_org_eval_bonus, get_org_tier
 
 UNLIMITED = -1
 
@@ -48,6 +48,9 @@ _trace_count_cache: dict[uuid.UUID, _CachedCount] = {}
 _eval_count_cache: dict[uuid.UUID, _CachedCount] = {}
 _tier_cache: dict[uuid.UUID, _CachedCount] = {}  # value held in .value as id
 _tier_value_cache: dict[uuid.UUID, str] = {}
+# Admin-granted eval allowance adjustment per org (may be negative). Stored as
+# the int value directly in ``.value`` since it can be negative.
+_eval_bonus_cache: dict[uuid.UUID, _CachedCount] = {}
 
 
 def _now() -> float:
@@ -69,6 +72,15 @@ async def _cached_eval_count(org_id: uuid.UUID) -> int:
         return hit.value
     value = await clickhouse_client.count_evaluations(org_id)
     _eval_count_cache[org_id] = _CachedCount(value, _now() + _CACHE_TTL_SECONDS)
+    return value
+
+
+async def _cached_eval_bonus(org_id: uuid.UUID) -> int:
+    hit = _eval_bonus_cache.get(org_id)
+    if hit is not None and hit.expires_at > _now():
+        return hit.value
+    value = await get_org_eval_bonus(org_id)
+    _eval_bonus_cache[org_id] = _CachedCount(value, _now() + _CACHE_TTL_SECONDS)
     return value
 
 
@@ -132,6 +144,13 @@ async def get_quota_status(
     tier = await _cached_tier(org_id)
     trace_quota, eval_quota = TIER_QUOTAS.get(tier, TIER_QUOTAS[DEFAULT_TIER])
 
+    # Admins can grant (or deduct) extra evaluations on top of the tier cap.
+    # Unlimited tiers stay unlimited; bounded tiers floor at zero so a
+    # deduction can zero out the allowance but never go negative.
+    if eval_quota != UNLIMITED:
+        bonus = await _cached_eval_bonus(org_id)
+        eval_quota = max(0, eval_quota + bonus)
+
     trace_count = (
         await _cached_trace_count(org_id)
         if force_count or trace_quota != UNLIMITED
@@ -158,8 +177,10 @@ def invalidate(org_id: Optional[uuid.UUID] = None) -> None:
         _eval_count_cache.clear()
         _tier_cache.clear()
         _tier_value_cache.clear()
+        _eval_bonus_cache.clear()
         return
     _trace_count_cache.pop(org_id, None)
     _eval_count_cache.pop(org_id, None)
     _tier_cache.pop(org_id, None)
     _tier_value_cache.pop(org_id, None)
+    _eval_bonus_cache.pop(org_id, None)
