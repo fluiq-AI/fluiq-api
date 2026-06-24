@@ -43,6 +43,46 @@ async def seed_judge_prompts() -> None:
         )
 
 
+async def create_judge_prompt(
+    name: str,
+    template: str,
+    description: Optional[str],
+    required_vars: list[str],
+    updated_by: Optional[uuid.UUID] = None,
+) -> Optional[dict[str, Any]]:
+    """Create a new custom judge prompt. Returns None if the name already exists.
+
+    ``default_template`` is set to the initial template so "Reset to default"
+    restores the prompt as first created. Version 1 is recorded in history.
+    """
+    async with postgres_client.acquire() as conn:
+        async with conn.transaction():
+            exists = await conn.fetchval(
+                "SELECT 1 FROM eval_judge_prompts WHERE name = $1", name
+            )
+            if exists:
+                return None
+            row = await conn.fetchrow(
+                """
+                INSERT INTO eval_judge_prompts
+                    (name, template, default_template, description, required_vars,
+                     is_overridden, version, updated_by)
+                VALUES ($1, $2, $2, $3, $4, FALSE, 1, $5)
+                RETURNING name, template, default_template, description, required_vars,
+                          is_overridden, version, updated_at
+                """,
+                name, template, description, required_vars, updated_by,
+            )
+            await conn.execute(
+                """
+                INSERT INTO eval_judge_prompt_versions (name, version, template, updated_by)
+                VALUES ($1, 1, $2, $3)
+                """,
+                name, template, updated_by,
+            )
+    return dict(row)
+
+
 async def list_judge_prompts() -> list[dict[str, Any]]:
     async with postgres_client.acquire() as conn:
         rows = await conn.fetch(
@@ -166,6 +206,7 @@ async def restore_judge_prompt_version(
 
 __all__ = [
     "seed_judge_prompts",
+    "create_judge_prompt",
     "list_judge_prompts",
     "get_judge_prompt",
     "update_judge_prompt",

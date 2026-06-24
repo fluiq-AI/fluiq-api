@@ -22,6 +22,7 @@ from db_queues.postgresql.auth import (
     get_user_by_id,
 )
 from db_queues.postgresql.eval_prompts import (
+    create_judge_prompt,
     get_judge_prompt,
     list_judge_prompt_versions,
     list_judge_prompts,
@@ -499,6 +500,17 @@ class UpdateJudgePromptRequest(BaseModel):
     template: str
 
 
+class CreateJudgePromptRequest(BaseModel):
+    name: str
+    template: str
+    description: Optional[str] = None
+    required_vars: List[str] = []
+
+
+# Lowercase identifier: starts with a letter, then letters/digits/underscores.
+_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+
+
 class JudgePromptVersionView(BaseModel):
     version_id: uuid.UUID
     name: str
@@ -534,6 +546,31 @@ async def judge_prompts_list(
 ) -> JudgePromptListResponse:
     rows = await list_judge_prompts()
     return JudgePromptListResponse(prompts=[JudgePromptView(**r) for r in rows])
+
+
+@admin_router.post("/judge-prompts", response_model=JudgePromptView, status_code=201)
+async def judge_prompt_create(
+    body: CreateJudgePromptRequest,
+    session: dict = Depends(require_admin),
+) -> JudgePromptView:
+    name = body.name.strip().lower()
+    if not _NAME_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail="Name must be lowercase letters, digits, or underscores (e.g. 'my_metric').",
+        )
+    # Reuse the same placeholder check used by edits.
+    _validate_template({"required_vars": body.required_vars}, body.template)
+    created = await create_judge_prompt(
+        name=name,
+        template=body.template,
+        description=body.description,
+        required_vars=[v.strip() for v in body.required_vars if v.strip()],
+        updated_by=uuid.UUID(session["sub"]),
+    )
+    if created is None:
+        raise HTTPException(status_code=409, detail=f"A prompt named '{name}' already exists.")
+    return JudgePromptView(**created)
 
 
 @admin_router.get("/judge-prompts/{name}", response_model=JudgePromptView)
