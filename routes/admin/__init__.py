@@ -1,3 +1,4 @@
+import logging
 import re
 import time
 import uuid
@@ -41,6 +42,8 @@ from shared.quotas import (
 )
 
 admin_router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Auth dependency
@@ -381,6 +384,53 @@ def _aws(service: str):
     return boto3.client(service, region_name=config.AWS_REGION)
 
 
+# Mutations are confined to this prefix and to known env-var names.
+_SECRET_NAME_RE = re.compile(r"^/fluiq/prod/[A-Za-z0-9_./-]+$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Fields accepted by register_task_definition (the rest of describe_task_definition
+# is read-only and must be dropped before re-registering).
+_TASK_DEF_KEYS = (
+    "family", "taskRoleArn", "executionRoleArn", "networkMode",
+    "containerDefinitions", "volumes", "placementConstraints",
+    "requiresCompatibilities", "cpu", "memory", "pidMode", "ipcMode",
+    "proxyConfiguration", "inferenceAccelerators", "ephemeralStorage",
+    "runtimePlatform",
+)
+
+
+def _require_secret_prefix(name: str) -> None:
+    if not _SECRET_NAME_RE.match(name or ""):
+        raise HTTPException(
+            status_code=400,
+            detail="Name must look like /fluiq/prod/<NAME> (letters, digits, and _ . - /).",
+        )
+
+
+def _audit(session: dict, action: str, **fields: Any) -> None:
+    """Emit one structured audit line per infra mutation."""
+    detail = " ".join(f"{k}={v}" for k, v in fields.items())
+    logger.info("infra-audit admin=%s action=%s %s", session.get("sub"), action, detail)
+
+
+def _ssm_arn(name: str) -> str:
+    account = _aws("sts").get_caller_identity()["Account"]
+    return f"arn:aws:ssm:{config.AWS_REGION}:{account}:parameter{name}"
+
+
+def _primary_container(containers: list[dict], service: str) -> dict:
+    """The container a worker's secrets attach to: matched by name, else the first."""
+    for c in containers:
+        if c.get("name") == service:
+            return c
+    if not containers:
+        raise HTTPException(status_code=502, detail="Task definition has no containers.")
+    return containers[0]
+
+
+def _task_def_for_register(td: dict) -> dict:
+    return {k: td[k] for k in _TASK_DEF_KEYS if td.get(k) not in (None, [], {})}
+
+
 @admin_router.get("/infra/workers")
 async def infra_workers(_session: dict = Depends(require_admin)):
     """ECS service status for the API + workers."""
@@ -409,19 +459,34 @@ async def infra_workers(_session: dict = Depends(require_admin)):
         raise HTTPException(status_code=502, detail=f"ECS describe failed: {exc}")
 
 
+# How many filter_log_events pages to scan before giving up (each page ≤ 10k
+# events); bounds the work when a query matches sparsely over a wide window.
+_INFRA_LOG_MAX_PAGES = 20
+
+
 @admin_router.get("/infra/workers/{service}/logs")
 async def infra_worker_logs(
     service: str,
-    limit: int = Query(120, ge=1, le=500),
+    limit: int = Query(200, ge=1, le=2000),
+    q: str | None = Query(None, description="Substring to search for (case-sensitive)."),
+    start: int | None = Query(None, ge=0, description="Window start, epoch ms."),
+    end: int | None = Query(None, ge=0, description="Window end, epoch ms."),
     _session: dict = Depends(require_admin),
 ):
-    """Tail the most recent CloudWatch log stream for a service."""
+    """Worker logs from CloudWatch.
+
+    With no ``q``/``start``/``end`` this tails the most recent log stream (fast
+    "live" view). When a query term or time window is supplied it searches across
+    *every* stream in the group via ``filter_log_events`` — i.e. the whole history,
+    not just the latest stream. Events are returned ascending by timestamp.
+    """
     if service not in _WORKER_SERVICES:
         raise HTTPException(status_code=404, detail="Unknown service.")
+    group = f"/ecs/{service}"
+    searching = bool(q) or start is not None or end is not None
 
-    def _logs():
+    def _tail():
         logs = _aws("logs")
-        group = f"/ecs/{service}"
         streams = logs.describe_log_streams(
             logGroupName=group, orderBy="LastEventTime", descending=True, limit=1
         ).get("logStreams", [])
@@ -438,8 +503,35 @@ async def infra_worker_logs(
             for e in resp.get("events", [])
         ]
 
+    def _search():
+        logs = _aws("logs")
+        kwargs: dict[str, Any] = {"logGroupName": group, "limit": min(limit, 10000)}
+        if q:
+            # Literal substring match across all streams (CloudWatch is case-sensitive).
+            kwargs["filterPattern"] = f'"{q}"'
+        if start is not None:
+            kwargs["startTime"] = start
+        if end is not None:
+            kwargs["endTime"] = end
+        events: list[dict] = []
+        token: str | None = None
+        for _ in range(_INFRA_LOG_MAX_PAGES):
+            if token:
+                kwargs["nextToken"] = token
+            resp = logs.filter_log_events(**kwargs)
+            events.extend(resp.get("events", []))
+            token = resp.get("nextToken")
+            if not token or len(events) >= limit:
+                break
+        events.sort(key=lambda e: e.get("timestamp", 0))
+        return [
+            {"ts": e["timestamp"], "message": (e.get("message") or "").rstrip()}
+            for e in events[:limit]
+        ]
+
     try:
-        return {"service": service, "events": await run_in_threadpool(_logs)}
+        events = await run_in_threadpool(_search if searching else _tail)
+        return {"service": service, "events": events, "searched": searching}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"CloudWatch logs failed: {exc}")
 
@@ -467,6 +559,235 @@ async def infra_secrets(_session: dict = Depends(require_admin)):
         return {"parameters": await run_in_threadpool(_list)}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"SSM describe failed: {exc}")
+
+
+class SecretWriteRequest(BaseModel):
+    name: str
+    value: str
+    type: str = "SecureString"  # "String" | "SecureString"
+    description: Optional[str] = None
+
+
+@admin_router.put("/infra/secrets")
+async def infra_put_secret(
+    payload: SecretWriteRequest,
+    session: dict = Depends(require_admin),
+):
+    """Create or update an SSM parameter under /fluiq/prod/. Values are write-only."""
+    _require_secret_prefix(payload.name)
+    if payload.type not in ("String", "SecureString"):
+        raise HTTPException(status_code=400, detail="type must be String or SecureString.")
+    if not payload.value:
+        raise HTTPException(status_code=400, detail="value is required.")
+
+    def _put():
+        ssm = _aws("ssm")
+        kwargs: dict[str, Any] = {
+            "Name": payload.name, "Value": payload.value,
+            "Type": payload.type, "Overwrite": True,
+        }
+        if payload.description:
+            kwargs["Description"] = payload.description
+        return ssm.put_parameter(**kwargs).get("Version")
+
+    try:
+        version = await run_in_threadpool(_put)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"SSM put failed: {exc}")
+    _audit(session, "secret.put", name=payload.name, type=payload.type, version=version)
+    return {"name": payload.name, "type": payload.type, "version": version}
+
+
+@admin_router.delete("/infra/secrets")
+async def infra_delete_secret(
+    name: str = Query(..., description="Full SSM parameter name under /fluiq/prod/."),
+    session: dict = Depends(require_admin),
+):
+    """Delete an SSM parameter. Irreversible."""
+    _require_secret_prefix(name)
+
+    def _del():
+        _aws("ssm").delete_parameter(Name=name)
+
+    try:
+        await run_in_threadpool(_del)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if "ParameterNotFound" in msg:
+            raise HTTPException(status_code=404, detail="Parameter not found.")
+        raise HTTPException(status_code=502, detail=f"SSM delete failed: {exc}")
+    _audit(session, "secret.delete", name=name)
+    return {"deleted": name}
+
+
+# ── Per-worker secret bindings (task-definition `secrets` → env vars) ──────────
+
+
+class WorkerSecretRequest(BaseModel):
+    env_name: str            # env var injected into the container
+    ssm_name: str            # SSM parameter the value is read from
+    value: Optional[str] = None   # if set, the SSM parameter is created/updated too
+    type: str = "SecureString"
+
+
+@admin_router.get("/infra/workers/{service}/secrets")
+async def infra_worker_secrets(service: str, _session: dict = Depends(require_admin)):
+    """List the SSM-backed env vars wired into a worker's task definition."""
+    if service not in _WORKER_SERVICES:
+        raise HTTPException(status_code=404, detail="Unknown service.")
+
+    def _get():
+        ecs = _aws("ecs")
+        svc = ecs.describe_services(cluster=_ECS_CLUSTER, services=[service]).get("services", [])
+        if not svc:
+            return []
+        td = ecs.describe_task_definition(taskDefinition=svc[0]["taskDefinition"])["taskDefinition"]
+        container = _primary_container(td.get("containerDefinitions", []), service)
+        return [
+            {"name": s.get("name"), "value_from": s.get("valueFrom")}
+            for s in container.get("secrets", [])
+        ]
+
+    try:
+        return {"service": service, "secrets": await run_in_threadpool(_get)}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"ECS describe failed: {exc}")
+
+
+@admin_router.post("/infra/workers/{service}/secrets")
+async def infra_worker_add_secret(
+    service: str,
+    payload: WorkerSecretRequest,
+    session: dict = Depends(require_admin),
+):
+    """Wire an SSM parameter into a worker as an env var (registers a new task-def
+    revision and updates the service — this redeploys the worker). When ``value`` is
+    provided the SSM parameter is created/updated first."""
+    if service not in _WORKER_SERVICES:
+        raise HTTPException(status_code=404, detail="Unknown service.")
+    if not _ENV_NAME_RE.match(payload.env_name):
+        raise HTTPException(status_code=400, detail="env_name must be a valid env var identifier.")
+    _require_secret_prefix(payload.ssm_name)
+    if payload.value is not None and payload.type not in ("String", "SecureString"):
+        raise HTTPException(status_code=400, detail="type must be String or SecureString.")
+
+    def _add():
+        if payload.value:
+            _aws("ssm").put_parameter(
+                Name=payload.ssm_name, Value=payload.value,
+                Type=payload.type, Overwrite=True,
+            )
+        ecs = _aws("ecs")
+        svc = ecs.describe_services(cluster=_ECS_CLUSTER, services=[service]).get("services", [])
+        if not svc:
+            raise HTTPException(status_code=404, detail="Service not found.")
+        td = ecs.describe_task_definition(taskDefinition=svc[0]["taskDefinition"])["taskDefinition"]
+        reg = _task_def_for_register(td)
+        container = _primary_container(reg.get("containerDefinitions", []), service)
+        secrets = [s for s in container.get("secrets", []) if s.get("name") != payload.env_name]
+        secrets.append({"name": payload.env_name, "valueFrom": _ssm_arn(payload.ssm_name)})
+        container["secrets"] = secrets
+        new = ecs.register_task_definition(**reg)["taskDefinition"]
+        ecs.update_service(
+            cluster=_ECS_CLUSTER, service=service, taskDefinition=new["taskDefinitionArn"],
+        )
+        return new["revision"]
+
+    try:
+        revision = await run_in_threadpool(_add)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"ECS update failed: {exc}")
+    _audit(
+        session, "worker.secret.add", service=service,
+        env_name=payload.env_name, ssm_name=payload.ssm_name,
+        created_param=bool(payload.value), revision=revision,
+    )
+    return {"service": service, "env_name": payload.env_name, "revision": revision}
+
+
+@admin_router.delete("/infra/workers/{service}/secrets/{env_name}")
+async def infra_worker_delete_secret(
+    service: str,
+    env_name: str,
+    session: dict = Depends(require_admin),
+):
+    """Unwire an env-var secret from a worker (new task-def revision + service update,
+    redeploying the worker). The underlying SSM parameter is left intact — delete it
+    from the Secrets tab if it is no longer used."""
+    if service not in _WORKER_SERVICES:
+        raise HTTPException(status_code=404, detail="Unknown service.")
+
+    def _del():
+        ecs = _aws("ecs")
+        svc = ecs.describe_services(cluster=_ECS_CLUSTER, services=[service]).get("services", [])
+        if not svc:
+            raise HTTPException(status_code=404, detail="Service not found.")
+        td = ecs.describe_task_definition(taskDefinition=svc[0]["taskDefinition"])["taskDefinition"]
+        reg = _task_def_for_register(td)
+        container = _primary_container(reg.get("containerDefinitions", []), service)
+        before = container.get("secrets", [])
+        kept = [s for s in before if s.get("name") != env_name]
+        if len(kept) == len(before):
+            raise HTTPException(status_code=404, detail="No such secret binding on this worker.")
+        container["secrets"] = kept
+        new = ecs.register_task_definition(**reg)["taskDefinition"]
+        ecs.update_service(
+            cluster=_ECS_CLUSTER, service=service, taskDefinition=new["taskDefinitionArn"],
+        )
+        return new["revision"]
+
+    try:
+        revision = await run_in_threadpool(_del)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"ECS update failed: {exc}")
+    _audit(session, "worker.secret.delete", service=service, env_name=env_name, revision=revision)
+    return {"service": service, "env_name": env_name, "revision": revision}
+
+
+# ── Scaling (desired task count) ───────────────────────────────────────────────
+
+_MAX_DESIRED = 10  # guard rail; raise if a service legitimately needs more
+
+
+class ScaleRequest(BaseModel):
+    desired: int
+
+
+@admin_router.post("/infra/workers/{service}/scale")
+async def infra_worker_scale(
+    service: str,
+    payload: ScaleRequest,
+    session: dict = Depends(require_admin),
+):
+    """Set the desired task count for a service (0 stops it, capped at _MAX_DESIRED)."""
+    if service not in _WORKER_SERVICES:
+        raise HTTPException(status_code=404, detail="Unknown service.")
+    if payload.desired < 0 or payload.desired > _MAX_DESIRED:
+        raise HTTPException(status_code=400, detail=f"desired must be between 0 and {_MAX_DESIRED}.")
+
+    def _scale():
+        ecs = _aws("ecs")
+        svc = ecs.update_service(
+            cluster=_ECS_CLUSTER, service=service, desiredCount=payload.desired,
+        )["service"]
+        return {
+            "desired": svc.get("desiredCount", payload.desired),
+            "running": svc.get("runningCount", 0),
+            "pending": svc.get("pendingCount", 0),
+        }
+
+    try:
+        result = await run_in_threadpool(_scale)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"ECS scale failed: {exc}")
+    _audit(session, "worker.scale", service=service, desired=payload.desired)
+    return {"service": service, **result}
 
 
 # ---------------------------------------------------------------------------
