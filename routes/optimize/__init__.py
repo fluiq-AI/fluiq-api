@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from db_queues.clickhouse import clickhouse_client
 from db_queues.postgresql.auth import get_organization, get_org_tier, resolve_api_key
 from routes.auth.helper import extract_api_key, get_current_session
+from shared.cache import cached_json, dash_key
 
 _OPTIMIZE_TIERS = {"Team", "Growth", "Enterprise"}
 
@@ -72,9 +73,13 @@ async def get_cache_stats(
     organization = await get_organization(org_id)
     if organization is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
-    stats = await clickhouse_client.fetch_cache_stats(
-        organization_id=org_id,
-        window_hours=window_hours,
+    stats = await cached_json(
+        dash_key(org_id, "cache_stats", window_hours=window_hours),
+        30,
+        lambda: clickhouse_client.fetch_cache_stats(
+            organization_id=org_id,
+            window_hours=window_hours,
+        ),
     )
     return CacheStatsResponse(
         window_hours=stats["window_hours"],
@@ -127,10 +132,14 @@ async def get_optimization_profile(
             detail="Redis is not configured on this deployment.",
         )
 
-    profile = await clickhouse_client.fetch_optimization_profile(
-        organization_id=org_id,
-        window_hours=window_hours,
-        min_calls=min_calls,
+    profile = await cached_json(
+        dash_key(org_id, "optimization_profile", window_hours=window_hours, min_calls=min_calls),
+        60,
+        lambda: clickhouse_client.fetch_optimization_profile(
+            organization_id=org_id,
+            window_hours=window_hours,
+            min_calls=min_calls,
+        ),
     )
 
     # Per-org key namespace: first 8 hex chars of org_id for brevity
@@ -302,9 +311,13 @@ async def get_prompt_cache_stats(
     organization = await get_organization(org_id)
     if organization is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
-    stats = await clickhouse_client.fetch_prompt_cache_stats(
-        organization_id=org_id,
-        window_hours=window_hours,
+    stats = await cached_json(
+        dash_key(org_id, "prompt_cache_stats", window_hours=window_hours),
+        30,
+        lambda: clickhouse_client.fetch_prompt_cache_stats(
+            organization_id=org_id,
+            window_hours=window_hours,
+        ),
     )
     return PromptCacheStatsResponse(**stats)
 

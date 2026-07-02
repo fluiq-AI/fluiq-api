@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from db_queues.clickhouse import clickhouse_client
 from db_queues.postgresql.auth import get_organization
 from routes.auth.helper import get_current_session
+from shared.cache import cached_json, dash_key
 
 from .model import AgentSummaryResponse, AgentSummaryRow
 
@@ -32,10 +33,14 @@ async def agent_summary(
             detail="Organization not found",
         )
 
-    rows = await clickhouse_client.fetch_agent_summary(
-        organization_id=org_id,
-        limit=limit,
-        offset=offset,
+    rows = await cached_json(
+        dash_key(org_id, "agent_summary", limit=limit, offset=offset),
+        30,
+        lambda: clickhouse_client.fetch_agent_summary(
+            organization_id=org_id,
+            limit=limit,
+            offset=offset,
+        ),
     )
     return AgentSummaryResponse(
         agents=[AgentSummaryRow(**row) for row in rows],
