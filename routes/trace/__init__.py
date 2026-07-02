@@ -15,6 +15,7 @@ from db_queues.postgresql.auth import get_organization, resolve_api_key
 from db_queues.postgresql.guardrails import get_policy
 from realtime import running_registry, trace_broker
 from routes.auth.helper import extract_api_key, get_current_session
+from shared.cache import cached_json, dash_key
 from shared.quotas import (
     bump_eval_count,
     bump_trace_count,
@@ -328,7 +329,11 @@ async def trace_spending(
     rows on first paint (see fetch_spending_by_day).
     """
     org_id = uuid.UUID(session["org_id"])
-    rows = await clickhouse_client.fetch_spending_by_day(org_id, days=days)
+    rows = await cached_json(
+        dash_key(org_id, "spending_by_day", days=days),
+        60,
+        lambda: clickhouse_client.fetch_spending_by_day(org_id, days=days),
+    )
 
     by_date: dict[str, SpendingDay] = {}
     for row in rows:

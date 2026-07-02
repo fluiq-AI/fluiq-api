@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 _TRACE_ORDER_MAP: dict[str, str] = {
     "newest":       "t.ingested_at DESC",
     "oldest":       "t.ingested_at ASC",
-    "latency_desc": "JSONExtractFloat(toString(t.event), 'latency') DESC NULLS LAST",
-    "latency_asc":  "JSONExtractFloat(toString(t.event), 'latency') ASC NULLS LAST",
+    "latency_desc": "t.event.latency.:Float64 DESC NULLS LAST",
+    "latency_asc":  "t.event.latency.:Float64 ASC NULLS LAST",
     "cost_desc":    "c.total_cost DESC NULLS LAST",
     "cost_asc":     "c.total_cost ASC NULLS LAST",
 }
@@ -91,18 +91,18 @@ class ClickHouseQueryMixin:
             )
             params["agent_key"] = agent_key
             if agent_kind == "function":
-                where += " AND JSONExtractString(toString(t.event), 'function') = {agent_key:String}"
+                where += " AND ifNull(t.event.function.:String,'') = {agent_key:String}"
             elif agent_kind == "chain":
-                where += " AND JSONExtractString(toString(t.event), 'name') = {agent_key:String}"
+                where += " AND ifNull(t.event.name.:String,'') = {agent_key:String}"
             elif agent_kind == "langgraph_node":
-                where += " AND JSONExtractString(JSONExtractRaw(toString(t.event), 'langgraph'), 'langgraph_node') = {agent_key:String}"
+                where += " AND ifNull(t.event.langgraph.langgraph_node.:String,'') = {agent_key:String}"
             elif agent_kind == "llm":
                 where += " AND concat(c.provider, ':', c.model) = {agent_key:String}"
             else:
                 where += (
                     " AND ("
-                    "JSONExtractString(toString(t.event), 'function') = {agent_key:String}"
-                    " OR JSONExtractString(toString(t.event), 'name') = {agent_key:String}"
+                    "ifNull(t.event.function.:String,'') = {agent_key:String}"
+                    " OR ifNull(t.event.name.:String,'') = {agent_key:String}"
                     ")"
                 )
 
@@ -117,14 +117,14 @@ class ClickHouseQueryMixin:
         # non-root fetch (paging raw spans) we keep the row-level predicate so
         # "failed" still means the individual failing spans.
         returning_roots = roots_only or agent_key is not None
-        blocked_pred = "JSONExtractString(toString(event), 'status') = 'blocked'"
+        blocked_pred = "ifNull(event.status.:String,'') = 'blocked'"
         failed_pred = (
-            "JSONHas(toString(event), 'success')"
-            " AND JSONExtractBool(toString(event), 'success') = 0"
-            " AND JSONExtractString(toString(event), 'status') != 'blocked'"
+            "event.success IS NOT NULL"
+            " AND ifNull(event.success.:Bool,false) = 0"
+            " AND ifNull(event.status.:String,'') != 'blocked'"
         )
         if status == "running":
-            where += " AND JSONExtractString(toString(t.event), 'status') = 'running'"
+            where += " AND ifNull(t.event.status.:String,'') = 'running'"
         elif status == "blocked":
             if returning_roots:
                 where += (
@@ -149,14 +149,14 @@ class ClickHouseQueryMixin:
                 where += f" AND {failed_pred.replace('event', 't.event')}"
         elif status == "completed":
             where += (
-                " AND JSONExtractString(toString(t.event), 'status') NOT IN ('running', 'blocked')"
-                " AND (NOT JSONHas(toString(t.event), 'success')"
-                "   OR JSONExtractBool(toString(t.event), 'success') = 1)"
+                " AND ifNull(t.event.status.:String,'') NOT IN ('running', 'blocked')"
+                " AND (NOT t.event.success IS NOT NULL"
+                "   OR ifNull(t.event.success.:Bool,false) = 1)"
             )
 
         # Integration filter
         if integration != "all":
-            where += " AND JSONExtractString(toString(t.event), 'integration') = {integration:String}"
+            where += " AND ifNull(t.event.integration.:String,'') = {integration:String}"
             params["integration"] = integration
 
         # Post-join filters (reference joined table aliases)
@@ -304,69 +304,69 @@ class ClickHouseQueryMixin:
 
         legacy_result = await self._client.query(f"""  # type: ignore[attr-defined]
 SELECT
-    JSONExtractString(toString(event), 'cache_kind')      AS kind,
-    sum(JSONExtractInt(toString(event), 'cache_hits'))    AS hits,
-    sum(JSONExtractInt(toString(event), 'cache_misses'))  AS misses,
+    ifNull(event.cache_kind.:String,'')      AS kind,
+    sum(ifNull(event.cache_hits.:Int64,0))    AS hits,
+    sum(ifNull(event.cache_misses.:Int64,0))  AS misses,
     count()                                               AS calls
 FROM {target}
 WHERE organization_id = {{org_id:UUID}}
-  AND JSONExtractString(toString(event), 'type') = 'cache'
+  AND ifNull(event.type.:String,'') = 'cache'
   AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
 GROUP BY kind
 """, parameters=params)
 
         llm_result = await self._client.query(f"""  # type: ignore[attr-defined]
 SELECT
-    lower(JSONExtractString(toString(event), 'integration')) AS kind,
-    countIf(JSONExtractBool(toString(event), 'cache_hit') = 1) AS hits,
-    countIf(JSONExtractBool(toString(event), 'cache_hit') = 0) AS misses,
+    lower(ifNull(event.integration.:String,'')) AS kind,
+    countIf(ifNull(event.cache_hit.:Bool,false) = 1) AS hits,
+    countIf(ifNull(event.cache_hit.:Bool,false) = 0) AS misses,
     count()                                                    AS calls
 FROM {target}
 WHERE organization_id = {{org_id:UUID}}
-  AND JSONExtractString(toString(event), 'type') = 'llm'
-  AND JSONHas(toString(event), 'cache_hit')
+  AND ifNull(event.type.:String,'') = 'llm'
+  AND event.cache_hit IS NOT NULL
   AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
 GROUP BY kind
 """, parameters=params)
 
         fn_result = await self._client.query(f"""  # type: ignore[attr-defined]
 SELECT
-    JSONExtractString(toString(event), 'function')             AS kind,
-    countIf(JSONExtractBool(toString(event), 'cache_hit') = 1) AS hits,
-    countIf(JSONExtractBool(toString(event), 'cache_hit') = 0) AS misses,
+    ifNull(event.function.:String,'')             AS kind,
+    countIf(ifNull(event.cache_hit.:Bool,false) = 1) AS hits,
+    countIf(ifNull(event.cache_hit.:Bool,false) = 0) AS misses,
     count()                                                    AS calls
 FROM {target}
 WHERE organization_id = {{org_id:UUID}}
-  AND JSONExtractString(toString(event), 'type') = 'function'
-  AND JSONHas(toString(event), 'cache_hit')
+  AND ifNull(event.type.:String,'') = 'function'
+  AND event.cache_hit IS NOT NULL
   AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
 GROUP BY kind
 """, parameters=params)
 
         vs_result = await self._client.query(f"""  # type: ignore[attr-defined]
 SELECT
-    lower(JSONExtractString(toString(event), 'integration')) AS kind,
-    countIf(JSONExtractBool(toString(event), 'cache_hit') = 1) AS hits,
-    countIf(JSONExtractBool(toString(event), 'cache_hit') = 0) AS misses,
+    lower(ifNull(event.integration.:String,'')) AS kind,
+    countIf(ifNull(event.cache_hit.:Bool,false) = 1) AS hits,
+    countIf(ifNull(event.cache_hit.:Bool,false) = 0) AS misses,
     count()                                                    AS calls
 FROM {target}
 WHERE organization_id = {{org_id:UUID}}
-  AND JSONExtractString(toString(event), 'type') = 'vectorstore'
-  AND JSONHas(toString(event), 'cache_hit')
+  AND ifNull(event.type.:String,'') = 'vectorstore'
+  AND event.cache_hit IS NOT NULL
   AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
 GROUP BY kind
 """, parameters=params)
 
         mcp_result = await self._client.query(f"""  # type: ignore[attr-defined]
 SELECT
-    JSONExtractString(toString(event), 'kind')                 AS kind,
-    countIf(JSONExtractBool(toString(event), 'cache_hit') = 1) AS hits,
-    countIf(JSONExtractBool(toString(event), 'cache_hit') = 0) AS misses,
+    ifNull(event.kind.:String,'')                 AS kind,
+    countIf(ifNull(event.cache_hit.:Bool,false) = 1) AS hits,
+    countIf(ifNull(event.cache_hit.:Bool,false) = 0) AS misses,
     count()                                                    AS calls
 FROM {target}
 WHERE organization_id = {{org_id:UUID}}
-  AND JSONExtractString(toString(event), 'type') = 'mcp'
-  AND JSONHas(toString(event), 'cache_hit')
+  AND ifNull(event.type.:String,'') = 'mcp'
+  AND event.cache_hit IS NOT NULL
   AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
 GROUP BY kind
 """, parameters=params)
@@ -422,20 +422,20 @@ GROUP BY kind
 
         result = await self._client.query(f"""  # type: ignore[attr-defined]
 SELECT
-    sum(JSONExtractInt(toString(event), 'prompt_cache_read_tokens'))    AS anthropic_read,
-    sum(JSONExtractInt(toString(event), 'prompt_cache_creation_tokens')) AS anthropic_creation,
-    sum(JSONExtractInt(toString(event), 'prompt_cached_tokens'))         AS provider_cached,
+    sum(ifNull(event.prompt_cache_read_tokens.:Int64,0))    AS anthropic_read,
+    sum(ifNull(event.prompt_cache_creation_tokens.:Int64,0)) AS anthropic_creation,
+    sum(ifNull(event.prompt_cached_tokens.:Int64,0))         AS provider_cached,
     count()                                                              AS calls,
     countIf(
-        JSONExtractInt(toString(event), 'prompt_cache_read_tokens') > 0
-        OR JSONExtractInt(toString(event), 'prompt_cached_tokens') > 0
+        ifNull(event.prompt_cache_read_tokens.:Int64,0) > 0
+        OR ifNull(event.prompt_cached_tokens.:Int64,0) > 0
     )                                                                    AS calls_with_hit
 FROM {target}
 WHERE organization_id = {{org_id:UUID}}
-  AND JSONExtractString(toString(event), 'type') = 'llm'
+  AND ifNull(event.type.:String,'') = 'llm'
   AND (
-        JSONHas(toString(event), 'prompt_cache_read_tokens')
-     OR JSONHas(toString(event), 'prompt_cached_tokens')
+        event.prompt_cache_read_tokens IS NOT NULL
+     OR event.prompt_cached_tokens IS NOT NULL
   )
   AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
 """, parameters=params)
@@ -484,11 +484,11 @@ WHERE organization_id = {{org_id:UUID}}
 WITH roots AS (
     SELECT
         trace_id, root_trace_id, ingested_at,
-        JSONExtractString(toString(event), 'function')                                    AS fn,
-        JSONExtractString(toString(event), 'name')                                        AS nm,
-        JSONExtractString(toString(event), 'integration')                                 AS intg,
-        JSONExtractString(JSONExtractRaw(toString(event), 'langgraph'), 'langgraph_node') AS lg_node,
-        JSONExtractFloat(toString(event), 'latency')                                      AS latency
+        ifNull(event.function.:String,'')                                    AS fn,
+        ifNull(event.name.:String,'')                                        AS nm,
+        ifNull(event.integration.:String,'')                                 AS intg,
+        ifNull(event.langgraph.langgraph_node.:String,'') AS lg_node,
+        event.latency.:Float64                                      AS latency
     FROM {target}
     WHERE organization_id = {{org_id:UUID}}
       -- A span counts as an agent root when it is its own root, OR when its
@@ -505,9 +505,9 @@ WITH roots AS (
             )
       )
       AND (
-            JSONExtractString(toString(event), 'function') != ''
-         OR JSONExtractString(toString(event), 'name') != ''
-         OR JSONExtractString(JSONExtractRaw(toString(event), 'langgraph'), 'langgraph_node') != ''
+            ifNull(event.function.:String,'') != ''
+         OR ifNull(event.name.:String,'') != ''
+         OR ifNull(event.langgraph.langgraph_node.:String,'') != ''
       )
 ),
 costs AS (
@@ -576,11 +576,11 @@ OFFSET {{offset:UInt32}}
         }
         model_result = await self._client.query(f"""  # type: ignore[attr-defined]
 SELECT
-    JSONExtractString(toString(event), 'model') AS model,
+    ifNull(event.model.:String,'') AS model,
     count()                                      AS call_count
 FROM {target}
 WHERE organization_id = {{org_id:UUID}}
-  AND JSONExtractString(toString(event), 'type') = 'llm'
+  AND ifNull(event.type.:String,'') = 'llm'
   AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
 GROUP BY model
 HAVING call_count >= {{min_calls:UInt32}}
@@ -595,13 +595,13 @@ SELECT
 FROM (
     SELECT
         cityHash64(
-            JSONExtractString(toString(event), 'model'),
-            toString(JSONExtractRaw(toString(event), 'messages'))
+            ifNull(event.model.:String,''),
+            toString(event.messages)
         ) AS prompt_hash,
         count() AS call_count
     FROM {target}
     WHERE organization_id = {{org_id:UUID}}
-      AND JSONExtractString(toString(event), 'type') = 'llm'
+      AND ifNull(event.type.:String,'') = 'llm'
       AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
     GROUP BY prompt_hash
 )
