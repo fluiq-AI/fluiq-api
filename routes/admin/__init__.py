@@ -379,6 +379,11 @@ _ECS_CLUSTER = "fluiq"
 _WORKER_SERVICES = ["fluiq-api", "fluiq-tracer", "fluiq-evaluator", "fluiq-security"]
 _SSM_PREFIX = "/fluiq/prod/"
 
+# Self-hosted infra boxes, for the Kafka/ClickHouse/Postgres log viewers.
+_KAFKA_INSTANCE_ID = "i-0ce87c91a2778da50"   # fluiq-kafka EC2 (Docker KRaft broker)
+_KAFKA_CONTAINER = "fluiq-kafka"
+_RDS_INSTANCE_ID = "fluiq-postgres"
+
 
 def _aws(service: str):
     return boto3.client(service, region_name=config.AWS_REGION)
@@ -534,6 +539,108 @@ async def infra_worker_logs(
         return {"service": service, "events": events, "searched": searching}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"CloudWatch logs failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure — data-store logs (Kafka · ClickHouse · Postgres)
+# ---------------------------------------------------------------------------
+# Each source lives somewhere different, so each has its own fetch strategy:
+#   kafka      → SSM RunShellScript `docker logs` on the broker EC2 (on-demand)
+#   clickhouse → query system.text_log / system.query_log over the live conn
+#   postgres   → RDS DownloadDBLogFilePortion on the latest log file
+# All fail SOFT: a missing IAM permission surfaces as a 502 with the AWS error,
+# which the Admin UI renders inline (nothing else breaks).
+
+_LOG_SOURCES = ("kafka", "clickhouse", "postgres")
+
+
+async def _clickhouse_logs(limit: int) -> dict:
+    client = clickhouse_client._client
+    if client is None:
+        raise HTTPException(status_code=503, detail="ClickHouse is not connected.")
+    settings = {"readonly": 2, "max_execution_time": 10}
+    # Prefer the server text log; fall back to recent query history + errors.
+    text_sql = (
+        "SELECT event_time, level, message FROM system.text_log "
+        f"ORDER BY event_time DESC LIMIT {limit}"
+    )
+    query_sql = (
+        "SELECT event_time, "
+        "       concat(type, ' ', "
+        "         if(exception != '', concat('EXCEPTION ', exception), "
+        "            concat(toString(query_duration_ms), 'ms')), ' ', "
+        "         substring(replaceRegexpAll(query, '\\\\s+', ' '), 1, 200)) "
+        "FROM system.query_log WHERE type != 'QueryStart' "
+        f"ORDER BY event_time DESC LIMIT {limit}"
+    )
+    last_exc: Exception | None = None
+    for sql in (text_sql, query_sql):
+        try:
+            res = await client.query(sql, settings=settings)
+            lines = [" ".join(str(c) for c in row) for row in res.result_rows]
+            lines.reverse()  # oldest → newest for a natural tail
+            return {"source": "clickhouse", "lines": lines}
+        except Exception as exc:  # noqa: BLE001 — try the fallback query
+            last_exc = exc
+    raise HTTPException(status_code=502, detail=f"ClickHouse logs unavailable: {last_exc}")
+
+
+def _kafka_logs(limit: int) -> dict:
+    ssm = _aws("ssm")
+    cmd_id = ssm.send_command(
+        InstanceIds=[_KAFKA_INSTANCE_ID],
+        DocumentName="AWS-RunShellScript",
+        Parameters={"commands": [
+            f"docker logs --tail {limit} {_KAFKA_CONTAINER} 2>&1 | tail -n {limit}"
+        ]},
+    )["Command"]["CommandId"]
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        time.sleep(1.0)
+        try:
+            inv = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=_KAFKA_INSTANCE_ID)
+        except ssm.exceptions.InvocationDoesNotExist:
+            continue
+        if inv["Status"] in ("Success", "Failed", "Cancelled", "TimedOut"):
+            out = (inv.get("StandardOutputContent") or "") + (inv.get("StandardErrorContent") or "")
+            return {"source": "kafka", "lines": out.splitlines()[-limit:], "status": inv["Status"]}
+    raise HTTPException(status_code=504, detail="Kafka log fetch timed out (SSM still running).")
+
+
+def _postgres_logs(limit: int) -> dict:
+    rds = _aws("rds")
+    files = rds.describe_db_log_files(DBInstanceIdentifier=_RDS_INSTANCE_ID).get("DescribeDBLogFiles", [])
+    if not files:
+        return {"source": "postgres", "lines": []}
+    latest = max(files, key=lambda f: f.get("LastWritten", 0))["LogFileName"]
+    portion = rds.download_db_log_file_portion(
+        DBInstanceIdentifier=_RDS_INSTANCE_ID,
+        LogFileName=latest, Marker="0", NumberOfLines=limit,
+    )
+    data = portion.get("LogFileData") or ""
+    return {"source": "postgres", "lines": data.splitlines()[-limit:], "file": latest}
+
+
+@admin_router.get("/infra/logs/{source}")
+async def infra_logs(
+    source: str,
+    limit: int = Query(200, ge=1, le=2000),
+    _session: dict = Depends(require_admin),
+):
+    """Tail logs for a data-store box. See module notes for per-source strategy."""
+    src = source.lower()
+    if src not in _LOG_SOURCES:
+        raise HTTPException(status_code=404, detail=f"source must be one of {', '.join(_LOG_SOURCES)}.")
+    try:
+        if src == "clickhouse":
+            return await _clickhouse_logs(limit)
+        if src == "kafka":
+            return await run_in_threadpool(_kafka_logs, limit)
+        return await run_in_threadpool(_postgres_logs, limit)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — fail soft; UI shows the AWS/IAM error
+        raise HTTPException(status_code=502, detail=f"{src} logs failed: {exc}")
 
 
 @admin_router.get("/infra/secrets")
