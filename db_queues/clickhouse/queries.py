@@ -178,27 +178,27 @@ class ClickHouseQueryMixin:
 
         order_by = _TRACE_ORDER_MAP.get(sort, "t.ingested_at DESC")
 
-        result = await self._client.query(  # type: ignore[attr-defined]
-            f"SELECT t.api_key_prefix, t.event, t.ingested_at, "
-            f"       c.total_cost, c.currency, "
-            f"       e.metrics, e.scores, e.evaluators, e.judge_models, e.details_list, "
-            f"       s.security_risk_level, s.security_risk_score, s.should_block, "
-            f"       s.injection_detected, s.injection_patterns, "
-            f"       s.jailbreak_detected, s.jailbreak_patterns, "
-            f"       s.skeleton_key_detected, s.skeleton_key_patterns, "
-            f"       s.secrets_detected, s.secret_types, "
-            f"       s.indirect_injection_detected, s.indirect_injection_sources, "
-            f"       s.rag_poisoning_detected, s.rag_poisoning_sources, s.rag_poisoning_score, "
-            f"       s.tool_exfiltration_detected, s.tool_exfiltration_types, s.tool_exfiltration_sources, "
-            f"       s.tool_policy_violation_detected, s.tool_policy_violations, "
-            f"       s.cross_agent_injection_detected, "
-            f"       s.semantic_attack_score, "
-            f"       s.pii_entities_prompt, s.pii_entities_response, "
-            f"       s.prompt_redacted, s.response_redacted, s.scan_latency "
-            f"FROM {target} AS t "
+        select_cols = (
+            "t.api_key_prefix, t.event, t.ingested_at, "
+            "c.total_cost, c.currency, "
+            "e.metrics, e.scores, e.evaluators, e.judge_models, e.details_list, "
+            "s.security_risk_level, s.security_risk_score, s.should_block, "
+            "s.injection_detected, s.injection_patterns, "
+            "s.jailbreak_detected, s.jailbreak_patterns, "
+            "s.skeleton_key_detected, s.skeleton_key_patterns, "
+            "s.secrets_detected, s.secret_types, "
+            "s.indirect_injection_detected, s.indirect_injection_sources, "
+            "s.rag_poisoning_detected, s.rag_poisoning_sources, s.rag_poisoning_score, "
+            "s.tool_exfiltration_detected, s.tool_exfiltration_types, s.tool_exfiltration_sources, "
+            "s.tool_policy_violation_detected, s.tool_policy_violations, "
+            "s.cross_agent_injection_detected, "
+            "s.semantic_attack_score, "
+            "s.pii_entities_prompt, s.pii_entities_response, "
+            "s.prompt_redacted, s.response_redacted, s.scan_latency"
+        )
+        joins = (
             f"LEFT JOIN {costs_target} AS c "
-            f"  ON t.organization_id = c.organization_id "
-            f" AND t.trace_id = c.trace_id "
+            f"  ON t.organization_id = c.organization_id AND t.trace_id = c.trace_id "
             f"LEFT JOIN ("
             f"   SELECT organization_id, trace_id, "
             f"          groupArray(metric)            AS metrics, "
@@ -210,16 +210,47 @@ class ClickHouseQueryMixin:
             f"   WHERE organization_id = {{org_id:UUID}} "
             f"   GROUP BY organization_id, trace_id"
             f") AS e "
-            f"  ON t.organization_id = e.organization_id "
-            f" AND t.trace_id = e.trace_id "
+            f"  ON t.organization_id = e.organization_id AND t.trace_id = e.trace_id "
             f"LEFT JOIN {security_target} AS s "
-            f"  ON t.organization_id = s.organization_id "
-            f" AND t.trace_id = s.trace_id "
-            f"WHERE {where}{security_filter}{quality_filter} "
-            f"ORDER BY {order_by} "
-            f"LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}",
-            parameters=params,
+            f"  ON t.organization_id = s.organization_id AND t.trace_id = s.trace_id "
         )
+
+        # Fast path (the default, unfiltered dashboard view): page the base table
+        # FIRST — WHERE + ORDER + LIMIT over indexed traces columns — and only then
+        # join and reconstruct the heavy `event` JSON for the <=LIMIT rows on the
+        # page. Reconstructing `event` across the whole org's joined rows was the
+        # dashboard's 15s+ hot spot; deferring it to the page cuts it to ~0.2s.
+        #
+        # Only valid when nothing after the LIMIT can change which rows qualify:
+        # no post-join (security/quality) filters and a sort key that lives on the
+        # traces table. Otherwise fall back to the full join-then-filter-then-limit
+        # query so pagination stays correct.
+        post_join_filter = f"{security_filter}{quality_filter}".strip()
+        sort_on_join = sort in ("cost_desc", "cost_asc")
+        if not post_join_filter and not sort_on_join:
+            query = (
+                f"WITH page AS ("
+                f"  SELECT t.organization_id, t.trace_id, t.api_key_prefix, "
+                f"         t.event, t.ingested_at "
+                f"  FROM {target} AS t "
+                f"  WHERE {where} "
+                f"  ORDER BY {order_by} "
+                f"  LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}"
+                f") "
+                f"SELECT {select_cols} "
+                f"FROM page AS t {joins} "
+                f"ORDER BY {order_by}"
+            )
+        else:
+            query = (
+                f"SELECT {select_cols} "
+                f"FROM {target} AS t {joins} "
+                f"WHERE {where}{security_filter}{quality_filter} "
+                f"ORDER BY {order_by} "
+                f"LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}"
+            )
+
+        result = await self._client.query(query, parameters=params)  # type: ignore[attr-defined]
         return [parse_trace_row(row) for row in result.result_rows]
 
     # ── Counts ────────────────────────────────────────────────────────────────
