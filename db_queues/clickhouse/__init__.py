@@ -18,20 +18,16 @@ def _split_statements(ddl: str) -> list[str]:
     """Split a multi-statement .sql file into individual statements.
 
     ClickHouse's HTTP interface runs one statement per request, so the schema
-    file (CREATE DATABASE / CREATE TABLE / ALTER …) must be split. The schema
-    contains no semicolons inside string literals, so a plain ``;`` split is
-    safe; comment-only fragments are dropped.
+    file (CREATE DATABASE / CREATE TABLE / ALTER …) must be split. Full-line
+    ``--`` comments are stripped *before* splitting on ``;`` so a semicolon
+    inside a comment can't cut a statement in half (the schema contains no
+    semicolons inside string literals, so ``;`` split is then safe).
     """
-    statements: list[str] = []
-    for chunk in ddl.split(";"):
-        lines = [
-            ln for ln in chunk.splitlines()
-            if ln.strip() and not ln.strip().startswith("--")
-        ]
-        stmt = "\n".join(lines).strip()
-        if stmt:
-            statements.append(stmt)
-    return statements
+    cleaned = "\n".join(
+        ln for ln in ddl.splitlines()
+        if ln.strip() and not ln.strip().startswith("--")
+    )
+    return [stmt.strip() for stmt in cleaned.split(";") if stmt.strip()]
 
 
 class ClickHouseClient(ClickHouseQueryMixin):
@@ -61,22 +57,35 @@ class ClickHouseClient(ClickHouseQueryMixin):
     async def start(self) -> None:
         if self._client is not None:
             return
-        self._client = await clickhouse_connect.get_async_client(
-            host=self.host,
-            port=self.port,
-            username=self.username,
-            password=self.password,
-            database=self.database,
-        )
-        # Warm the connection during startup so the first real query on the
-        # dashboard's first paint doesn't also pay the TCP/TLS + handshake cost
-        # (which, when it pushed requests past the gateway timeout, surfaced as
-        # phantom CORS errors on first login).
         try:
-            await self._client.query("SELECT 1")
+            self._client = await clickhouse_connect.get_async_client(
+                host=self.host,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                database=self.database,
+            )
+            # Warm the connection during startup so the first real query on the
+            # dashboard's first paint doesn't also pay the TCP/TLS + handshake cost
+            # (which, when it pushed requests past the gateway timeout, surfaced as
+            # phantom CORS errors on first login).
+            try:
+                await self._client.query("SELECT 1")
+            except Exception:
+                logger.exception("[CLICKHOUSE] Warm-up query failed")
+            await self._apply_schema()
         except Exception:
-            logger.exception("[CLICKHOUSE] Warm-up query failed")
-        await self._apply_schema()
+            # Leave the client unset so the next caller retries the FULL start —
+            # including the schema apply. A half-initialized client (connected
+            # but schema not applied) would serve queries against missing
+            # tables/columns and never heal.
+            client, self._client = self._client, None
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+            raise
         logger.info("[CLICKHOUSE] Client started: %s:%s/%s", self.host, self.port, self.database)
 
     async def _apply_schema(self) -> None:

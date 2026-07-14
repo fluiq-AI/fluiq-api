@@ -7,6 +7,7 @@ from typing import Optional
 
 from aiokafka.errors import MessageSizeTooLargeError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from db_queues.clickhouse import clickhouse_client
@@ -17,6 +18,9 @@ from realtime import running_registry, trace_broker
 from routes.auth.helper import extract_api_key, get_current_session
 from shared.cache import cached_json, dash_key
 from shared.quotas import (
+    QuotaStatus,
+    UNLIMITED,
+    UNLIMITED_RETENTION_DAYS,
     bump_eval_count,
     bump_trace_count,
     get_quota_status,
@@ -30,8 +34,10 @@ from .model import (
     TraceRecord,
 )
 
+import logging
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 _RETRIEVAL_APIS = {
     "query",
@@ -74,7 +80,25 @@ async def ingestion(
     # Enforce tier quotas before doing any Kafka work. Trace quota is a hard
     # stop (402); eval quota gates only the evaluations fan-out so tracing
     # keeps flowing even after the eval cap is reached.
-    quota = await get_quota_status(org_id)
+    try:
+        quota = await get_quota_status(org_id)
+    except Exception:
+        # Quota stores unreachable (e.g. ClickHouse restarting). Ingestion must
+        # not lose data because a metering read failed — Kafka exists precisely
+        # to buffer through store outages. Fail open: accept the trace, skip the
+        # eval fan-out for this request (eval is best-effort), and stamp the
+        # generous retention so a paid org's rows are never marked for early
+        # deletion by a fallback guess.
+        logger.warning(
+            "[INGEST] quota lookup failed; failing open (trace accepted, eval fan-out skipped)",
+            exc_info=True,
+        )
+        quota = QuotaStatus(
+            tier="Unknown",
+            trace_count=0, trace_quota=UNLIMITED,
+            eval_count=0, eval_quota=0,   # eval_over → True: skips eval fan-out
+            retention_days=UNLIMITED_RETENTION_DAYS,
+        )
     if quota.trace_over:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -94,6 +118,11 @@ async def ingestion(
     # Strip SDK-embedded configs before persisting the trace.
     eval_config     = event.pop("_eval_config",     None)
     security_config = event.pop("_security_config", None)
+    # fluiq.eval() sets this on every traced event; instrument() alone never
+    # does. Evaluation is opt-in behind it (no ambient auto-eval). Treat an
+    # explicit eval_config as also enabling eval so older SDKs (which send
+    # _eval_config on LLM warn-mode but not the _eval flag) keep working.
+    eval_enabled    = bool(event.pop("_eval", False)) or eval_config is not None
 
     is_running = event.get("status") == "running"
 
@@ -145,6 +174,9 @@ async def ingestion(
         "api_key_prefix":  prefix,
         "trace_id":        trace_id,
         "event":           event,
+        # Per-row retention window for this org's tier (Free=14d, paid=never).
+        # Carried through Kafka so the tracer stamps it onto the ClickHouse row.
+        "retention_days":  quota.retention_days,
     }
     # A trace event larger than the producer's max_request_size used to crash
     # here with an unhandled MessageSizeTooLargeError → 500. Return an explicit
@@ -165,17 +197,21 @@ async def ingestion(
     if not is_running:
         bump_trace_count(org_id)
 
+    # Evaluation is opt-in: it runs ONLY when the caller enabled it via
+    # fluiq.eval() (the SDK sets the `_eval` flag, plus `_eval_config` with the
+    # metrics/thresholds on LLM calls). instrument() alone never auto-evaluates.
+    # Quota-gated; the worker's judge cache keeps repeated prompts cheap.
     eval_skipped = False
-    if not is_running and _is_retrieval_event(event):
+    if not is_running and eval_enabled:
         if quota.eval_over:
             eval_skipped = True
-        else:
+        elif _is_retrieval_event(event):
+            # Retrieval → context precision (the worker's default for retrieval
+            # events); the `_eval` flag alone gates it since retrieval calls
+            # carry no `_eval_config`.
             await kafka_queue.add_job(job, topic=config.KAFKA_EVAL_TOPIC, key=str(org_id))
             bump_eval_count(org_id)
-    elif not is_running and eval_config and event.get("type") == "llm":
-        if quota.eval_over:
-            eval_skipped = True
-        else:
+        elif event.get("type") == "llm" and eval_config:
             await kafka_queue.add_job(
                 {**job, "eval_config": eval_config, "operation": "sdk_llm"},
                 topic=config.KAFKA_EVAL_TOPIC,
@@ -350,6 +386,48 @@ async def trace_spending(
         entry.all += cost
 
     return SpendingResponse(days=sorted(by_date.values(), key=lambda d: d.date))
+
+
+class RollupItem(BaseModel):
+    run_cost: float
+    run_tokens: int
+    span_count: int
+    quality_min: Optional[float] = None
+    quality_avg: Optional[float] = None
+    quality_count: int
+    security_risk_max: float
+    security_should_block: bool
+    security_detections: int
+
+
+class RollupRequest(BaseModel):
+    root_ids: list[str]
+
+
+class RollupResponse(BaseModel):
+    rollups: dict[str, RollupItem]
+
+
+# Bound the per-request fan-out so one call can't ask for an unbounded IN list.
+_MAX_ROLLUP_IDS = 500
+
+
+@router.post("/traces/rollups", response_model=RollupResponse)
+async def trace_rollups(
+    body: RollupRequest,
+    session: dict = Depends(get_current_session),
+) -> RollupResponse:
+    """Precomputed per-run cost / quality / security totals for a set of roots.
+
+    The Traces list and drawer pass the visible root_trace_ids and get back each
+    run's rolled-up numbers straight from the AggregatingMergeTree rollups —
+    replacing the old per-root prefetch that pulled every child to sum them in
+    the browser. Roots with no rollup yet are omitted (caller treats as zero).
+    """
+    org_id = uuid.UUID(session["org_id"])
+    ids = body.root_ids[:_MAX_ROLLUP_IDS]
+    data = await clickhouse_client.get_root_rollups(org_id, ids)
+    return RollupResponse(rollups={k: RollupItem(**v) for k, v in data.items()})
 
 
 SSE_HEARTBEAT_SECONDS = 15.0

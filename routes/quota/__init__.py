@@ -1,11 +1,13 @@
 import uuid
+from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from db_queues.postgresql.auth import get_organization
+from db_queues.postgresql.auth import get_organization, get_trial_ends_at
 from routes.auth.helper import get_current_session
-from shared.quotas import UNLIMITED, get_quota_status
+from shared.quotas import UNLIMITED, UNLIMITED_RETENTION_DAYS, get_quota_status
 
 
 class QuotaCounter(BaseModel):
@@ -19,6 +21,12 @@ class QuotaResponse(BaseModel):
     tier: str
     traces: QuotaCounter
     evaluations: QuotaCounter
+    # Raw-trace retention window in days for this tier. Paid tiers use a
+    # ~100-year sentinel; ``None`` tells the frontend to render "Unlimited".
+    retention_days: int | None
+    # Expiry of an active self-serve trial, or ``None`` when the tier isn't a
+    # trial. Lets the dashboard show "Trial · N days left".
+    trial_ends_at: Optional[datetime] = None
 
 
 quota_router = APIRouter()
@@ -42,6 +50,7 @@ async def get_quota(
         )
 
     status_ = await get_quota_status(org_id, force_count=True)
+    trial_ends_at = await get_trial_ends_at(org_id)
     return QuotaResponse(
         tier=status_.tier,
         traces=QuotaCounter(
@@ -52,6 +61,12 @@ async def get_quota(
             used=status_.eval_count,
             limit=None if status_.eval_quota == UNLIMITED else status_.eval_quota,
         ),
+        retention_days=(
+            None
+            if status_.retention_days >= UNLIMITED_RETENTION_DAYS
+            else status_.retention_days
+        ),
+        trial_ends_at=trial_ends_at,
     )
 
 

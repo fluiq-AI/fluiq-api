@@ -13,6 +13,11 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
 KAFKA_TRACE_TOPIC = os.getenv("KAFKA_TRACE_TOPIC")
 KAFKA_TRACE_PERSISTED_TOPIC = os.getenv("KAFKA_TRACE_PERSISTED_TOPIC")
 KAFKA_EVAL_TOPIC = os.getenv("KAFKA_EVAL_TOPIC")
+
+# Fraction of LLM calls that get an ambient single-shot eval when the caller did
+# NOT configure fluiq.eval(). 1.0 = every call (default); 0 = none. An explicit
+# fluiq.eval() is always evaluated regardless of this rate.
+EVAL_AUTO_SAMPLE_RATE = float(os.getenv("EVAL_AUTO_SAMPLE_RATE", "1.0"))
 # Dedicated topic for the standalone security worker (separate from evals so the
 # heavy torch/spaCy security deps don't run in the evaluator).
 KAFKA_SECURITY_TOPIC = os.getenv("KAFKA_SECURITY_TOPIC")
