@@ -91,6 +91,29 @@ async def get_cache_stats(
     )
 
 
+@optimize_router.get("/insights")
+async def get_optimization_insights(
+    session: dict = Depends(get_current_session),
+    window_hours: int = Query(default=168, ge=1, le=720),
+) -> dict:
+    """Developer optimization insights (JWT auth) — powers the Insights page.
+
+    Read-only analysis over the org's traces + costs in the window: most-repeated
+    prompts (cache candidates + projected savings), a cacheable-spend headline,
+    the most expensive models and agents, the slowest models (p95), and error
+    hotspots. Cached briefly so repeated dashboard loads don't re-scan.
+    """
+    org_id = uuid.UUID(session["org_id"])
+    return await cached_json(
+        dash_key(org_id, "optimization_insights", window_hours=window_hours),
+        60,
+        lambda: clickhouse_client.fetch_optimization_insights(
+            organization_id=org_id,
+            window_hours=window_hours,
+        ),
+    )
+
+
 # ── GET /profile  (SDK, API key auth, paid tier) ──────────────────────────────
 
 class ProfileResponse(BaseModel):

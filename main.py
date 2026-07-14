@@ -22,11 +22,13 @@ from routes.optimize import optimize_router
 from routes.datasets import datasets_router
 from routes.prompts import prompts_router
 from routes.quota import quota_router
+from routes.billing import billing_router
 from routes.secure import router as secure_router
 from routes.contact import router as contact_router
 from routes.blog import blog_router
 from routes.models import models_router
 from routes.alerts import alerts_router
+from routes.otel import otel_router
 import config
 
 @asynccontextmanager
@@ -39,7 +41,16 @@ async def lifespan(app: FastAPI):
         await seed_judge_prompts()
     except Exception:
         logging.getLogger(__name__).exception("[STARTUP] judge-prompt seed failed")
-    await clickhouse_client.start()
+    # ClickHouse being down must not keep the API from booting: /ingest fails
+    # open on quota and publishes to Kafka (which buffers through the outage),
+    # and every query method lazily re-runs start() — so the client self-heals
+    # on the first request after ClickHouse returns.
+    try:
+        await clickhouse_client.start()
+    except Exception:
+        logger.exception(
+            "[STARTUP] ClickHouse unavailable; continuing — client reconnects on first use",
+        )
     await trace_consumer.start()
     await alert_consumer.start()
     await security_reply_consumer.start()
@@ -124,8 +135,10 @@ app.include_router(audit_router, prefix="/api/v1")
 app.include_router(guardrails_router, prefix="/api/v1")
 app.include_router(alerts_router, prefix="/api/v1")
 app.include_router(trace.router, prefix="/api/v1")
+app.include_router(otel_router, prefix="/api/v1")
 app.include_router(agents_router, prefix="/api/v1")
 app.include_router(quota_router, prefix="/api/v1")
+app.include_router(billing_router, prefix="/api/v1")
 app.include_router(evaluate_router, prefix="/api/v1")
 app.include_router(prompts_router, prefix="/api/v1")
 app.include_router(datasets_router, prefix="/api/v1")

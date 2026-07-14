@@ -1,7 +1,7 @@
 import hashlib
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import bcrypt
 
@@ -13,7 +13,6 @@ from shared.model import ApiKeyCreated, OrganizationModel, UserModel, UserType
 from . import postgres_client
 
 API_KEY_PREFIX_LENGTH = 11
-
 
 
 API_KEY_LIMITS: dict[str, int] = {
@@ -189,23 +188,105 @@ async def get_organization(org_id: uuid.UUID) -> Optional[OrganizationModel]:
     return OrganizationModel(**dict(row))
 
 
+# Self-serve trial config. Team & Growth can be trialed for 5 days without a
+# card; the trial reverts to Free on expiry. Enterprise is sales-led (no trial).
+TRIAL_DAYS = 5
+TRIALABLE_TIERS = frozenset({"Team", "Growth"})
+
+
 async def get_org_tier(org_id: uuid.UUID) -> Optional[str]:
     """Return the tier (`Free` / `Team` / `Growth` / `Enterprise`) for an org.
 
     The tier is read from the org owner's ``users.user_type`` row. Returns
     ``None`` if the org or its owner cannot be found.
+
+    Trials expire lazily here: if an active trial's ``trial_ends_at`` has
+    passed, the owner is downgraded to Free in the same round-trip and Free is
+    returned. This is the single read path behind ``shared.quotas``, so no cron
+    is needed — the plan self-heals the next time usage is checked. The
+    ``trial_used`` latch is left set so the trial can't be restarted.
     """
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
-            f"SELECT u.user_type "
+            f"SELECT u.user_id, u.user_type, u.trial_ends_at "
             f"FROM {config.POSTGRES_ORG_TABLE} o "
             f"JOIN {config.POSTGRES_USER_TABLE} u ON u.user_id = o.user_id "
             f"WHERE o.org_id = $1",
             org_id,
         )
-    if row is None:
+        if row is None:
+            return None
+        tier = row["user_type"]
+        ends_at = row["trial_ends_at"]
+        if (
+            ends_at is not None
+            and tier != "Free"
+            and ends_at <= datetime.now(timezone.utc)
+        ):
+            await conn.execute(
+                f"UPDATE {config.POSTGRES_USER_TABLE} "
+                f"SET user_type = 'Free', trial_ends_at = NULL, updated_at = NOW() "
+                f"WHERE user_id = $1",
+                row["user_id"],
+            )
+            return "Free"
+    return tier
+
+
+async def get_trial_ends_at(org_id: uuid.UUID) -> Optional[datetime]:
+    """Return the owner's active ``trial_ends_at``, or ``None`` if no live trial.
+
+    A timestamp already in the past reads as ``None`` — the caller shouldn't
+    surface an expired trial even if ``get_org_tier`` hasn't swept it yet.
+    """
+    async with postgres_client.acquire() as conn:
+        value = await conn.fetchval(
+            f"SELECT u.trial_ends_at "
+            f"FROM {config.POSTGRES_ORG_TABLE} o "
+            f"JOIN {config.POSTGRES_USER_TABLE} u ON u.user_id = o.user_id "
+            f"WHERE o.org_id = $1",
+            org_id,
+        )
+    if value is None or value <= datetime.now(timezone.utc):
         return None
-    return row["user_type"]
+    return value
+
+
+async def start_trial(org_id: uuid.UUID, plan: str) -> dict:
+    """Start a 5-day trial of ``plan`` for an org, no card required.
+
+    Returns ``{"ok": True, "tier", "trial_ends_at"}`` on success, or
+    ``{"ok": False, "error"}`` with a user-facing reason when the trial can't
+    start (bad plan, already on a paid plan, or trial already used). Guards run
+    inside the same connection as the update so two concurrent requests can't
+    both consume the one-shot ``trial_used`` latch.
+    """
+    if plan not in TRIALABLE_TIERS:
+        return {"ok": False, "error": "Trials are only available for the Team and Growth plans."}
+
+    ends_at = datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+    async with postgres_client.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                f"SELECT u.user_id, u.user_type, u.trial_used "
+                f"FROM {config.POSTGRES_ORG_TABLE} o "
+                f"JOIN {config.POSTGRES_USER_TABLE} u ON u.user_id = o.user_id "
+                f"WHERE o.org_id = $1 FOR UPDATE OF u",
+                org_id,
+            )
+            if row is None:
+                return {"ok": False, "error": "Organization not found."}
+            if row["user_type"] != "Free":
+                return {"ok": False, "error": "You're already on a paid plan."}
+            if row["trial_used"]:
+                return {"ok": False, "error": "You've already used your free trial."}
+            await conn.execute(
+                f"UPDATE {config.POSTGRES_USER_TABLE} "
+                f"SET user_type = $2, trial_ends_at = $3, trial_used = TRUE, updated_at = NOW() "
+                f"WHERE user_id = $1",
+                row["user_id"], plan, ends_at,
+            )
+    return {"ok": True, "tier": plan, "trial_ends_at": ends_at}
 
 
 async def get_org_eval_bonus(org_id: uuid.UUID) -> int:
@@ -540,6 +621,10 @@ __all__ = [
     "consume_password_reset",
     "get_organization",
     "get_org_tier",
+    "get_trial_ends_at",
+    "start_trial",
+    "TRIAL_DAYS",
+    "TRIALABLE_TIERS",
     "get_org_eval_bonus",
     "admin_get_user_eval_account",
     "admin_adjust_eval_bonus",

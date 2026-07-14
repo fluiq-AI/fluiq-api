@@ -29,6 +29,7 @@ from db_queues.postgresql.auth import resolve_api_key
 from db_queues.postgresql.prompts import get_custom_judge_template
 from realtime import trace_broker
 from routes.auth.helper import extract_api_key, get_current_session
+from shared.quotas import bump_eval_count, get_quota_status
 from .judge import run_custom_judges, run_metrics, SUPPORTED_METRICS
 
 evaluate_router = APIRouter()
@@ -190,6 +191,107 @@ async def evaluate(
         passed=len(failures) == 0,
         failures=failures,
     )
+
+
+# ── POST /evaluate/agentic ────────────────────────────────────────────────────
+
+class AgenticEvalRequest(BaseModel):
+    trace_id:      str
+    root_trace_id: Optional[str] = None
+    # "fast" (L1+L2) | "standard" (+L3 trajectory) | "deep" (+L4 panel).
+    depth:         Optional[str] = None
+
+
+class AgenticEvalResponse(BaseModel):
+    ok:       bool
+    trace_id: str
+    status:   str            # "queued" | "skipped"
+    events:   int
+    detail:   Optional[str] = None
+
+
+@evaluate_router.post("/evaluate/agentic", response_model=AgenticEvalResponse)
+async def evaluate_agentic(
+    payload: AgenticEvalRequest,
+    session: dict = Depends(get_current_session),
+) -> AgenticEvalResponse:
+    """Trigger the agentic (multi-layer) evaluation for a whole trace.
+
+    Fired by the **Run Agentic Eval** button in the trace drawer. Unlike
+    ``fluiq.eval()`` (synchronous single-shot per LLM answer), this fetches every
+    span of the trace tree, publishes one ``agent_eval`` job to the eval worker,
+    and returns immediately. The layered results (deterministic + tool-selection
+    + trajectory [+ panel]) stream back to the UI over the existing SSE
+    ``trace.enriched`` channel, exactly like single-shot evals.
+    """
+    org_id  = uuid.UUID(session["org_id"])
+    root_id = payload.root_trace_id or payload.trace_id
+    try:
+        root_uuid = uuid.UUID(root_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=422, detail="Invalid trace id")
+
+    quota = await get_quota_status(org_id)
+    if quota.eval_over:
+        return AgenticEvalResponse(
+            ok=False, trace_id=payload.trace_id, status="skipped", events=0,
+            detail=f"Evaluation quota exceeded for {quota.tier} tier.",
+        )
+
+    # Pull every span of the trace tree — the agentic evaluator normalizes the
+    # whole run (all tool/MCP calls across steps), not just the root span.
+    rows = await clickhouse_client.fetch_traces(
+        org_id, root_trace_id=root_uuid, limit=500,
+    )
+    events = [r["event"] for r in rows if isinstance(r.get("event"), dict)]
+    if not events:
+        raise HTTPException(status_code=404, detail="No trace events found for this id")
+
+    job: Dict[str, Any] = {
+        "operation":       "agent_eval",
+        "organization_id": str(org_id),
+        "trace_id":        payload.trace_id,
+        "root_trace_id":   root_id,
+        "events":          events,
+    }
+    if payload.depth:
+        job["depth"] = payload.depth
+
+    await kafka_queue.add_job(job, topic=config.KAFKA_EVAL_TOPIC, key=str(org_id))
+    bump_eval_count(org_id)
+
+    return AgenticEvalResponse(
+        ok=True, trace_id=payload.trace_id, status="queued", events=len(events),
+    )
+
+
+# ── GET /evaluate/agentic-summary ─────────────────────────────────────────────
+
+class AgenticLayerStat(BaseModel):
+    layer: str
+    score: Optional[float] = None
+    count: int
+
+
+class AgenticSummaryResponse(BaseModel):
+    window_hours:  int
+    runs:          int
+    pass_rate:     Optional[float] = None
+    avg_run_score: Optional[float] = None
+    layers:        List[AgenticLayerStat]
+
+
+@evaluate_router.get("/evaluate/agentic-summary", response_model=AgenticSummaryResponse)
+async def agentic_summary(
+    window_hours: int = 24,
+    session: dict = Depends(get_current_session),
+) -> AgenticSummaryResponse:
+    """Aggregate agentic-eval health (run pass-rate, avg run score, per-layer
+    averages) for the Overview tile. Windowed by ``window_hours`` (1..720)."""
+    org_id = uuid.UUID(session["org_id"])
+    window_hours = max(1, min(int(window_hours), 720))
+    data = await clickhouse_client.fetch_agentic_summary(org_id, window_hours=window_hours)
+    return AgenticSummaryResponse(window_hours=window_hours, **data)
 
 
 # ── POST /evaluate/playground ─────────────────────────────────────────────────

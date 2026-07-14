@@ -23,14 +23,45 @@ from db_queues.postgresql.auth import get_org_eval_bonus, get_org_tier
 UNLIMITED = -1
 
 # (trace_quota, eval_quota) per calendar month; -1 means unlimited.
+#
+# Observability (trace ingestion) is free and UNLIMITED on every tier,
+# including Free — collecting traces is the whole point, and it's cheap
+# relative to the compute-heavy pillars. We monetize evals / security, not
+# trace volume. What differs by tier is *retention*, not the ingest cap
+# (see TIER_RETENTION_DAYS): Free keeps a rolling window, paid keeps forever.
 TIER_QUOTAS: dict[str, tuple[int, int]] = {
-    "Free":       (50_000,      1_000),
+    "Free":       (UNLIMITED,   1_000),
     "Team":       (UNLIMITED,  10_000),
     "Growth":     (UNLIMITED, 100_000),
     "Enterprise": (UNLIMITED, UNLIMITED),
 }
 
 DEFAULT_TIER = "Free"
+
+# Raw-trace retention per tier, in days. Free orgs keep a rolling 14-day
+# window; paid tiers never expire — the sentinel below is ~100 years, which
+# ClickHouse's per-row TTL treats as "keep forever". The value is stamped onto
+# each trace row at ingest so the TTL can roll off Free traces without ever
+# touching paid data. Stays within UInt16 (max 65535) for the CH column.
+FREE_RETENTION_DAYS = 14
+UNLIMITED_RETENTION_DAYS = 36_500  # ~100 years ≈ never
+
+TIER_RETENTION_DAYS: dict[str, int] = {
+    "Free":       FREE_RETENTION_DAYS,
+    "Team":       UNLIMITED_RETENTION_DAYS,
+    "Growth":     UNLIMITED_RETENTION_DAYS,
+    "Enterprise": UNLIMITED_RETENTION_DAYS,
+}
+
+
+def retention_days_for_tier(tier: str) -> int:
+    """Days to retain raw traces for an org on ``tier``.
+
+    An unknown tier falls back to the Free window — failing toward *less*
+    retention for an unrecognized (hence non-paying) tier, never toward
+    silently keeping data forever.
+    """
+    return TIER_RETENTION_DAYS.get(tier, FREE_RETENTION_DAYS)
 
 # Refresh ClickHouse counts at most every 60 seconds per org. This is a soft
 # cap — over-shooting by a minute's worth of traffic is acceptable, and the
@@ -120,6 +151,7 @@ class QuotaStatus:
     trace_quota: int
     eval_count: int
     eval_quota: int
+    retention_days: int = FREE_RETENTION_DAYS
 
     @property
     def trace_over(self) -> bool:
@@ -167,6 +199,7 @@ async def get_quota_status(
         trace_quota=trace_quota,
         eval_count=eval_count,
         eval_quota=eval_quota,
+        retention_days=retention_days_for_tier(tier),
     )
 
 

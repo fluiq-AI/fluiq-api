@@ -22,6 +22,28 @@ _TRACE_ORDER_MAP: dict[str, str] = {
     "cost_asc":     "c.total_cost ASC NULLS LAST",
 }
 
+# Substrings that mark a model as already small/cheap → never suggest a downgrade.
+_CHEAP_MARKERS = ("mini", "haiku", "flash", "nano", "lite", "small", "8b", "3b", "1b", "-lite")
+
+
+def _suggest_downgrade(model: str) -> Optional[tuple[str, float]]:
+    """Map a premium model to a cheaper sibling + an estimated savings fraction
+    on the candidate (small-output) spend. Returns None when the model is already
+    a small model or has no obvious cheaper equivalent. Heuristic, deliberately
+    conservative; the UI frames it as a hint, not a guarantee."""
+    m = (model or "").lower()
+    if not m or any(x in m for x in _CHEAP_MARKERS):
+        return None
+    if "sonnet" in m or "opus" in m:
+        return ("claude-haiku-4-5", 0.85)
+    if "gemini" in m and "pro" in m:
+        return ("gemini-2.5-flash", 0.88)
+    if m.startswith(("o1", "o3")) or "-o1" in m or "-o3" in m:
+        return ("o4-mini", 0.75)
+    if "gpt-4o" in m or "gpt-4.1" in m or "gpt-4-turbo" in m or m.startswith("gpt-4"):
+        return ("gpt-4o-mini", 0.90)
+    return None
+
 
 class ClickHouseQueryMixin:
     """All read/write query methods. Requires self._client (AsyncClient) and self.start()."""
@@ -69,42 +91,28 @@ class ClickHouseQueryMixin:
             where += " AND t.root_trace_id = {root_trace_id:UUID}"
             params["root_trace_id"] = str(root_trace_id)
         if roots_only:
-            where += (
-                " AND (t.trace_id = t.root_trace_id"
-                f" OR t.root_trace_id NOT IN ("
-                f"   SELECT trace_id FROM {target}"
-                "    WHERE organization_id = {org_id:UUID}"
-                " ))"
-            )
+            # Denormalized root flag stamped at ingest — replaces the old
+            # whole-org ``root_trace_id NOT IN (SELECT trace_id …)`` scan. is_root
+            # already encodes "own root OR orphan (phantom parent)". The
+            # ``OR trace_id = root_trace_id`` is a cheap belt-and-suspenders: an
+            # own-root span is a root by definition, so it must show even if a
+            # self-referential parent_id stamped is_root=0 at ingest.
+            where += " AND (t.is_root = 1 OR t.trace_id = t.root_trace_id)"
         if agent_key is not None:
-            # Match the agent-root definition used by fetch_agent_summary: a
-            # span is a root when it is its own root OR its root_trace_id points
-            # at a never-persisted (orphan) parent. Using strict equality here
-            # would open an empty drawer for orphan-root agents that correctly
-            # appear in the Agents list.
-            where += (
-                " AND (t.trace_id = t.root_trace_id"
-                f" OR t.root_trace_id NOT IN ("
-                f"   SELECT trace_id FROM {target}"
-                "    WHERE organization_id = {org_id:UUID}"
-                " ))"
-            )
+            # Same agent-root definition as fetch_agent_summary, now via the
+            # denormalized flag (with the own-root fallback) instead of a
+            # per-load orphan-detection subquery.
+            where += " AND (t.is_root = 1 OR t.trace_id = t.root_trace_id)"
             params["agent_key"] = agent_key
-            if agent_kind == "function":
-                where += " AND ifNull(t.event.function.:String,'') = {agent_key:String}"
-            elif agent_kind == "chain":
-                where += " AND ifNull(t.event.name.:String,'') = {agent_key:String}"
-            elif agent_kind == "langgraph_node":
-                where += " AND ifNull(t.event.langgraph.langgraph_node.:String,'') = {agent_key:String}"
+            if agent_kind in ("function", "chain", "langgraph_node"):
+                # Match the denormalized column instead of re-extracting JSON;
+                # pin agent_kind too so distinct kinds can't collide on a key.
+                where += " AND t.agent_key = {agent_key:String} AND t.agent_kind = {agent_kind:String}"
+                params["agent_kind"] = agent_kind
             elif agent_kind == "llm":
                 where += " AND concat(c.provider, ':', c.model) = {agent_key:String}"
             else:
-                where += (
-                    " AND ("
-                    "ifNull(t.event.function.:String,'') = {agent_key:String}"
-                    " OR ifNull(t.event.name.:String,'') = {agent_key:String}"
-                    ")"
-                )
+                where += " AND t.agent_key = {agent_key:String}"
 
         # Status filter
         #
@@ -192,10 +200,15 @@ class ClickHouseQueryMixin:
             "s.tool_exfiltration_detected, s.tool_exfiltration_types, s.tool_exfiltration_sources, "
             "s.tool_policy_violation_detected, s.tool_policy_violations, "
             "s.cross_agent_injection_detected, "
+            "s.image_injection_detected, s.image_injection_sources, "
             "s.semantic_attack_score, "
             "s.pii_entities_prompt, s.pii_entities_response, "
             "s.prompt_redacted, s.response_redacted, s.scan_latency"
         )
+        # Org-wide joins: the eval subquery aggregates every eval row the org has
+        # ever produced. Only the slow path (post-join filter / cost sort) needs
+        # this shape, because it filters/sorts on the joined columns BEFORE the
+        # LIMIT and so can't yet know which trace_ids survive to the page.
         joins = (
             f"LEFT JOIN {costs_target} AS c "
             f"  ON t.organization_id = c.organization_id AND t.trace_id = c.trace_id "
@@ -212,6 +225,46 @@ class ClickHouseQueryMixin:
             f") AS e "
             f"  ON t.organization_id = e.organization_id AND t.trace_id = e.trace_id "
             f"LEFT JOIN {security_target} AS s "
+            f"  ON t.organization_id = s.organization_id AND t.trace_id = s.trace_id "
+        )
+
+        # Page-scoped joins (fast path): every right-side relation is pre-filtered
+        # to the <=LIMIT trace_ids already selected into the `page` CTE, so each
+        # join seeks those rows along the (organization_id, trace_id) sort key
+        # instead of scanning/hashing the whole org. Without this, the eval
+        # subquery re-aggregated the org's ENTIRE evaluations table on every load
+        # (and on each of the frontend's per-root prefetch calls) — the dominant
+        # cost for orgs with a large accumulated history. The `IN (SELECT ...
+        # FROM page)` references the CTE defined below, which is legal because
+        # CTEs are visible to subqueries throughout the statement. Semantics are
+        # identical to `joins`: the added predicate only narrows the right side by
+        # the same keys the ON clause already requires.
+        page_scoped_joins = (
+            f"LEFT JOIN ("
+            f"   SELECT organization_id, trace_id, total_cost, currency "
+            f"   FROM {costs_target} "
+            f"   WHERE organization_id = {{org_id:UUID}} "
+            f"     AND trace_id IN (SELECT trace_id FROM page)"
+            f") AS c "
+            f"  ON t.organization_id = c.organization_id AND t.trace_id = c.trace_id "
+            f"LEFT JOIN ("
+            f"   SELECT organization_id, trace_id, "
+            f"          groupArray(metric)            AS metrics, "
+            f"          groupArray(score)             AS scores, "
+            f"          groupArray(evaluator)         AS evaluators, "
+            f"          groupArray(judge_model)       AS judge_models, "
+            f"          groupArray(toString(details)) AS details_list "
+            f"   FROM {evals_target} "
+            f"   WHERE organization_id = {{org_id:UUID}} "
+            f"     AND trace_id IN (SELECT trace_id FROM page) "
+            f"   GROUP BY organization_id, trace_id"
+            f") AS e "
+            f"  ON t.organization_id = e.organization_id AND t.trace_id = e.trace_id "
+            f"LEFT JOIN ("
+            f"   SELECT * FROM {security_target} "
+            f"   WHERE organization_id = {{org_id:UUID}} "
+            f"     AND trace_id IN (SELECT trace_id FROM page)"
+            f") AS s "
             f"  ON t.organization_id = s.organization_id AND t.trace_id = s.trace_id "
         )
 
@@ -238,7 +291,7 @@ class ClickHouseQueryMixin:
                 f"  LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}"
                 f") "
                 f"SELECT {select_cols} "
-                f"FROM page AS t {joins} "
+                f"FROM page AS t {page_scoped_joins} "
                 f"ORDER BY {order_by}"
             )
         else:
@@ -515,44 +568,35 @@ WHERE organization_id = {{org_id:UUID}}
 WITH roots AS (
     SELECT
         trace_id, root_trace_id, ingested_at,
-        ifNull(event.function.:String,'')                                    AS fn,
-        ifNull(event.name.:String,'')                                        AS nm,
-        ifNull(event.integration.:String,'')                                 AS intg,
-        ifNull(event.langgraph.langgraph_node.:String,'') AS lg_node,
-        event.latency.:Float64                                      AS latency
+        agent_key,
+        agent_kind,
+        ifNull(event.integration.:String,'') AS intg,
+        event.latency.:Float64               AS latency
     FROM {target}
     WHERE organization_id = {{org_id:UUID}}
-      -- A span counts as an agent root when it is its own root, OR when its
-      -- root_trace_id points at a parent that was never persisted (orphan
-      -- root: out-of-order delivery, a parent that stayed `running`/errored,
-      -- or a synthetic chain id). This mirrors the /traces roots_only rule so
-      -- a named @trace span that shows in Traces also shows in Agents instead
-      -- of disappearing because its phantom parent fails the strict equality.
-      AND (
-            trace_id = root_trace_id
-         OR root_trace_id NOT IN (
-                SELECT trace_id FROM {target}
-                WHERE organization_id = {{org_id:UUID}}
-            )
-      )
-      AND (
-            ifNull(event.function.:String,'') != ''
-         OR ifNull(event.name.:String,'') != ''
-         OR ifNull(event.langgraph.langgraph_node.:String,'') != ''
-      )
+      -- Denormalized at ingest: is_root already encodes "own root OR orphan
+      -- (phantom parent)", and agent_key is the function/name/langgraph_node.
+      -- Replaces the old whole-org NOT IN scan + per-row JSON extraction. The
+      -- own-root fallback guards against a self-referential parent_id (e.g.
+      -- CrewAI's crew span) stamping is_root=0.
+      AND (is_root = 1 OR trace_id = root_trace_id)
+      AND agent_key != ''
 ),
 costs AS (
+    -- Precomputed per-run cost rollup (AggregatingMergeTree), read with the
+    -- -Merge combinators. Replaces a full GROUP BY scan of {costs_target} on
+    -- every Agents load; identical semantics (sum of the run's child costs).
     SELECT
         root_trace_id,
-        sum(total_cost)                                          AS run_cost,
-        sum(input_tokens + cached_input_tokens + output_tokens) AS run_tokens
-    FROM {costs_target}
+        sumMerge(run_cost)   AS run_cost,
+        sumMerge(run_tokens) AS run_tokens
+    FROM fluiq.trace_cost_rollup
     WHERE organization_id = {{org_id:UUID}}
     GROUP BY root_trace_id
 )
 SELECT
-    multiIf(fn != '', fn, nm != '', nm, lg_node)                       AS agent_key,
-    multiIf(fn != '', 'function', nm != '', 'chain', 'langgraph_node') AS agent_kind,
+    agent_key                                                           AS agent_key,
+    agent_kind                                                          AS agent_kind,
     intg                                                                AS integration,
     count()                                                             AS runs,
     sum(ifNull(c.run_cost, 0))                                         AS total_cost,
@@ -585,6 +629,152 @@ OFFSET {{offset:UInt32}}
                 "last_run":        last_run,
             })
         return rows
+
+    # ── Per-run rollups (root_trace_id) ────────────────────────────────────────
+
+    async def get_root_rollups(
+        self,
+        organization_id: uuid.UUID,
+        root_ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Precomputed cost / quality / security aggregates per agent run.
+
+        Reads the AggregatingMergeTree rollup tables (fed by materialized views
+        off trace_costs / evaluations / security_scans) with the ``*Merge``
+        combinators, so a root's totals come back without re-summing its
+        children. Returns ``{root_trace_id: {...}}``; a root with no rollup row
+        yet is simply absent, and the caller treats missing as zero / unscored.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        ids = [str(r) for r in root_ids if r]
+        if not ids:
+            return {}
+        params = {"org_id": str(organization_id), "root_ids": ids}
+        out: dict[str, dict[str, Any]] = {}
+
+        def _slot(rid: str) -> dict[str, Any]:
+            return out.setdefault(rid, {
+                "run_cost": 0.0,
+                "run_tokens": 0,
+                "span_count": 0,
+                "quality_min": None,
+                "quality_avg": None,
+                "quality_count": 0,
+                "security_risk_max": 0.0,
+                "security_should_block": False,
+                "security_detections": 0,
+            })
+
+        cost = await self._client.query(  # type: ignore[attr-defined]
+            "SELECT root_trace_id, sumMerge(run_cost), sumMerge(run_tokens) "
+            "FROM fluiq.trace_cost_rollup "
+            "WHERE organization_id = {org_id:UUID} "
+            "  AND root_trace_id IN {root_ids:Array(UUID)} "
+            "GROUP BY root_trace_id",
+            parameters=params,
+        )
+        for rid, run_cost, run_tokens in cost.result_rows:
+            slot = _slot(str(rid))
+            slot["run_cost"] = float(run_cost) if run_cost is not None else 0.0
+            slot["run_tokens"] = int(run_tokens or 0)
+
+        cnt = await self._client.query(  # type: ignore[attr-defined]
+            "SELECT root_trace_id, countMerge(span_count) "
+            "FROM fluiq.trace_count_rollup "
+            "WHERE organization_id = {org_id:UUID} "
+            "  AND root_trace_id IN {root_ids:Array(UUID)} "
+            "GROUP BY root_trace_id",
+            parameters=params,
+        )
+        for rid, span_count in cnt.result_rows:
+            _slot(str(rid))["span_count"] = int(span_count or 0)
+
+        qual = await self._client.query(  # type: ignore[attr-defined]
+            "SELECT root_trace_id, minMerge(quality_min), avgMerge(quality_avg), "
+            "       countMerge(quality_count) "
+            "FROM fluiq.trace_quality_rollup "
+            "WHERE organization_id = {org_id:UUID} "
+            "  AND root_trace_id IN {root_ids:Array(UUID)} "
+            "GROUP BY root_trace_id",
+            parameters=params,
+        )
+        for rid, qmin, qavg, qcount in qual.result_rows:
+            slot = _slot(str(rid))
+            slot["quality_min"] = float(qmin) if qmin is not None else None
+            slot["quality_avg"] = float(qavg) if qavg is not None else None
+            slot["quality_count"] = int(qcount or 0)
+
+        sec = await self._client.query(  # type: ignore[attr-defined]
+            "SELECT root_trace_id, maxMerge(risk_score_max), maxMerge(should_block_max), "
+            "       sumMerge(detections) "
+            "FROM fluiq.trace_security_rollup "
+            "WHERE organization_id = {org_id:UUID} "
+            "  AND root_trace_id IN {root_ids:Array(UUID)} "
+            "GROUP BY root_trace_id",
+            parameters=params,
+        )
+        for rid, risk, block, dets in sec.result_rows:
+            slot = _slot(str(rid))
+            slot["security_risk_max"] = float(risk) if risk is not None else 0.0
+            slot["security_should_block"] = bool(block)
+            slot["security_detections"] = int(dets or 0)
+
+        return out
+
+    # ── Dataset trajectory snapshots (no-TTL) ──────────────────────────────────
+
+    async def insert_dataset_trajectory(
+        self,
+        organization_id: uuid.UUID,
+        root_trace_id: uuid.UUID,
+        events: list[dict[str, Any]],
+    ) -> None:
+        """Pin a run's spans into the no-TTL trajectory store (one row per span).
+
+        Idempotent-ish: ReplacingMergeTree keyed on (org, root, trace_id) with a
+        captured_at version, so re-pinning the same run replaces its rows.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        rows = []
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            tid = ev.get("trace_id") or str(uuid.uuid4())
+            rows.append([str(organization_id), str(root_trace_id), str(tid), ev])
+        if not rows:
+            return
+        await self._client.insert(  # type: ignore[attr-defined]
+            "fluiq.dataset_trajectory_spans",
+            rows,
+            column_names=["org_id", "root_trace_id", "trace_id", "event"],
+        )
+
+    async def get_dataset_trajectory(
+        self,
+        organization_id: uuid.UUID,
+        root_trace_id: uuid.UUID,
+    ) -> list[dict[str, Any]]:
+        """Return the pinned span events for a run, or [] if not snapshotted."""
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        result = await self._client.query(  # type: ignore[attr-defined]
+            "SELECT toString(event) "
+            "FROM fluiq.dataset_trajectory_spans FINAL "
+            "WHERE org_id = {org:UUID} AND root_trace_id = {root:UUID} "
+            "ORDER BY captured_at, trace_id",
+            parameters={"org": str(organization_id), "root": str(root_trace_id)},
+        )
+        events: list[dict[str, Any]] = []
+        for row in result.result_rows:
+            try:
+                ev = json.loads(row[0])
+                if isinstance(ev, dict):
+                    events.append(ev)
+            except Exception:
+                continue
+        return events
 
     # ── Optimization ──────────────────────────────────────────────────────────
 
@@ -649,6 +839,235 @@ FROM (
             "window_hours": window_hours,
         }
 
+    async def fetch_optimization_insights(
+        self,
+        organization_id: uuid.UUID,
+        window_hours: int = 168,
+        top_n: int = 8,
+        table: Optional[str] = None,
+        costs_table: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Developer-facing optimization insights over a time window.
+
+        Returns, in one call: the most-repeated prompts (cache candidates) with
+        projected savings, a cacheable-spend headline, the most expensive models
+        and agents, the slowest models (p95), and error hotspots. All read-only
+        over ``traces`` + ``trace_costs``; safe to cache.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target       = table       or self.default_table  # type: ignore[attr-defined]
+        costs_target = costs_table or config.CLICKHOUSE_TRACE_COSTS_TABLE
+        p = {"org_id": str(organization_id), "window": int(window_hours), "top_n": int(top_n)}
+
+        def f(v: Any) -> float:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        # Per-LLM-call rows (model, prompt hash, preview, latency, cost) reused by
+        # the repeated-prompt and cacheable-spend queries.
+        # Prompt text is shape-agnostic: OpenAI/Anthropic use `messages`, Gemini
+        # uses `contents`, LangChain/others use `input`/`prompts` — concat so the
+        # same logical prompt hashes together regardless of provider shape.
+        ptext = ("concat(toString(t.event.messages), toString(t.event.contents), "
+                 "toString(t.event.input), toString(t.event.prompts))")
+        inner = f"""
+            SELECT
+                cityHash64(ifNull(t.event.model.:String,''), {ptext}) AS phash,
+                ifNull(t.event.model.:String,'')       AS model,
+                substring({ptext}, 1, 240)             AS preview,
+                t.event.latency.:Float64               AS latency,
+                ifNull(c.cost, 0)                      AS cost
+            FROM {target} AS t
+            LEFT JOIN (
+                SELECT trace_id, sum(total_cost) AS cost FROM {costs_target}
+                WHERE organization_id = {{org_id:UUID}}
+                  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+                GROUP BY trace_id
+            ) AS c ON t.trace_id = c.trace_id
+            WHERE t.organization_id = {{org_id:UUID}}
+              AND ifNull(t.event.type.:String,'') = 'llm'
+              AND t.ingested_at >= now() - toIntervalHour({{window:UInt32}})
+        """
+
+        # 1. Top repeated prompts (cache candidates).
+        top_prompts_res = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT model, any(preview) AS preview, count() AS calls,
+       avgIf(latency, latency > 0) AS avg_latency, sum(cost) AS total_cost
+FROM ({inner})
+GROUP BY phash, model
+HAVING calls > 1
+ORDER BY calls DESC, total_cost DESC
+LIMIT {{top_n:UInt32}}
+""", parameters=p)
+
+        top_prompts = []
+        for model, preview, calls, avg_latency, total_cost in top_prompts_res.result_rows:
+            calls = int(calls or 0)
+            tc = f(total_cost)
+            top_prompts.append({
+                "model": model or "",
+                "preview": (preview or "").strip(),
+                "calls": calls,
+                "avg_latency": f(avg_latency),
+                "total_cost": tc,
+                # Serving all-but-one call from cache recovers (calls-1)/calls of the spend.
+                "projected_savings": round(tc * (calls - 1) / calls, 6) if calls > 1 else 0.0,
+            })
+
+        # 2. Cacheable-spend headline.
+        cacheable_res = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT
+    sum(group_cost)                                          AS total_spend,
+    sumIf(group_cost * (calls - 1) / calls, calls > 1)       AS recoverable_spend,
+    sum(calls)                                               AS total_calls,
+    sumIf(calls - 1, calls > 1)                              AS recoverable_calls
+FROM (
+    SELECT phash, count() AS calls, sum(cost) AS group_cost
+    FROM ({inner})
+    GROUP BY phash
+)
+""", parameters=p)
+        cacheable = {"total_spend": 0.0, "recoverable_spend": 0.0, "total_calls": 0, "recoverable_calls": 0, "pct": 0.0}
+        if cacheable_res.result_rows:
+            ts, rs, tcalls, rcalls = cacheable_res.result_rows[0]
+            total_spend = f(ts)
+            cacheable = {
+                "total_spend": total_spend,
+                "recoverable_spend": f(rs),
+                "total_calls": int(tcalls or 0),
+                "recoverable_calls": int(rcalls or 0),
+                "pct": round(f(rs) / total_spend, 4) if total_spend else 0.0,
+            }
+
+        # 3. Most expensive models.
+        models_res = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT model, count() AS calls, sum(total_cost) AS cost,
+       toUInt64(sum(input_tokens + cached_input_tokens + output_tokens)) AS tokens
+FROM {costs_target}
+WHERE organization_id = {{org_id:UUID}}
+  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+GROUP BY model
+ORDER BY cost DESC
+LIMIT {{top_n:UInt32}}
+""", parameters=p)
+        top_models = [{
+            "model": m or "", "calls": int(calls or 0), "total_cost": f(cost),
+            "avg_cost": round(f(cost) / int(calls), 6) if calls else 0.0, "tokens": int(tokens or 0),
+        } for m, calls, cost, tokens in models_res.result_rows]
+
+        # 4. Most expensive agents (per-run cost grouped by denormalized agent_key).
+        agents_res = await self._client.query(f"""  # type: ignore[attr-defined]
+WITH roots AS (
+    SELECT root_trace_id, agent_key, agent_kind, ifNull(event.integration.:String,'') AS integ
+    FROM {target}
+    WHERE organization_id = {{org_id:UUID}}
+      AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+      AND (is_root = 1 OR trace_id = root_trace_id) AND agent_key != ''
+),
+run_costs AS (
+    SELECT root_trace_id, sum(total_cost) AS c FROM {costs_target}
+    WHERE organization_id = {{org_id:UUID}}
+      AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+    GROUP BY root_trace_id
+)
+SELECT r.agent_key, any(r.agent_kind), any(r.integ), count() AS runs, sum(ifNull(rc.c, 0)) AS cost
+FROM roots AS r LEFT JOIN run_costs AS rc ON r.root_trace_id = rc.root_trace_id
+GROUP BY r.agent_key
+ORDER BY cost DESC
+LIMIT {{top_n:UInt32}}
+""", parameters=p)
+        top_agents = [{
+            "agent_key": k or "", "agent_kind": kind or "", "integration": integ or "",
+            "runs": int(runs or 0), "total_cost": f(cost),
+            "avg_cost": round(f(cost) / int(runs), 6) if runs else 0.0,
+        } for k, kind, integ, runs, cost in agents_res.result_rows]
+
+        # 5. Slowest models (p50 / p95).
+        slow_res = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT ifNull(event.model.:String,'') AS model, count() AS calls,
+       quantile(0.5)(event.latency.:Float64)  AS p50,
+       quantile(0.95)(event.latency.:Float64) AS p95
+FROM {target}
+WHERE organization_id = {{org_id:UUID}}
+  AND ifNull(event.type.:String,'') = 'llm'
+  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+  AND event.latency.:Float64 > 0
+GROUP BY model
+HAVING calls >= 5
+ORDER BY p95 DESC
+LIMIT {{top_n:UInt32}}
+""", parameters=p)
+        slowest = [{
+            "model": m or "", "calls": int(calls or 0), "p50": f(p50), "p95": f(p95),
+        } for m, calls, p50, p95 in slow_res.result_rows]
+
+        # 6. Error hotspots (by function/agent).
+        errors_res = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT
+    coalesce(nullIf(ifNull(event.function.:String,''), ''), agent_key, ifNull(event.integration.:String,'')) AS name,
+    count() AS calls,
+    countIf(ifNull(event.status.:String,'') = 'error' OR event.success.:Bool = false) AS errors
+FROM {target}
+WHERE organization_id = {{org_id:UUID}}
+  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+GROUP BY name
+HAVING calls >= 5 AND errors > 0
+ORDER BY errors / calls DESC, errors DESC
+LIMIT {{top_n:UInt32}}
+""", parameters=p)
+        errors = [{
+            "name": name or "", "calls": int(calls or 0), "errors": int(errs or 0),
+            "error_rate": round(int(errs or 0) / int(calls), 4) if calls else 0.0,
+        } for name, calls, errs in errors_res.result_rows]
+
+        # 7. Model-downgrade hints — premium models used for small-output (simple)
+        # completions, where a cheaper sibling would likely suffice. Detection is
+        # in ClickHouse (small-output calls grouped by model); the premium→cheap
+        # mapping + savings estimate is applied in Python so it's easy to tune.
+        downgrade_res = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT model, count() AS calls, sum(total_cost) AS cost, avg(output_tokens) AS avg_out
+FROM {costs_target}
+WHERE organization_id = {{org_id:UUID}}
+  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+  AND output_tokens > 0 AND output_tokens <= 256
+GROUP BY model
+HAVING calls >= 3
+ORDER BY cost DESC
+LIMIT 30
+""", parameters=p)
+
+        downgrades = []
+        for model, calls, cost, avg_out in downgrade_res.result_rows:
+            suggestion = _suggest_downgrade(model or "")
+            if suggestion is None:
+                continue
+            cheaper, factor = suggestion
+            spend = f(cost)
+            downgrades.append({
+                "model": model or "",
+                "suggested": cheaper,
+                "calls": int(calls or 0),
+                "candidate_spend": spend,
+                "est_savings": round(spend * factor, 6),
+                "avg_output_tokens": round(f(avg_out), 1),
+            })
+        downgrades.sort(key=lambda d: d["est_savings"], reverse=True)
+        downgrades = downgrades[:top_n]
+
+        return {
+            "window_hours": window_hours,
+            "top_prompts": top_prompts,
+            "cacheable": cacheable,
+            "top_models": top_models,
+            "top_agents": top_agents,
+            "slowest": slowest,
+            "errors": errors,
+            "downgrades": downgrades,
+        }
+
     # ── Evaluations ───────────────────────────────────────────────────────────
 
     async def fetch_recent_evals(
@@ -685,6 +1104,164 @@ LIMIT {{limit:UInt32}}
             }
             for trace_id, metric, score, evaluator, judge_model in result.result_rows
         ]
+
+    async def fetch_agentic_summary(
+        self,
+        organization_id: uuid.UUID,
+        window_hours: int = 24,
+        evals_table: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Aggregate agentic-eval health over a time window.
+
+        Agentic evals write one row per layer per run (``evaluator =
+        'fluiq.agent_eval'``). The ``deterministic``-layer row is the run
+        representative — it carries the run-level ``run_score`` / ``run_passed``
+        — so run counts and pass-rate key off that layer, while per-layer average
+        scores are computed across all rows of each layer.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        evals_target = evals_table or config.CLICKHOUSE_EVALUATIONS_TABLE
+        params = {"org_id": str(organization_id), "window": int(window_hours)}
+        result = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT
+    countIf(layer = 'deterministic')                       AS runs,
+    avgIf(run_passed, layer = 'deterministic')             AS pass_rate,
+    avgIf(run_score,  layer = 'deterministic')             AS avg_run_score,
+    avgIf(score, layer = 'deterministic')                  AS det_score,
+    avgIf(score, layer = 'tool_selection')                 AS tsq_score,
+    countIf(layer = 'tool_selection')                      AS tsq_count,
+    avgIf(score, layer = 'trajectory')                     AS traj_score,
+    countIf(layer = 'trajectory')                          AS traj_count,
+    avgIf(score, layer = 'coordination')                   AS coord_score,
+    countIf(layer = 'coordination')                        AS coord_count
+FROM {evals_target}
+WHERE organization_id = {{org_id:UUID}}
+  AND evaluator = 'fluiq.agent_eval'
+  AND ingested_at >= now() - toIntervalHour({{window:UInt32}})
+""", parameters=params)
+
+        def _f(v: Any) -> Optional[float]:
+            return float(v) if v is not None else None
+
+        if not result.result_rows:
+            return {"runs": 0, "pass_rate": None, "avg_run_score": None, "layers": []}
+
+        (runs, pass_rate, avg_run_score,
+         det_score, tsq_score, tsq_count, traj_score, traj_count,
+         coord_score, coord_count) = result.result_rows[0]
+
+        return {
+            "runs":          int(runs or 0),
+            "pass_rate":     _f(pass_rate),
+            "avg_run_score": _f(avg_run_score),
+            "layers": [
+                {"layer": "deterministic",  "score": _f(det_score),   "count": int(runs or 0)},
+                {"layer": "tool_selection", "score": _f(tsq_score),   "count": int(tsq_count or 0)},
+                {"layer": "trajectory",     "score": _f(traj_score),  "count": int(traj_count or 0)},
+                {"layer": "coordination",   "score": _f(coord_score), "count": int(coord_count or 0)},
+            ],
+        }
+
+    async def fetch_dataset_eval_results(
+        self,
+        organization_id: uuid.UUID,
+        trace_ids: list[str],
+        evals_table: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Eval rows (standard metrics + agentic layers) for a set of trace ids.
+
+        The per-item results a dataset *agentic-eval* run aggregates into its
+        report — one row per (trace_id, metric/layer).
+        """
+        if not trace_ids:
+            return []
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        evals_target = evals_table or config.CLICKHOUSE_EVALUATIONS_TABLE
+        params = {"org_id": str(organization_id), "tids": [str(t) for t in trace_ids]}
+        result = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT toString(trace_id) AS trace_id, evaluator, metric, score, layer, run_score, run_passed
+FROM {evals_target}
+WHERE organization_id = {{org_id:UUID}}
+  AND trace_id IN {{tids:Array(UUID)}}
+""", parameters=params)
+        return [
+            {
+                "trace_id":   tid,
+                "evaluator":  ev or "",
+                "metric":     metric or "",
+                "score":      float(score) if score is not None else None,
+                "layer":      layer or "",
+                "run_score":  float(run_score) if run_score is not None else None,
+                "run_passed": bool(run_passed),
+            }
+            for tid, ev, metric, score, layer, run_score, run_passed in result.result_rows
+        ]
+
+    async def fetch_dataset_security_results(
+        self,
+        organization_id: uuid.UUID,
+        trace_ids: list[str],
+        table: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Security-scan rows for a set of trace ids — the per-item results a
+        dataset *security* run aggregates into its report."""
+        if not trace_ids:
+            return []
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        sec_target = table or config.CLICKHOUSE_SECURITY_TABLE
+        params = {"org_id": str(organization_id), "tids": [str(t) for t in trace_ids]}
+        result = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT toString(trace_id) AS trace_id, security_risk_level, security_risk_score, should_block,
+       injection_detected, jailbreak_detected, skeleton_key_detected, secrets_detected,
+       indirect_injection_detected, rag_poisoning_detected, tool_exfiltration_detected,
+       tool_policy_violation_detected, cross_agent_injection_detected, image_injection_detected
+FROM {sec_target}
+WHERE organization_id = {{org_id:UUID}}
+  AND trace_id IN {{tids:Array(UUID)}}
+""", parameters=params)
+        cols = [
+            "trace_id", "risk_level", "risk_score", "should_block",
+            "injection", "jailbreak", "skeleton_key", "secrets",
+            "indirect_injection", "rag_poisoning", "tool_exfiltration",
+            "tool_policy_violation", "cross_agent_injection", "image_injection",
+        ]
+        out: list[dict[str, Any]] = []
+        for row in result.result_rows:
+            d = dict(zip(cols, row))
+            d["risk_score"] = float(d["risk_score"]) if d["risk_score"] is not None else None
+            for k in cols[3:]:
+                d[k] = int(d[k] or 0)
+            out.append(d)
+        return out
+
+    async def fetch_costs_for_traces(
+        self,
+        organization_id: uuid.UUID,
+        trace_ids: list[str],
+        costs_table: Optional[str] = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Run-level cost per trace id (summed over the root's subtree), keyed by
+        root_trace_id. Used to enrich dataset examples with their run cost."""
+        if not trace_ids:
+            return {}
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        costs_target = costs_table or config.CLICKHOUSE_TRACE_COSTS_TABLE
+        params = {"org_id": str(organization_id), "tids": [str(t) for t in trace_ids]}
+        result = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT toString(root_trace_id) AS tid, sum(total_cost) AS cost, any(currency) AS cur
+FROM {costs_target}
+WHERE organization_id = {{org_id:UUID}}
+  AND root_trace_id IN {{tids:Array(UUID)}}
+GROUP BY root_trace_id
+""", parameters=params)
+        return {
+            tid: {"cost": float(cost) if cost is not None else None, "currency": cur or "USD"}
+            for tid, cost, cur in result.result_rows
+        }
 
     async def insert_evaluations(
         self,

@@ -87,6 +87,13 @@ ALTER TABLE users DROP CONSTRAINT users_user_type_check;
 
 ALTER TABLE users ADD CONSTRAINT users_user_type_check CHECK (user_type IN ('Free', 'Starter', 'Team', 'Growth', 'Enterprise', 'Admin'));
 
+-- Self-serve 5-day trial of a paid plan (Team / Growth), no card required.
+-- ``trial_ends_at`` is the expiry instant while a trial is active (NULL
+-- otherwise); ``get_org_tier`` lazily downgrades to Free once it passes.
+-- ``trial_used`` is a one-shot latch so a single account can't loop trials.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used    BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE TABLE IF NOT EXISTS prompts (
     prompt_id   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     org_id      UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
@@ -169,6 +176,51 @@ CREATE TABLE IF NOT EXISTS dataset_examples (
 );
 CREATE INDEX IF NOT EXISTS idx_dataset_examples_dataset_id ON dataset_examples(dataset_id);
 CREATE INDEX IF NOT EXISTS idx_dataset_examples_org_id     ON dataset_examples(org_id);
+
+-- Batch jobs that evaluate (or security-scan) an entire dataset. One row per
+-- launch; per-example progress/results live in dataset_run_items. Results
+-- themselves are produced by the eval/security workers into ClickHouse (keyed
+-- by trace_id) and aggregated back into `summary` on read.
+CREATE TABLE IF NOT EXISTS dataset_runs (
+    run_id      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    dataset_id  UUID        NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
+    org_id      UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    kind        TEXT        NOT NULL,                       -- 'agentic' | 'security'
+    depth       TEXT,                                        -- agentic depth, when kind='agentic'
+    status      TEXT        NOT NULL DEFAULT 'running',      -- 'running' | 'complete' | 'failed'
+    total       INT         NOT NULL DEFAULT 0,
+    summary     JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_dataset_runs_dataset ON dataset_runs(dataset_id, created_at DESC);
+
+-- One row per example enrolled in a run. `trace_id` is the id the job was
+-- published under (the example's source trace, or a synthesized id for
+-- text-only examples); the report joins ClickHouse results on it. `source`
+-- records whether we re-ran the real trace or a synthetic text event.
+CREATE TABLE IF NOT EXISTS dataset_run_items (
+    item_id     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id      UUID        NOT NULL REFERENCES dataset_runs(run_id) ON DELETE CASCADE,
+    example_id  UUID        NOT NULL,
+    org_id      UUID        NOT NULL,
+    trace_id    TEXT        NOT NULL,
+    source      TEXT        NOT NULL DEFAULT 'trace',        -- 'trace' | 'text'
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dataset_run_items_run ON dataset_run_items(run_id);
+
+-- Agents linked to a dataset so their future runs are auto-appended as examples
+-- (the import of past runs happens immediately at link time, client-side).
+CREATE TABLE IF NOT EXISTS dataset_agent_links (
+    dataset_id  UUID        NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
+    org_id      UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    agent_key   TEXT        NOT NULL,
+    agent_kind  TEXT        NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (dataset_id, agent_key, agent_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_dataset_agent_links_agent ON dataset_agent_links(org_id, agent_key, agent_kind);
 
 -- Feedback collected when a user deletes their account.
 -- user_id is NOT a FK so the record survives after the user row is removed.
