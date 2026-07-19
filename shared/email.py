@@ -92,6 +92,37 @@ class EmailService:
         """
         await self.send_email(to=to, subject=subject, html=html, text=text)
 
+    async def send_org_invitation_email(
+        self,
+        to: str,
+        org_name: str,
+        inviter_name: str,
+        role: str,
+        accept_url: str,
+        expires_in_hours: int,
+    ) -> None:
+        subject = f"You've been invited to join {org_name} on Fluiq"
+        days = max(1, round(expires_in_hours / 24))
+        text = (
+            f"{inviter_name} invited you to join the “{org_name}” organization on "
+            f"Fluiq as a {role}.\n\n"
+            f"Accept the invitation: {accept_url}\n\n"
+            f"This invitation expires in {days} day(s). If you weren't expecting "
+            f"this, you can safely ignore this email.\n"
+        )
+        html = f"""
+        <div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#0f172a">
+          <h2 style="margin:0 0 16px">Join {org_name} on Fluiq</h2>
+          <p><strong>{inviter_name}</strong> invited you to join the
+             <strong>{org_name}</strong> organization as a <strong>{role}</strong>.</p>
+          <p style="text-align:center;margin:28px 0">
+            <a href="{accept_url}" style="background:#0f172a;color:#ffffff;padding:12px 20px;border-radius:8px;text-decoration:none;display:inline-block">Accept invitation</a>
+          </p>
+          <p style="color:#64748b;font-size:13px">This invitation expires in {days} day(s). If you weren't expecting this, you can safely ignore this email.</p>
+        </div>
+        """
+        await self.send_email(to=to, subject=subject, html=html, text=text)
+
 
 def _html_to_text(html: str) -> str:
     return re.sub(r"<[^>]+>", "", html).strip()

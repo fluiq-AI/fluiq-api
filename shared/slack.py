@@ -11,6 +11,8 @@ from typing import Any, Optional
 
 import httpx
 
+from shared.net import is_safe_public_url
+
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(5.0, connect=3.0)
@@ -22,7 +24,7 @@ _client: Optional[httpx.AsyncClient] = None
 def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(timeout=_TIMEOUT)
+        _client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False)
     return _client
 
 
@@ -39,6 +41,11 @@ _RISK_EMOJI = {"low": "🟡", "medium": "🟠", "high": "🔴", "clean": "🟢"}
 async def post_webhook(webhook_url: str, blocks: list[dict], text: str) -> bool:
     """POST a Block Kit message. Returns True on a 2xx, False otherwise."""
     if not webhook_url:
+        return False
+    # SSRF guard: org-supplied webhook URL, POSTed server-side. Reject anything
+    # that isn't an https:// URL resolving to a public host.
+    if not await is_safe_public_url(webhook_url, require_https=True):
+        logger.warning("[ALERTS] Refusing to POST to non-public Slack webhook")
         return False
     try:
         resp = await _get_client().post(webhook_url, json={"text": text, "blocks": blocks})

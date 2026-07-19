@@ -22,6 +22,7 @@ from db_queues.postgresql.guardrails import (
     upsert_policy,
 )
 from routes.auth.helper import get_current_session
+from shared.net import is_safe_public_url
 
 guardrails_router = APIRouter()
 
@@ -101,6 +102,16 @@ async def save_policy(
             detail=f"Unknown pii_ignore entities: {bad_pii}. Valid: {PII_ENTITIES}",
         )
 
+    # SSRF guard: an alert_webhook is POSTed server-side on every block, so a URL
+    # resolving to a private/loopback/link-local (metadata) host would turn the
+    # API into an SSRF pivot. Reject at save time; re-checked again on each fire.
+    webhook = payload.alert_webhook or None
+    if webhook and not await is_safe_public_url(webhook, require_https=True):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="alert_webhook must be an https:// URL resolving to a public host.",
+        )
+
     deny  = [p.strip() for p in payload.custom_deny_list  if p.strip()]
     allow = [p.strip() for p in payload.custom_allow_list if p.strip()]
     tools = sorted({t.strip() for t in payload.allowed_tools if t.strip()})
@@ -115,7 +126,7 @@ async def save_policy(
         custom_allow_list = allow,
         pii_ignore        = sorted(set(payload.pii_ignore)),
         allowed_tools     = tools,
-        alert_webhook     = payload.alert_webhook or None,
+        alert_webhook     = webhook,
         alert_on          = payload.alert_on,
         scan_responses    = payload.scan_responses,
     )

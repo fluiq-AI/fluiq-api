@@ -112,6 +112,19 @@ JUDGE_PROMPT_DEFAULTS: list[dict] = [
         ),
     },
     {
+        "name": "completeness",
+        "description": "Completeness — does the answer fully address every part of the question.",
+        "required_vars": ["answer"],
+        "template": (
+            "Today's date $today. Evaluate whether the ANSWER fully addresses "
+            "every part of the QUESTION without omitting key information the "
+            "question asks for. Score 1.0 = comprehensive and complete, 0.0 = "
+            "no answer given or the main ask is unaddressed.\n"
+            "Return JSON: {\"score\": float, \"missing\": [str], \"reason\": str}.\n\n"
+            "${question_block}ANSWER: $answer"
+        ),
+    },
+    {
         "name": "context_precision",
         "description": "Context precision — judge whether a single retrieved context is useful for the question.",
         "required_vars": ["question", "context"],

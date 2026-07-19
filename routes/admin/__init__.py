@@ -22,6 +22,15 @@ from db_queues.postgresql.auth import (
     get_platform_stats,
     get_user_by_id,
 )
+from db_queues.postgresql.organizations import (
+    admin_add_member,
+    admin_list_user_organizations,
+    admin_set_org_plan,
+    list_members,
+    remove_member,
+    rename_organization,
+    set_member_role,
+)
 from db_queues.postgresql.eval_prompts import (
     create_judge_prompt,
     get_judge_prompt,
@@ -91,6 +100,8 @@ class OrgAdminView(BaseModel):
     owner_email: Optional[str]
     owner_name: Optional[str]
     owner_type: Optional[str]
+    plan: Optional[str] = None
+    member_count: int = 0
     api_key_usage: int
     api_key_limit: int
     created_at: datetime
@@ -270,6 +281,138 @@ async def list_organizations(
         page=page,
         limit=limit,
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin: organization membership + plan management (god-mode; any org)
+# ---------------------------------------------------------------------------
+
+class AdminMemberView(BaseModel):
+    user_id: uuid.UUID
+    name: str
+    email: str
+    role: str
+    created_at: datetime
+
+
+class AdminMembersResponse(BaseModel):
+    members: list[AdminMemberView]
+
+
+class AdminAddMemberRequest(BaseModel):
+    email: str
+    role: str = "member"
+
+
+class AdminSetRoleRequest(BaseModel):
+    role: str
+
+
+class AdminOrgUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    plan_tier: Optional[str] = None
+
+
+_ORG_ROLES = {"owner", "admin", "member"}
+_ORG_PLANS = {"Free", "Starter", "Team", "Growth", "Enterprise"}
+
+
+@admin_router.get(
+    "/organizations/{org_id}/members", response_model=AdminMembersResponse
+)
+async def admin_org_members(
+    org_id: uuid.UUID, _session: dict = Depends(require_admin)
+) -> AdminMembersResponse:
+    rows = await list_members(org_id)
+    return AdminMembersResponse(members=[AdminMemberView(**r) for r in rows])
+
+
+@admin_router.post("/organizations/{org_id}/members", response_model=AdminMembersResponse)
+async def admin_org_add_member(
+    org_id: uuid.UUID,
+    body: AdminAddMemberRequest,
+    _session: dict = Depends(require_admin),
+) -> AdminMembersResponse:
+    role = body.role if body.role in _ORG_ROLES else "member"
+    ok, err = await admin_add_member(org_id, body.email.strip(), role)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err)
+    rows = await list_members(org_id)
+    return AdminMembersResponse(members=[AdminMemberView(**r) for r in rows])
+
+
+@admin_router.patch("/organizations/{org_id}/members/{member_id}", response_model=UpdateUserTypeResponse)
+async def admin_org_set_member_role(
+    org_id: uuid.UUID,
+    member_id: uuid.UUID,
+    body: AdminSetRoleRequest,
+    _session: dict = Depends(require_admin),
+) -> UpdateUserTypeResponse:
+    if body.role not in _ORG_ROLES:
+        raise HTTPException(status_code=400, detail="Invalid role.")
+    ok = await set_member_role(org_id, member_id, body.role)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Member not found.")
+    return UpdateUserTypeResponse(ok=True)
+
+
+@admin_router.delete(
+    "/organizations/{org_id}/members/{member_id}", response_model=UpdateUserTypeResponse
+)
+async def admin_org_remove_member(
+    org_id: uuid.UUID,
+    member_id: uuid.UUID,
+    _session: dict = Depends(require_admin),
+) -> UpdateUserTypeResponse:
+    ok, err = await remove_member(org_id, member_id)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err)
+    return UpdateUserTypeResponse(ok=True)
+
+
+@admin_router.patch("/organizations/{org_id}", response_model=UpdateUserTypeResponse)
+async def admin_update_org(
+    org_id: uuid.UUID,
+    body: AdminOrgUpdateRequest,
+    _session: dict = Depends(require_admin),
+) -> UpdateUserTypeResponse:
+    if body.name is not None:
+        renamed = await rename_organization(org_id, body.name)
+        if renamed is None:
+            raise HTTPException(status_code=404, detail="Organization not found")
+    if body.plan_tier is not None:
+        if body.plan_tier not in _ORG_PLANS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"plan_tier must be one of: {', '.join(sorted(_ORG_PLANS))}",
+            )
+        ok = await admin_set_org_plan(org_id, body.plan_tier)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        invalidate_quota_cache(org_id)
+    return UpdateUserTypeResponse(ok=True)
+
+
+class AdminUserOrgsResponse(BaseModel):
+    organizations: list[dict]
+
+
+@admin_router.get("/users/{user_id}/organizations", response_model=AdminUserOrgsResponse)
+async def admin_user_organizations(
+    user_id: uuid.UUID, _session: dict = Depends(require_admin)
+) -> AdminUserOrgsResponse:
+    rows = await admin_list_user_organizations(user_id)
+    orgs = [
+        {
+            "org_id": str(r["org_id"]),
+            "name": r["name"],
+            "role": r["role"],
+            "plan": r.get("plan"),
+            "member_count": int(r["member_count"]),
+        }
+        for r in rows
+    ]
+    return AdminUserOrgsResponse(organizations=orgs)
 
 
 # ---------------------------------------------------------------------------

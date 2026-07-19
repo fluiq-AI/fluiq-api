@@ -22,7 +22,12 @@ import config
 
 logger = logging.getLogger(__name__)
 
-_pending: dict[str, asyncio.Future] = {}
+# correlation_id -> (future, expected_org_id | None). The expected org lets the
+# consumer reject a reply carrying a mismatched org_id — defense in depth against
+# a worker echoing the wrong correlation_id and leaking one tenant's verdict to
+# another. Verification is skipped when either side omits the org (e.g. the
+# response-gate path), preserving correlation-id-only matching there.
+_pending: dict[str, tuple[asyncio.Future, Optional[str]]] = {}
 
 
 class SecurityReplyConsumer:
@@ -59,9 +64,17 @@ class SecurityReplyConsumer:
                 correlation_id = msg.value.get("correlation_id")
                 if not correlation_id:
                     continue
-                fut = _pending.get(correlation_id)
-                if fut and not fut.done():
-                    fut.set_result(msg.value.get("result"))
+                entry = _pending.get(correlation_id)
+                if not entry:
+                    continue
+                fut, expected_org = entry
+                if fut.done():
+                    continue
+                reply_org = msg.value.get("org_id")
+                if expected_org and reply_org and str(reply_org) != str(expected_org):
+                    logger.warning("[KAFKA] Dropping security reply with mismatched org_id")
+                    continue
+                fut.set_result(msg.value.get("result"))
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -82,11 +95,17 @@ class SecurityReplyConsumer:
 security_reply_consumer = SecurityReplyConsumer()
 
 
-async def wait_for_reply(correlation_id: str, timeout: float) -> Optional[dict[str, Any]]:
-    """Publish correlation_id slot, await the worker reply, clean up on timeout."""
+async def wait_for_reply(
+    correlation_id: str,
+    timeout: float,
+    expected_org: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Register the correlation_id slot, await the worker reply, clean up on
+    timeout. When ``expected_org`` is given, a reply whose ``org_id`` doesn't
+    match is rejected by the consumer."""
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
-    _pending[correlation_id] = fut
+    _pending[correlation_id] = (fut, expected_org)
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
     except (asyncio.TimeoutError, asyncio.CancelledError):

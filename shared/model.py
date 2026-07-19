@@ -37,6 +37,8 @@ class ApiKeyCreated(ApiKeyModel):
 
 
 class OrganizationModel(BaseModel):
+    model_config = {"extra": "ignore"}
+
     org_id: UUID
     name: str
     user_id: UUID
@@ -45,6 +47,8 @@ class OrganizationModel(BaseModel):
     api_key_limit: int = 1
     api_key_usage: int = 0
     eval_quota_bonus: int = 0
+    # Per-org plan override; None means the org inherits the owner's user_type.
+    plan_tier: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
 

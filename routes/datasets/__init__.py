@@ -42,7 +42,8 @@ from db_queues.postgresql.dataset_runs import (
     list_runs,
     unlink_agent,
 )
-from routes.auth.helper import get_current_session
+from db_queues.postgresql.auth import resolve_api_key
+from routes.auth.helper import extract_api_key, get_current_session
 from shared.quotas import bump_eval_count, get_quota_status
 from shared.dataset_media import store_trajectory_media, hydrate_trajectory_media
 
@@ -88,16 +89,42 @@ class AddExampleRequest(BaseModel):
         raise ValueError("input is required")
 
 
+# Metrics a 'metrics' dataset run may request — mirrors the evaluator worker's
+# _build_evaluator names (plus per-org custom judges, referenced by slug).
+RUN_METRICS = frozenset({
+    "hallucination", "faithfulness", "relevance",
+    "toxicity", "coherence", "completeness",
+})
+
+
 class CreateRunRequest(BaseModel):
-    kind:  str                      # 'agentic' | 'security'
+    kind:  str                      # 'agentic' | 'security' | 'metrics'
     depth: Optional[str] = None     # agentic depth: fast | standard | deep
+    # kind='metrics' only: which metrics to grade each example on, plus
+    # optional per-org custom judges {slug: threshold}.
+    metrics:       Optional[List[str]]      = None
+    custom_judges: Optional[Dict[str, float]] = None
 
     @field_validator("kind")
     @classmethod
     def _validate_kind(cls, v: str) -> str:
-        if v not in ("agentic", "security"):
-            raise ValueError("kind must be 'agentic' or 'security'")
+        if v not in ("agentic", "security", "metrics"):
+            raise ValueError("kind must be 'agentic', 'security', or 'metrics'")
         return v
+
+    @field_validator("metrics")
+    @classmethod
+    def _validate_metrics(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is None:
+            return None
+        cleaned = [m.strip().lower() for m in v if m and m.strip()]
+        unknown = sorted(set(cleaned) - RUN_METRICS)
+        if unknown:
+            raise ValueError(
+                f"unknown metrics: {', '.join(unknown)}. "
+                f"Supported: {', '.join(sorted(RUN_METRICS))}"
+            )
+        return cleaned or None
 
 
 class LinkAgentRequest(BaseModel):
@@ -306,7 +333,7 @@ async def create_dataset_run(
     payload: CreateRunRequest,
     session: dict = Depends(get_current_session),
 ):
-    """Launch a batch agentic-eval or security run over every example.
+    """Launch a batch agentic-eval, security, or metrics run over every example.
 
     For each example we re-run the *real* source trace when one is recorded
     (``metadata.source_trace_id``) — fetching its full span tree so agentic /
@@ -314,9 +341,12 @@ async def create_dataset_run(
     for text-only examples. Results land in ClickHouse (keyed by trace_id) via
     the normal workers; ``GET /datasets/runs/{run_id}`` aggregates the report.
     """
-    org_id = uuid.UUID(session["org_id"])
+    return await _launch_run(uuid.UUID(session["org_id"]), dataset_id, payload)
 
-    if payload.kind == "agentic":
+
+async def _launch_run(org_id: uuid.UUID, dataset_id: uuid.UUID, payload: CreateRunRequest):
+    """Shared run-launch body for the session route and the CI (API-key) route."""
+    if payload.kind in ("agentic", "metrics"):
         quota = await get_quota_status(org_id)
         if quota.eval_over:
             raise HTTPException(
@@ -324,7 +354,11 @@ async def create_dataset_run(
                 detail=f"Evaluation quota exceeded for {quota.tier} tier.",
             )
 
-    run = await create_run(org_id, dataset_id, payload.kind, payload.depth)
+    run_metrics = payload.metrics or ["hallucination", "relevance"]
+    # For metrics runs the kind-specific config column records which metrics
+    # ran (the way `depth` records the agentic depth).
+    depth = ",".join(run_metrics) if payload.kind == "metrics" else payload.depth
+    run = await create_run(org_id, dataset_id, payload.kind, depth)
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
     run_id = run["run_id"]
@@ -365,7 +399,38 @@ async def create_dataset_run(
             events = [_synthetic_event(ex, trace_id)]
 
         # ── publish the job the workers already know how to run ──
-        if payload.kind == "agentic":
+        if payload.kind == "metrics":
+            # Grade the example's recorded answer with the chosen LLM metrics
+            # against its expected output. Always under a FRESH trace_id so the
+            # eval rows are uniquely attributable to this run (source traces may
+            # already carry production/agentic eval rows).
+            root = _root_event(events, trace_id)
+            answer = str(
+                (meta.get("output") if isinstance(meta, dict) else None)
+                or root.get("response") or root.get("output") or ""
+            )
+            event = {**root, "response": answer}
+            trace_id = str(uuid.uuid4())
+            event["trace_id"] = event["root_trace_id"] = trace_id
+            expected = str(ex.get("expected_output") or "").strip()
+            job = {
+                "operation":       "sdk_llm",
+                "organization_id": str(org_id),
+                "trace_id":        trace_id,
+                "event":           event,
+                "eval_config": {
+                    "metrics":       run_metrics,
+                    "custom_judges": payload.custom_judges or {},
+                },
+            }
+            # The reference is the expected output — unless that IS the answer
+            # being graded (text-only example with no recorded output), where a
+            # self-comparison would trivially score 1.0.
+            if expected and expected != answer.strip():
+                job["reference"] = expected
+            await kafka_queue.add_job(job, topic=config.KAFKA_EVAL_TOPIC, key=str(org_id))
+            bump_eval_count(org_id)
+        elif payload.kind == "agentic":
             if source == "trace":
                 job = {
                     "operation":       "agent_eval",
@@ -421,7 +486,11 @@ async def get_dataset_run_report(
 ):
     """Aggregate a run's per-example worker results (from ClickHouse) into a
     report, and finalize the run once every example has a result."""
-    org_id = uuid.UUID(session["org_id"])
+    return await _build_report(uuid.UUID(session["org_id"]), run_id)
+
+
+async def _build_report(org_id: uuid.UUID, run_id: uuid.UUID):
+    """Shared report body for the session route and the CI (API-key) route."""
     run = await get_run(run_id, org_id)
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
@@ -435,6 +504,13 @@ async def get_dataset_run_report(
         for r in rows:
             by_trace.setdefault(r["trace_id"], []).append(r)
         summary = _agentic_summary(by_trace, len(items))
+    elif run["kind"] == "metrics":
+        rows = await clickhouse_client.fetch_dataset_eval_results(org_id, trace_ids)
+        by_trace = {}
+        for r in rows:
+            if r["evaluator"] == "fluiq.eval" and r["score"] is not None:
+                by_trace.setdefault(r["trace_id"], []).append(r)
+        summary = _metrics_summary(by_trace, len(items))
     else:
         rows = await clickhouse_client.fetch_dataset_security_results(org_id, trace_ids)
         by_trace = {}
@@ -455,7 +531,16 @@ async def get_dataset_run_report(
             "input":           it.get("input"),
             "expected_output": it.get("expected_output"),
             "done":            it["trace_id"] in by_trace,
-            "result":          by_trace.get(it["trace_id"]) if run["kind"] == "security" else None,
+            "result": (
+                by_trace.get(it["trace_id"])
+                if run["kind"] == "security"
+                else [
+                    {"metric": r["metric"], "score": r["score"]}
+                    for r in by_trace.get(it["trace_id"], [])
+                ]
+                if run["kind"] == "metrics"
+                else None
+            ),
         }
         for it in items
     ]
@@ -493,6 +578,162 @@ def _agentic_summary(by_trace: Dict[str, List[dict]], total: int) -> dict:
     }
 
 
+def _metrics_summary(by_trace: Dict[str, List[dict]], total: int) -> dict:
+    """Blend per-example metric rows into run-level per-metric averages."""
+    completed = len(by_trace)
+    metric_scores: Dict[str, List[float]] = {}
+    example_avgs: List[float] = []
+    for rows in by_trace.values():
+        scores = [r["score"] for r in rows]
+        for r in rows:
+            metric_scores.setdefault(r["metric"], []).append(r["score"])
+        if scores:
+            example_avgs.append(sum(scores) / len(scores))
+
+    def _avg(xs: List[float]) -> Optional[float]:
+        return round(sum(xs) / len(xs), 4) if xs else None
+
+    return {
+        "kind":      "metrics",
+        "total":     total,
+        "completed": completed,
+        "avg_score": _avg(example_avgs),
+        "metrics":   {k: _avg(v) for k, v in metric_scores.items()},
+    }
+
+
+# Score movements smaller than this are noise (LLM judges are not perfectly
+# deterministic), so the comparison classifies them as unchanged.
+_COMPARE_EPSILON = 0.05
+
+
+def _example_scores(kind: str, rows: List[dict]) -> tuple[Optional[float], Dict[str, float]]:
+    """One example's (overall score, per-metric/layer scores) for comparison."""
+    per: Dict[str, float] = {}
+    overall: Optional[float] = None
+    if kind == "agentic":
+        for r in rows:
+            if r["layer"] and r["score"] is not None:
+                per[r["layer"]] = r["score"]
+            if r["layer"] == "deterministic" and r["run_score"] is not None:
+                overall = r["run_score"]
+        if overall is None and per:
+            overall = min(per.values())
+    else:  # metrics
+        scored = [r for r in rows if r["evaluator"] == "fluiq.eval" and r["score"] is not None]
+        for r in scored:
+            per[r["metric"]] = r["score"]
+        if scored:
+            overall = sum(r["score"] for r in scored) / len(scored)
+    return overall, per
+
+
+@datasets_router.get("/datasets/runs/{run_id}/compare")
+async def compare_dataset_runs(
+    run_id: uuid.UUID,
+    against: uuid.UUID = Query(..., description="Baseline run to compare against"),
+    session: dict = Depends(get_current_session),
+):
+    """Run-vs-run regression report: per-metric deltas plus every example that
+    regressed, improved, or stayed flat versus the baseline run. Examples are
+    joined by example_id (trace ids differ between runs)."""
+    org_id = uuid.UUID(session["org_id"])
+    run = await get_run(run_id, org_id)
+    baseline = await get_run(against, org_id)
+    if run is None or baseline is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+    if run["dataset_id"] != baseline["dataset_id"]:
+        raise HTTPException(status_code=400, detail="Runs belong to different datasets")
+    if run["kind"] != baseline["kind"]:
+        raise HTTPException(status_code=400, detail="Runs are of different kinds")
+    if run["kind"] not in ("agentic", "metrics"):
+        raise HTTPException(
+            status_code=400, detail="Comparison supports agentic and metrics runs"
+        )
+
+    items_a = await get_run_items(run_id, org_id)
+    items_b = await get_run_items(against, org_id)
+    rows_a = await clickhouse_client.fetch_dataset_eval_results(
+        org_id, [it["trace_id"] for it in items_a]
+    )
+    rows_b = await clickhouse_client.fetch_dataset_eval_results(
+        org_id, [it["trace_id"] for it in items_b]
+    )
+    by_trace_a: Dict[str, List[dict]] = {}
+    for r in rows_a:
+        by_trace_a.setdefault(r["trace_id"], []).append(r)
+    by_trace_b: Dict[str, List[dict]] = {}
+    for r in rows_b:
+        by_trace_b.setdefault(r["trace_id"], []).append(r)
+
+    a_by_example = {str(it["example_id"]): it for it in items_a}
+    b_by_example = {str(it["example_id"]): it for it in items_b}
+
+    examples: List[dict] = []
+    counts = {"regressed": 0, "improved": 0, "unchanged": 0, "added": 0, "missing": 0}
+    metric_pairs: Dict[str, List[tuple[float, float]]] = {}
+
+    for ex_id, it in a_by_example.items():
+        score_a, per_a = _example_scores(run["kind"], by_trace_a.get(it["trace_id"], []))
+        base_it = b_by_example.get(ex_id)
+        if base_it is None:
+            counts["added"] += 1
+            status_label = "added"
+            score_b, per_b = None, {}
+        else:
+            score_b, per_b = _example_scores(
+                run["kind"], by_trace_b.get(base_it["trace_id"], [])
+            )
+            if score_a is None or score_b is None:
+                status_label = "pending"
+            elif score_a < score_b - _COMPARE_EPSILON:
+                counts["regressed"] += 1
+                status_label = "regressed"
+            elif score_a > score_b + _COMPARE_EPSILON:
+                counts["improved"] += 1
+                status_label = "improved"
+            else:
+                counts["unchanged"] += 1
+                status_label = "unchanged"
+            for name in set(per_a) & set(per_b):
+                metric_pairs.setdefault(name, []).append((per_a[name], per_b[name]))
+        examples.append({
+            "example_id":     ex_id,
+            "input":          (str(it.get("input") or ""))[:300],
+            "score":          score_a,
+            "baseline_score": score_b,
+            "delta": round(score_a - score_b, 4) if score_a is not None and score_b is not None else None,
+            "scores":          per_a,
+            "baseline_scores": per_b,
+            "status":          status_label,
+        })
+    counts["missing"] = len(set(b_by_example) - set(a_by_example))
+
+    # Per-metric deltas over examples present in BOTH runs, so a changed
+    # example mix can't masquerade as a score movement.
+    metrics_out = [
+        {
+            "metric":       name,
+            "avg":          round(sum(a for a, _ in pairs) / len(pairs), 4),
+            "baseline_avg": round(sum(b for _, b in pairs) / len(pairs), 4),
+            "delta":        round(sum(a - b for a, b in pairs) / len(pairs), 4),
+        }
+        for name, pairs in sorted(metric_pairs.items())
+    ]
+
+    # Regressions first, biggest drop on top.
+    order = {"regressed": 0, "improved": 1, "unchanged": 2, "added": 3, "pending": 4}
+    examples.sort(key=lambda e: (order.get(e["status"], 5), e["delta"] if e["delta"] is not None else 0))
+
+    return {
+        "run":      _serialize_run(run),
+        "baseline": _serialize_run(baseline),
+        "metrics":  metrics_out,
+        "examples": examples,
+        "summary":  counts,
+    }
+
+
 _THREAT_KEYS = [
     "injection", "jailbreak", "skeleton_key", "secrets", "indirect_injection",
     "rag_poisoning", "tool_exfiltration", "tool_policy_violation",
@@ -523,6 +764,62 @@ def _security_summary(by_trace: Dict[str, dict], total: int) -> dict:
         "blocked":     blocked,
         "threats":     {k: v for k, v in threats.items() if v > 0},
     }
+
+
+# ── CI (API-key) runs — `python -m fluiq.ci` / GitHub Actions ────────────────
+# Distinct /ci/eval-runs prefix so these can't collide with the
+# /datasets/{dataset_id}/... session routes.
+
+class CIRunRequest(CreateRunRequest):
+    api_key:      Optional[str] = None       # also accepted via header
+    dataset_id:   Optional[uuid.UUID] = None
+    dataset_name: Optional[str] = None       # case-insensitive name lookup
+
+
+async def _resolve_ci_org(header_key: Optional[str], body_key: Optional[str]) -> uuid.UUID:
+    key = header_key or body_key
+    if not key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key required")
+    resolved = await resolve_api_key(key)
+    if resolved is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+    org_id, _prefix, _key_id = resolved
+    return org_id
+
+
+@datasets_router.post("/ci/eval-runs", status_code=status.HTTP_201_CREATED)
+async def ci_create_run(
+    payload: CIRunRequest,
+    api_key: Optional[str] = Depends(extract_api_key),
+):
+    """Launch a dataset eval run from CI, authenticated by API key."""
+    org_id = await _resolve_ci_org(api_key, payload.api_key)
+
+    dataset_id = payload.dataset_id
+    if dataset_id is None:
+        name = (payload.dataset_name or "").strip().lower()
+        if not name:
+            raise HTTPException(status_code=422, detail="dataset_id or dataset_name required")
+        rows = await list_datasets(org_id)
+        match = next((r for r in rows if str(r.get("name") or "").strip().lower() == name), None)
+        if match is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No dataset named '{payload.dataset_name}'",
+            )
+        dataset_id = match["dataset_id"]
+
+    return await _launch_run(org_id, dataset_id, payload)
+
+
+@datasets_router.get("/ci/eval-runs/{run_id}")
+async def ci_run_report(
+    run_id: uuid.UUID,
+    api_key: Optional[str] = Depends(extract_api_key),
+):
+    """Fetch a run's report from CI, authenticated by API key."""
+    org_id = await _resolve_ci_org(api_key, None)
+    return await _build_report(org_id, run_id)
 
 
 # ── Agent links (Connect Agents) ──────────────────────────────────────────────
