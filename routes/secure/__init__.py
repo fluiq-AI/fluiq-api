@@ -12,7 +12,7 @@ The org's GuardrailPolicy is fetched (60 s cache) and:
   - block_threshold    → sent to the worker; 'medium' lowers the block bar
   - alert_webhook      → POSTed asynchronously on every block
 
-Requires Team tier or above.
+Requires Growth tier or above (see ``_SECURE_TIERS``).
 """
 from __future__ import annotations
 
@@ -23,13 +23,14 @@ from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import config
 from db_queues.postgresql.auth import resolve_api_key, get_org_tier
 from db_queues.postgresql.guardrails import get_policy, GuardrailPolicy
 from db_queues.kafka import kafka_queue, wait_for_reply
 from routes.auth.helper import extract_api_key
+from shared.net import is_safe_public_url
 from . import scanners
 
 logger = logging.getLogger(__name__)
@@ -57,9 +58,15 @@ async def _resolve_and_gate(api_key: str) -> tuple:
     return org_id, prefix
 
 
+# Upper bound on scanned prompt size. Prevents a multi-MB prompt from driving
+# unbounded regex/preprocessing work per request (DoS). Larger prompts are
+# truncated for scanning; the caller's actual LLM call is unaffected.
+_MAX_PROMPT_CHARS = 64 * 1024
+
+
 class CheckRequest(BaseModel):
     api_key:   Optional[str] = None
-    prompt:    str
+    prompt:    str = Field(max_length=1_000_000)
     trace_id:  Optional[str] = None
     context:   Optional[dict] = None
     guardrail: str = "default"
@@ -70,6 +77,9 @@ class CheckResponse(BaseModel):
     block_reason: Optional[str]
     risk_level:   str
     attack_types: List[str]
+    # True when the verdict came from the degraded pattern-only fallback (the full
+    # worker scan — PII/secrets/semantic — did not run). Lets callers fail closed.
+    degraded:     bool = False
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
@@ -81,6 +91,12 @@ async def _fire_webhook(
     risk_level: str,
     attack_types: List[str],
 ) -> None:
+    # Re-validate at fire time (defends against a policy stored before the SSRF
+    # guard existed, and narrows the DNS-rebinding window). Never follow
+    # redirects — a redirect could hop to an internal host.
+    if not await is_safe_public_url(webhook_url, require_https=True):
+        logger.warning("[SECURE] Refusing to POST alert to non-public webhook")
+        return
     payload = {
         "event":        "security.block",
         "org_id":       org_id,
@@ -90,7 +106,7 @@ async def _fire_webhook(
     }
     for attempt in range(3):
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
                 r = await client.post(webhook_url, json=payload)
                 if r.status_code < 500:
                     return
@@ -150,7 +166,13 @@ async def _publish_blocked_trace(
     context: Optional[dict] = None,
 ) -> None:
     try:
-        event: dict = {
+        # Merge caller-supplied context FIRST so the reserved security fields
+        # below always win. Otherwise a client could POST a context that
+        # overwrites status/block_reason and forge a blocked trace as "clean".
+        event: dict = {}
+        if context:
+            event.update({k: v for k, v in context.items() if v is not None})
+        event.update({
             "trace_id":     trace_id,
             "type":         "llm",
             "status":       "blocked",
@@ -159,9 +181,7 @@ async def _publish_blocked_trace(
             "block_reason": result.block_reason,
             "risk_level":   result.risk_level,
             "attack_types": result.attack_types,
-        }
-        if context:
-            event.update({k: v for k, v in context.items() if v is not None})
+        })
         await kafka_queue.add_job(
             {
                 "organization_id": str(org_id),
@@ -183,16 +203,22 @@ async def pre_call_check(
     payload: CheckRequest,
     api_key: Optional[str] = Depends(extract_api_key),
 ) -> CheckResponse:
-    """Pre-call security guard with per-org guardrail policy."""
+    """Pre-call security guard with per-org guardrail policy.
+
+    Order matters: hard blocks (deny-list, then high-risk attack patterns) are
+    evaluated BEFORE the allow-list, so an attacker cannot neutralize a scan by
+    embedding an allow-listed phrase next to a payload. The allow-list only
+    short-circuits the softer worker/medium tier, never a deny or high-risk hit.
+    """
     org_id, prefix = await _resolve_and_gate(api_key or payload.api_key)
     policy = await get_policy(org_id, slug=payload.guardrail or "default")
 
-    # 1. Allow-list short-circuit
-    if _apply_allow_list(payload.prompt, policy):
-        return CheckResponse(allow=True, block_reason=None, risk_level="clean", attack_types=[])
+    # Cap the text actually scanned so a giant prompt can't drive unbounded regex
+    # work. The prompt forwarded to the worker is likewise bounded.
+    scan_prompt = payload.prompt[:_MAX_PROMPT_CHARS]
 
-    # 2. Deny-list short-circuit
-    deny_reason = _apply_deny_list(payload.prompt, policy)
+    # 1. Deny-list — hard block, evaluated first.
+    deny_reason = _apply_deny_list(scan_prompt, policy)
     if deny_reason:
         response = CheckResponse(
             allow=False, block_reason=deny_reason, risk_level="high", attack_types=["custom_deny_list"],
@@ -202,10 +228,10 @@ async def pre_call_check(
         _maybe_fire_webhook(policy, str(org_id), payload.trace_id, "high", ["custom_deny_list"])
         return response
 
-    # 3. Fast pattern check — deterministic, catches obvious injection/jailbreak/
-    #    skeleton-key including indirect attacks hidden in HTML markup.
-    #    Short-circuits before the Kafka round-trip so latency is near-zero.
-    r = scanners.check(payload.prompt)
+    # 2. Fast pattern check — deterministic, catches obvious injection/jailbreak/
+    #    skeleton-key including indirect attacks hidden in HTML markup. Runs
+    #    before the allow-list so an allow phrase can't whitelist an injection.
+    r = scanners.check(scan_prompt)
     pattern_attacks = _filter_by_categories(r.attack_types, policy)
     pattern_blocks = (
         r.risk_level == "high"
@@ -224,14 +250,27 @@ async def pre_call_check(
         _maybe_fire_webhook(policy, str(org_id), payload.trace_id, r.risk_level, pattern_attacks)
         return response
 
-    # 4. Priority path: full scan via evaluator worker (policy forwarded)
+    # 3. Allow-list short-circuit — only reachable once the hard blocks above have
+    #    passed. Trusted content skips the deeper worker/medium-tier scan.
+    if _apply_allow_list(scan_prompt, policy):
+        return CheckResponse(allow=True, block_reason=None, risk_level="clean", attack_types=[])
+
+    # 4. Priority path: full scan via evaluator worker (policy forwarded).
+    #    Register the reply future BEFORE publishing so a fast worker reply is
+    #    never lost to a registration race (which would force the degraded path).
     correlation_id = uuid4().hex
     try:
+        reply = wait_for_reply(
+            correlation_id,
+            timeout=config.KAFKA_SECURITY_CHECK_TIMEOUT,
+            expected_org=str(org_id),
+        )
         await kafka_queue.add_job(
             {
                 "operation":      "security_check_sync",
-                "prompt":         payload.prompt,
+                "prompt":         scan_prompt,
                 "correlation_id": correlation_id,
+                "org_id":         str(org_id),
                 "policy": {
                     "block_threshold":  policy.block_threshold,
                     "block_categories": policy.block_categories,
@@ -240,7 +279,7 @@ async def pre_call_check(
             },
             topic=config.KAFKA_SECURITY_TOPIC,
         )
-        result = await wait_for_reply(correlation_id, timeout=config.KAFKA_SECURITY_CHECK_TIMEOUT)
+        result = await reply
         if result is not None:
             response = CheckResponse(**result)
             if not response.allow and payload.trace_id:
@@ -251,19 +290,25 @@ async def pre_call_check(
     except Exception:
         logger.exception("[SECURE] Kafka full-scan failed, falling back to pattern check")
 
-    # 5. Fallback: pattern check already ran above; re-use result with policy applied
-    logger.warning("[SECURE] Falling back to pattern-only check for correlation_id=%s", correlation_id)
+    # 5. Degraded fallback: the full worker scan (PII / secrets / semantic) did
+    #    not run. Re-use the pattern result with policy applied. When
+    #    SECURE_FAIL_CLOSED is set, block instead of allowing on degraded.
+    logger.warning("[SECURE] Degraded pattern-only check for correlation_id=%s", correlation_id)
     attack_types = _filter_by_categories(r.attack_types, policy)
     should_block  = (
         r.risk_level == "high"
         or (r.risk_level == "medium" and policy.block_threshold == "medium")
     ) and bool(attack_types or not policy.block_categories)
+    if config.SECURE_FAIL_CLOSED and not should_block:
+        should_block = True
+        attack_types = attack_types or ["scan_unavailable"]
 
     response = CheckResponse(
         allow        = not should_block,
         block_reason = f"Blocked by fluiq.secure: {', '.join(attack_types)}" if should_block else None,
         risk_level   = r.risk_level,
         attack_types = attack_types,
+        degraded     = True,
     )
     if not response.allow and payload.trace_id:
         await _publish_blocked_trace(str(org_id), prefix, payload.trace_id, response, payload.context)

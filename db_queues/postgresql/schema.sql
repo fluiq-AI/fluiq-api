@@ -382,3 +382,84 @@ CREATE TABLE IF NOT EXISTS eval_judge_prompt_versions (
 );
 CREATE INDEX IF NOT EXISTS idx_eval_judge_prompt_versions_name
     ON eval_judge_prompt_versions(name, version);
+
+-- Per-organization judge-prompt overrides: a customer edit of a built-in
+-- judge prompt, visible only to that org. Resolution order in the evaluator is
+-- org override → platform template (eval_judge_prompts) → code default, so
+-- deleting a row here reverts the org to the platform prompt. The API rejects
+-- an edit that drops any required_vars of the underlying prompt.
+CREATE TABLE IF NOT EXISTS eval_judge_prompt_org_overrides (
+    org_id     UUID        NOT NULL REFERENCES organizations(org_id)   ON DELETE CASCADE,
+    name       TEXT        NOT NULL REFERENCES eval_judge_prompts(name) ON DELETE CASCADE,
+    template   TEXT        NOT NULL,
+    version    INTEGER     NOT NULL DEFAULT 1,
+    updated_by UUID,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (org_id, name)
+);
+
+-- Immutable per-org history, for rollback. Survives deletion of the live
+-- override so "restore" works after a reset.
+CREATE TABLE IF NOT EXISTS eval_judge_prompt_org_versions (
+    version_id  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id      UUID        NOT NULL,
+    name        TEXT        NOT NULL,
+    version     INTEGER     NOT NULL,
+    template    TEXT        NOT NULL,
+    updated_by  UUID,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_eval_judge_prompt_org_versions
+    ON eval_judge_prompt_org_versions(org_id, name, version);
+
+-- ---------------------------------------------------------------------------
+-- Multi-user organizations: team membership + email invitations.
+--
+-- Historically an org had exactly one user (organizations.user_id = the owner,
+-- users.org_id = that user's only org). ``organization_members`` is now the
+-- source of truth for "who may access which org"; users.org_id remains the
+-- user's *current/active* org (what the JWT is minted with) and
+-- organizations.user_id remains the *owner* (whose users.user_type drives the
+-- org's plan unless organizations.plan_tier overrides it).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS organization_members (
+    org_id     UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    user_id    UUID        NOT NULL REFERENCES users(user_id)        ON DELETE CASCADE,
+    role       TEXT        NOT NULL DEFAULT 'member'
+               CHECK (role IN ('owner', 'admin', 'member')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (org_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_members(user_id);
+
+-- One-time backfill for pre-existing deployments: every org's owner becomes an
+-- 'owner' member. Idempotent via ON CONFLICT.
+INSERT INTO organization_members (org_id, user_id, role)
+SELECT org_id, user_id, 'owner' FROM organizations
+ON CONFLICT DO NOTHING;
+
+-- Tokenized email invitations. The raw token is only ever in the accept link
+-- (emailed once); we persist its SHA-256 like password-reset OTPs / API keys.
+CREATE TABLE IF NOT EXISTS organization_invitations (
+    invite_id   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id      UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    email       TEXT        NOT NULL,
+    role        TEXT        NOT NULL DEFAULT 'member'
+                CHECK (role IN ('admin', 'member')),
+    token_hash  TEXT        NOT NULL,
+    invited_by  UUID,
+    status      TEXT        NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'accepted', 'revoked')),
+    expires_at  TIMESTAMPTZ NOT NULL,
+    accepted_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_org_invites_org   ON organization_invitations(org_id, status);
+CREATE INDEX IF NOT EXISTS idx_org_invites_email ON organization_invitations(lower(email), status);
+
+-- Per-org plan override. NULL => fall back to the owner's users.user_type (the
+-- legacy path, so existing single-user orgs are unchanged). A secondary org a
+-- user creates is stamped 'Free' here so it can be upgraded independently of
+-- any paid plan the creator holds on their home org.
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS plan_tier TEXT;

@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from db_queues.clickhouse import clickhouse_client
 from db_queues.kafka import kafka_queue, security_reply_consumer, playground_reply_consumer
@@ -18,6 +19,8 @@ from routes.api_keys import api_keys_router
 from routes.audit import audit_router
 from routes.guardrails import guardrails_router
 from routes.evaluate import evaluate_router
+from routes.evaluate.judge_prompts import judge_prompts_router
+from routes.feedback import feedback_router
 from routes.optimize import optimize_router
 from routes.datasets import datasets_router
 from routes.prompts import prompts_router
@@ -29,6 +32,7 @@ from routes.blog import blog_router
 from routes.models import models_router
 from routes.alerts import alerts_router
 from routes.otel import otel_router
+from routes.organizations import organizations_router
 import config
 
 @asynccontextmanager
@@ -107,6 +111,33 @@ def _cors_headers_for(request: Request) -> dict[str, str]:
     }
 
 
+class SelectiveGZipMiddleware:
+    """GZip everything except SSE.
+
+    Trace list responses carry full event JSON and reach tens of MB
+    uncompressed — transfer time, not query time, dominated dashboard loads.
+    gzip cuts them 10-20x. Event streams must bypass compression: gzip's
+    internal buffering can hold a small SSE event back indefinitely, stalling
+    realtime updates.
+    """
+
+    def __init__(self, app):
+        self._plain = app
+        self._gzip = GZipMiddleware(app, minimum_size=1024)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            accept = next(
+                (v for k, v in scope.get("headers", []) if k == b"accept"),
+                b"",
+            )
+            if b"text/event-stream" in accept:
+                await self._plain(scope, receive, send)
+                return
+        await self._gzip(scope, receive, send)
+
+
+app.add_middleware(SelectiveGZipMiddleware)
 app.add_middleware(AuditMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -140,6 +171,8 @@ app.include_router(agents_router, prefix="/api/v1")
 app.include_router(quota_router, prefix="/api/v1")
 app.include_router(billing_router, prefix="/api/v1")
 app.include_router(evaluate_router, prefix="/api/v1")
+app.include_router(judge_prompts_router, prefix="/api/v1")
+app.include_router(feedback_router, prefix="/api/v1")
 app.include_router(prompts_router, prefix="/api/v1")
 app.include_router(datasets_router, prefix="/api/v1")
 app.include_router(optimize_router, prefix="/api/v1/optimize")
@@ -148,6 +181,7 @@ app.include_router(contact_router, prefix="/api/v1")
 app.include_router(blog_router, prefix="/api/v1")
 app.include_router(models_router, prefix="/api/v1")
 app.include_router(auth.auth_router, prefix="/auth")
+app.include_router(organizations_router, prefix="/api/v1/organizations")
 app.include_router(api_keys_router, prefix="/api-keys")
 
 @app.get("/")

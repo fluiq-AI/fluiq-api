@@ -140,11 +140,19 @@ CREATE TABLE IF NOT EXISTS fluiq.security_scans
     should_block                 UInt8,
     scan_latency                 Float32,
     extra                        JSON,
+    -- Mirrors traces.retention_days: stamped per row from the org's tier so a
+    -- scan's redacted text + entity labels roll off on the same schedule as the
+    -- raw trace they describe (Free=14d, paid=~never). DEFAULT is the "never"
+    -- sentinel so any unstamped row fails safe (kept, never silently deleted).
+    -- Keep on DateTime64 (see the traces TTL note — toDateTime overflows the
+    -- ~100y sentinel into the past and would delete rows immediately).
+    retention_days               UInt16 DEFAULT 36500,
     ingested_at                  DateTime64(3, 'UTC') DEFAULT now64(3)
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ingested_at)
-ORDER BY (organization_id, trace_id, ingested_at);
+ORDER BY (organization_id, trace_id, ingested_at)
+TTL ingested_at + toIntervalDay(retention_days);
 
 -- Migrations for existing deployments — agentic-threat signals (A.2/B.2/B.3/C.1)
 ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS rag_poisoning_detected         UInt8 DEFAULT 0;
@@ -159,6 +167,13 @@ ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS cross_agent_injection_
 -- Image-embedded injection (found via OCR of image media)
 ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS image_injection_detected       UInt8 DEFAULT 0;
 ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS image_injection_sources        Array(String);
+
+-- Per-row retention + TTL (mirrors traces). The ADD COLUMN MUST run BEFORE the
+-- security worker deploys (it inserts retention_days by name); the DEFAULT
+-- backfills existing rows with the "never" sentinel, so no history is deleted.
+-- MODIFY TTL must run AFTER the column exists.
+ALTER TABLE fluiq.security_scans ADD COLUMN IF NOT EXISTS retention_days UInt16 DEFAULT 36500;
+ALTER TABLE fluiq.security_scans MODIFY TTL ingested_at + toIntervalDay(retention_days);
 
 -- ── Per-run rollups (root_trace_id) ──────────────────────────────────────────
 -- Precomputed cost / quality / security aggregates per agent run, so the
@@ -224,8 +239,15 @@ SELECT
 FROM fluiq.evaluations
 -- Exclude security-evaluator rows so quality mirrors the UI's minTraceScore,
 -- which summarizes *quality* by its weakest metric and ignores fluiq.security
--- (security is surfaced separately via the security rollup).
-WHERE evaluator != 'fluiq.security'
+-- (security is surfaced separately via the security rollup). Human rows
+-- (human.feedback / human.annotation) are also excluded: a thumbs-down must
+-- not drag the automated quality_min to 0 — human signals are surfaced
+-- separately in the drawer.
+-- MIGRATION NOTE: CREATE IF NOT EXISTS won't replace an existing view — on
+-- deployed environments run `DROP VIEW fluiq.mv_trace_quality_rollup` once
+-- BEFORE the deploy that ships human feedback, so boot recreates it with this
+-- WHERE clause (no backfill needed while no human rows exist yet).
+WHERE evaluator != 'fluiq.security' AND evaluator NOT LIKE 'human.%'
 GROUP BY organization_id, root_trace_id;
 
 CREATE TABLE IF NOT EXISTS fluiq.trace_security_rollup

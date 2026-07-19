@@ -7,8 +7,15 @@ dependencies (presidio, sentence-transformers).  Full post-call scanning
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import List, Optional
+
+_ZERO_WIDTH_RE = re.compile(
+    "[​‌‍⁠﻿᠎­͏؜"
+    "ᅟᅠ឴឵ㅤﾠ‎‏]"
+)
+_FORMAT_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _compile(patterns: list[str]) -> list[tuple[str, re.Pattern]]:
@@ -16,8 +23,13 @@ def _compile(patterns: list[str]) -> list[tuple[str, re.Pattern]]:
 
 
 def _preprocess(text: str) -> str:
-    """Strip HTML/XML markup before pattern matching so attackers cannot hide
-    injection payloads inside comments or tags (indirect injection via RAG)."""
+    """Normalize Unicode + strip HTML/XML markup before pattern matching so
+    attackers cannot hide injection payloads inside comments/tags (indirect
+    injection via RAG) or behind homoglyphs / zero-width characters."""
+    # Fold full-width/compatibility homoglyphs, drop zero-width + control chars.
+    text = unicodedata.normalize("NFKC", text)
+    text = _ZERO_WIDTH_RE.sub("", text)
+    text = _FORMAT_CTRL_RE.sub("", text)
     # Strip HTML comments first (<!-- ... -->)
     text = re.sub(r'<!--.*?-->', ' ', text, flags=re.DOTALL)
     # Strip XML/HTML tags

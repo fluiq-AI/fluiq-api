@@ -129,6 +129,12 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 KAFKA_SECURITY_REPLY_TOPIC     = os.getenv("KAFKA_SECURITY_REPLY_TOPIC")
 KAFKA_SECURITY_CHECK_TIMEOUT   = float(os.getenv("KAFKA_SECURITY_CHECK_TIMEOUT"))
+# When the full worker scan is unavailable (timeout / Kafka error / reply topic
+# unset), /secure/check falls back to the pattern-only scanner, which cannot see
+# PII, secrets, or semantic attacks. Default preserves the documented fail-OPEN
+# behavior (allow on degraded). Set SECURE_FAIL_CLOSED=true to block instead when
+# running degraded — safer for block-critical deployments.
+SECURE_FAIL_CLOSED = os.getenv("SECURE_FAIL_CLOSED", "false").lower() in ("1", "true", "yes")
 
 KAFKA_PLAYGROUND_REPLY_TOPIC   = os.getenv("KAFKA_PLAYGROUND_REPLY_TOPIC")
 KAFKA_PLAYGROUND_CHECK_TIMEOUT = float(os.getenv("KAFKA_PLAYGROUND_CHECK_TIMEOUT", "30"))

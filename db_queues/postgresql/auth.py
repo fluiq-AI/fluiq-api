@@ -63,6 +63,13 @@ async def register_user(
                     f"VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *",
                     user_id, email, hashed_password, name, user_type, org_id,
                 )
+                # The account owner is the org's first member. This is the
+                # source of truth for org access (see organization_members).
+                await conn.execute(
+                    "INSERT INTO organization_members (org_id, user_id, role) "
+                    "VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING",
+                    org_id, user_id,
+                )
             except asyncpg.UniqueViolationError:
                 return None
     return UserModel(**dict(user_row)), OrganizationModel(**dict(org_row))
@@ -197,18 +204,21 @@ TRIALABLE_TIERS = frozenset({"Team", "Growth"})
 async def get_org_tier(org_id: uuid.UUID) -> Optional[str]:
     """Return the tier (`Free` / `Team` / `Growth` / `Enterprise`) for an org.
 
-    The tier is read from the org owner's ``users.user_type`` row. Returns
-    ``None`` if the org or its owner cannot be found.
+    Effective tier is ``organizations.plan_tier`` when set, else the org owner's
+    ``users.user_type`` row (the legacy path). Returns ``None`` if the org or its
+    owner cannot be found.
 
-    Trials expire lazily here: if an active trial's ``trial_ends_at`` has
-    passed, the owner is downgraded to Free in the same round-trip and Free is
-    returned. This is the single read path behind ``shared.quotas``, so no cron
-    is needed — the plan self-heals the next time usage is checked. The
-    ``trial_used`` latch is left set so the trial can't be restarted.
+    Trials expire lazily on the owner path only: if an active trial's
+    ``trial_ends_at`` has passed, the owner is downgraded to Free in the same
+    round-trip and Free is returned. This is the single read path behind
+    ``shared.quotas``, so no cron is needed — the plan self-heals the next time
+    usage is checked. The ``trial_used`` latch is left set so the trial can't be
+    restarted. Orgs with an explicit ``plan_tier`` (e.g. secondary orgs) carry
+    no self-serve trial, so that branch does not apply to them.
     """
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
-            f"SELECT u.user_id, u.user_type, u.trial_ends_at "
+            f"SELECT o.plan_tier, u.user_id, u.user_type, u.trial_ends_at "
             f"FROM {config.POSTGRES_ORG_TABLE} o "
             f"JOIN {config.POSTGRES_USER_TABLE} u ON u.user_id = o.user_id "
             f"WHERE o.org_id = $1",
@@ -216,6 +226,8 @@ async def get_org_tier(org_id: uuid.UUID) -> Optional[str]:
         )
         if row is None:
             return None
+        if row["plan_tier"] is not None:
+            return row["plan_tier"]
         tier = row["user_type"]
         ends_at = row["trial_ends_at"]
         if (
@@ -540,6 +552,9 @@ async def admin_list_organizations(
         rows = await conn.fetch(
             f"SELECT o.org_id, o.name AS org_name, o.user_id, "
             f"o.api_key_usage, o.api_key_limit, o.created_at, "
+            f"COALESCE(o.plan_tier, u.user_type) AS plan, "
+            f"(SELECT COUNT(*) FROM organization_members m WHERE m.org_id = o.org_id) "
+            f"    AS member_count, "
             f"u.email AS owner_email, u.name AS owner_name, u.user_type AS owner_type "
             f"FROM {config.POSTGRES_ORG_TABLE} o "
             f"LEFT JOIN {config.POSTGRES_USER_TABLE} u ON u.user_id = o.user_id "

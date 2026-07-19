@@ -167,6 +167,30 @@ class ClickHouseQueryMixin:
             where += " AND ifNull(t.event.integration.:String,'') = {integration:String}"
             params["integration"] = integration
 
+        # Security-tab filter: pre-call blocks plus any scanned risk level. Kept
+        # as a pre-join predicate (risky root_trace_ids from an org-scoped seek)
+        # so the fast page-first path below stays usable; the joined-column
+        # filters ("clean"/level) can't, because "no scan row" is only observable
+        # after the LEFT JOIN.
+        #
+        # SUBTREE-AWARE, mirroring the blocked/failed status branches: match on
+        # root_trace_id, not trace_id. Security scans run per span, so an agentic
+        # attack is usually detected on a CHILD LLM/tool span (trace_id != root),
+        # while the Security page lists roots (roots_only). Keying on t.trace_id
+        # would miss every run whose detection isn't on the root span itself.
+        if security == "flagged":
+            where += (
+                " AND (t.root_trace_id IN ("
+                f"    SELECT DISTINCT root_trace_id FROM {target}"
+                "     WHERE organization_id = {org_id:UUID}"
+                f"       AND {blocked_pred}"
+                "  ) OR t.root_trace_id IN ("
+                f"    SELECT DISTINCT root_trace_id FROM {security_target}"
+                "     WHERE organization_id = {org_id:UUID}"
+                "       AND security_risk_level IN ('low','medium','high')"
+                "  ))"
+            )
+
         # Post-join filters (reference joined table aliases)
         security_filter = ""
         if security == "clean":
@@ -1283,6 +1307,36 @@ GROUP BY root_trace_id
                 evals_target, rows,
                 column_names=["organization_id", "trace_id", "metric", "score", "evaluator", "judge_model"],
             )
+
+    async def insert_human_score(
+        self,
+        organization_id: uuid.UUID,
+        trace_id: str,
+        root_trace_id: str,
+        evaluator: str,
+        metric: str,
+        score: float,
+        details: dict[str, Any],
+        api_key_prefix: str = "",
+        table: Optional[str] = None,
+    ) -> None:
+        """One human signal (end-user feedback or a dashboard annotation) into
+        the evaluations table, so it rides the same read paths as judge scores.
+        The quality rollup MV excludes evaluator LIKE 'human.%'."""
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        evals_target = table or config.CLICKHOUSE_EVALUATIONS_TABLE
+        await self._client.insert(  # type: ignore[attr-defined]
+            evals_target,
+            [[
+                str(organization_id), api_key_prefix, trace_id, root_trace_id,
+                evaluator, metric, float(score), "", details or {},
+            ]],
+            column_names=[
+                "organization_id", "api_key_prefix", "trace_id", "root_trace_id",
+                "evaluator", "metric", "score", "judge_model", "details",
+            ],
+        )
 
     # ── Audit log ─────────────────────────────────────────────────────────────
 
