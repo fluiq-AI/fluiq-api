@@ -17,6 +17,7 @@ from db_queues.postgresql.guardrails import get_policy
 from realtime import running_registry, trace_broker
 from routes.auth.helper import extract_api_key, get_current_session
 from shared.cache import cached_json, dash_key
+from shared.ids import coerce_trace_uuid
 from shared.quotas import (
     QuotaStatus,
     UNLIMITED,
@@ -110,10 +111,15 @@ async def ingestion(
         )
 
     event = payload.event
-    trace_id = event.get("trace_id")
-    if not trace_id:
-        trace_id = str(uuid.uuid4())
-        event["trace_id"] = trace_id
+    # Normalize caller-supplied identifiers to valid UUIDs. ClickHouse stores
+    # trace_id/root_trace_id as UUID columns, so a non-UUID string would crash
+    # the tracer insert (and drop the trace). Map deterministically so a
+    # non-UUID trace tree stays internally linked (see shared.ids).
+    trace_id = coerce_trace_uuid(event.get("trace_id")) or str(uuid.uuid4())
+    event["trace_id"] = trace_id
+    for _link in ("root_trace_id", "parent_id"):
+        if event.get(_link):
+            event[_link] = coerce_trace_uuid(event[_link])
 
     # Strip SDK-embedded configs before persisting the trace.
     eval_config     = event.pop("_eval_config",     None)

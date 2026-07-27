@@ -83,6 +83,15 @@ CREATE TABLE IF NOT EXISTS fluiq.evaluations
     metric           String,
     score            Float32,
     judge_model      String DEFAULT '',
+    -- Judge spend for the whole eval message, not for this metric: a jury's
+    -- calls are not divisible per metric, so the first row of a message carries
+    -- the totals and the rest carry zeros. Always aggregate with SUM (never AVG
+    -- or per-row reads) — SUM over a message's rows is its true spend.
+    -- Tokens, not cost: the price of a token is a policy decision (markup,
+    -- model weighting) that changes, while the token count is ground truth.
+    judge_input_tokens   UInt32 DEFAULT 0,
+    judge_output_tokens  UInt32 DEFAULT 0,
+    judge_calls          UInt16 DEFAULT 0,
     details          JSON,
     -- Agentic eval fields. Non-agentic rows leave these at their defaults;
     -- agentic dashboards filter on evaluator = 'fluiq.agent_eval'.
@@ -101,6 +110,13 @@ ALTER TABLE fluiq.evaluations ADD COLUMN IF NOT EXISTS layer      LowCardinality
 ALTER TABLE fluiq.evaluations ADD COLUMN IF NOT EXISTS step_id    String  DEFAULT '';
 ALTER TABLE fluiq.evaluations ADD COLUMN IF NOT EXISTS run_score  Float32 DEFAULT 0;
 ALTER TABLE fluiq.evaluations ADD COLUMN IF NOT EXISTS run_passed UInt8   DEFAULT 1;
+
+-- Judge-token accounting. MUST be applied before deploying an evaluator that
+-- writes them: the worker inserts by explicit column name, so a worker ahead of
+-- this migration fails every insert.
+ALTER TABLE fluiq.evaluations ADD COLUMN IF NOT EXISTS judge_input_tokens  UInt32 DEFAULT 0;
+ALTER TABLE fluiq.evaluations ADD COLUMN IF NOT EXISTS judge_output_tokens UInt32 DEFAULT 0;
+ALTER TABLE fluiq.evaluations ADD COLUMN IF NOT EXISTS judge_calls         UInt16 DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS fluiq.security_scans
 (

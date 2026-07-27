@@ -16,6 +16,8 @@ async def create_run(
     dataset_id: uuid.UUID,
     kind: str,
     depth: Optional[str] = None,
+    model: Optional[str] = None,
+    batch_id: Optional[uuid.UUID] = None,
 ) -> Optional[Dict[str, Any]]:
     """Create a dataset run. Returns None if the dataset is not the org's."""
     async with postgres_client.acquire() as conn:
@@ -27,11 +29,11 @@ async def create_run(
             return None
         row = await conn.fetchrow(
             """
-            INSERT INTO dataset_runs (dataset_id, org_id, kind, depth)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO dataset_runs (dataset_id, org_id, kind, depth, model, batch_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *
             """,
-            dataset_id, org_id, kind, depth,
+            dataset_id, org_id, kind, depth, model, batch_id,
         )
         return dict(row)
 
@@ -100,7 +102,12 @@ async def get_run_items(run_id: uuid.UUID, org_id: uuid.UUID) -> List[Dict[str, 
         return [dict(r) for r in rows]
 
 
-async def list_runs(dataset_id: uuid.UUID, org_id: uuid.UUID) -> List[Dict[str, Any]]:
+async def list_runs(
+    dataset_id: uuid.UUID,
+    org_id: uuid.UUID,
+    limit: int = 50,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
     async with postgres_client.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -110,9 +117,9 @@ async def list_runs(dataset_id: uuid.UUID, org_id: uuid.UUID) -> List[Dict[str, 
             WHERE r.dataset_id = $1 AND r.org_id = $2
             GROUP BY r.run_id
             ORDER BY r.created_at DESC
-            LIMIT 50
+            LIMIT $3 OFFSET $4
             """,
-            dataset_id, org_id,
+            dataset_id, org_id, limit, offset,
         )
         return [dict(r) for r in rows]
 

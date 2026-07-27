@@ -12,7 +12,7 @@ async def list_datasets(org_id: uuid.UUID) -> List[Dict[str, Any]]:
     async with postgres_client.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT d.dataset_id, d.org_id, d.name, d.description,
+            SELECT d.dataset_id, d.org_id, d.name, d.description, d.kind,
                    d.created_at, d.updated_at,
                    COUNT(e.example_id)::int AS example_count
             FROM datasets d
@@ -30,15 +30,16 @@ async def create_dataset(
     org_id: uuid.UUID,
     name: str,
     description: Optional[str] = None,
+    kind: str = "agentic",
 ) -> Dict[str, Any]:
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO datasets (org_id, name, description)
-            VALUES ($1, $2, $3)
+            INSERT INTO datasets (org_id, name, description, kind)
+            VALUES ($1, $2, $3, $4)
             RETURNING *
             """,
-            org_id, name, description,
+            org_id, name, description, kind,
         )
         return dict(row)
 

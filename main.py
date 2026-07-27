@@ -31,6 +31,7 @@ from routes.contact import router as contact_router
 from routes.blog import blog_router
 from routes.models import models_router
 from routes.alerts import alerts_router
+from routes.credentials import credentials_router
 from routes.otel import otel_router
 from routes.organizations import organizations_router
 import config
@@ -165,6 +166,7 @@ app.include_router(admin_router, prefix="/admin")
 app.include_router(audit_router, prefix="/api/v1")
 app.include_router(guardrails_router, prefix="/api/v1")
 app.include_router(alerts_router, prefix="/api/v1")
+app.include_router(credentials_router, prefix="/api/v1")
 app.include_router(trace.router, prefix="/api/v1")
 app.include_router(otel_router, prefix="/api/v1")
 app.include_router(agents_router, prefix="/api/v1")

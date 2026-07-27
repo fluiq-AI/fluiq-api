@@ -356,6 +356,68 @@ class ClickHouseQueryMixin:
     async def count_evaluations(self, organization_id: uuid.UUID) -> int:
         return await self.count_rows(organization_id, config.CLICKHOUSE_EVALUATIONS_TABLE)
 
+    async def count_security_scans(self, organization_id: uuid.UUID) -> int:
+        return await self.count_rows(organization_id, config.CLICKHOUSE_SECURITY_TABLE)
+
+    async def fetch_judge_usage(
+        self,
+        organization_id: uuid.UUID,
+        days: int = 30,
+    ) -> dict[str, Any]:
+        """Judge-token spend for an org, in total and split by evaluator.
+
+        Judge tokens are the only part of an evaluation whose cost varies —
+        with trace size, jury size, and judge model — so this is what a
+        usage-based price has to be built on. Row counts cannot substitute:
+        a jury writes one row and makes three calls.
+
+        ``judge_*`` columns hold the totals for a whole eval *message* on its
+        first row, with later rows of the same message carrying zeros (a jury's
+        calls are not divisible per metric). That makes SUM exact and any
+        per-row or AVG reading meaningless — hence the aggregation here rather
+        than in a caller.
+
+        Returns tokens, not money: what a token costs is a pricing decision
+        that changes, while the count is ground truth.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+
+        table = config.CLICKHOUSE_EVALUATIONS_TABLE
+        result = await self._client.query(  # type: ignore[attr-defined]
+            f"SELECT evaluator, "
+            f"       sum(judge_input_tokens)  AS input_tokens, "
+            f"       sum(judge_output_tokens) AS output_tokens, "
+            f"       sum(judge_calls)         AS judge_calls, "
+            # Distinct messages, not rows: this is the billable unit.
+            f"       uniqExact(trace_id)      AS eval_runs "
+            f"FROM {table} "
+            f"WHERE organization_id = {{org_id:UUID}} "
+            f"  AND ingested_at >= now('UTC') - INTERVAL {{days:UInt32}} DAY "
+            f"GROUP BY evaluator "
+            f"ORDER BY input_tokens + output_tokens DESC",
+            parameters={"org_id": str(organization_id), "days": int(days)},
+        )
+
+        by_evaluator = [
+            {
+                "evaluator":     row[0] or "",
+                "input_tokens":  int(row[1] or 0),
+                "output_tokens": int(row[2] or 0),
+                "judge_calls":   int(row[3] or 0),
+                "eval_runs":     int(row[4] or 0),
+            }
+            for row in (result.result_rows or [])
+        ]
+        return {
+            "window_days":   int(days),
+            "input_tokens":  sum(r["input_tokens"] for r in by_evaluator),
+            "output_tokens": sum(r["output_tokens"] for r in by_evaluator),
+            "judge_calls":   sum(r["judge_calls"] for r in by_evaluator),
+            "eval_runs":     sum(r["eval_runs"] for r in by_evaluator),
+            "by_evaluator":  by_evaluator,
+        }
+
     # ── Spending ────────────────────────────────────────────────────────────────
 
     async def fetch_spending_by_day(
@@ -1204,8 +1266,13 @@ WHERE organization_id = {{org_id:UUID}}
             await self.start()  # type: ignore[attr-defined]
         evals_target = evals_table or config.CLICKHOUSE_EVALUATIONS_TABLE
         params = {"org_id": str(organization_id), "tids": [str(t) for t in trace_ids]}
+        # NB: do NOT alias `toString(trace_id) AS trace_id` — in ClickHouse the
+        # SELECT alias shadows the raw UUID column in WHERE, so `trace_id IN
+        # {tids:Array(UUID)}` would compare the stringified id to UUIDs and match
+        # nothing. Left unaliased, WHERE binds the real column; the result is
+        # unpacked positionally below.
         result = await self._client.query(f"""  # type: ignore[attr-defined]
-SELECT toString(trace_id) AS trace_id, evaluator, metric, score, layer, run_score, run_passed
+SELECT toString(trace_id), evaluator, metric, score, layer, run_score, run_passed
 FROM {evals_target}
 WHERE organization_id = {{org_id:UUID}}
   AND trace_id IN {{tids:Array(UUID)}}
@@ -1223,6 +1290,45 @@ WHERE organization_id = {{org_id:UUID}}
             for tid, ev, metric, score, layer, run_score, run_passed in result.result_rows
         ]
 
+    async def fetch_run_judge_usage(
+        self,
+        organization_id: uuid.UUID,
+        trace_ids: list[str],
+        evals_table: Optional[str] = None,
+    ) -> dict[str, int]:
+        """Actual judge spend for one dataset run, summed over its trace ids.
+
+        Same contract as :meth:`fetch_judge_usage`: the ``judge_*`` columns carry
+        a whole eval message's totals on its first row and zeros on the rest, so
+        SUM is exact and per-row readings are meaningless.
+
+        Returns counts, not money, matching the rest of the product: a token
+        count is ground truth, while what it costs is a pricing decision.
+        """
+        empty = {"judge_calls": 0, "input_tokens": 0, "output_tokens": 0}
+        if not trace_ids:
+            return empty
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target = evals_table or config.CLICKHOUSE_EVALUATIONS_TABLE
+        result = await self._client.query(f"""  # type: ignore[attr-defined]
+SELECT sum(judge_calls)         AS judge_calls,
+       sum(judge_input_tokens)  AS input_tokens,
+       sum(judge_output_tokens) AS output_tokens
+FROM {target}
+WHERE organization_id = {{org_id:UUID}}
+  AND trace_id IN {{tids:Array(UUID)}}
+""", parameters={"org_id": str(organization_id), "tids": [str(t) for t in trace_ids]})
+        rows = result.result_rows or []
+        if not rows:
+            return empty
+        row = rows[0]
+        return {
+            "judge_calls":   int(row[0] or 0),
+            "input_tokens":  int(row[1] or 0),
+            "output_tokens": int(row[2] or 0),
+        }
+
     async def fetch_dataset_security_results(
         self,
         organization_id: uuid.UUID,
@@ -1237,8 +1343,10 @@ WHERE organization_id = {{org_id:UUID}}
             await self.start()  # type: ignore[attr-defined]
         sec_target = table or config.CLICKHOUSE_SECURITY_TABLE
         params = {"org_id": str(organization_id), "tids": [str(t) for t in trace_ids]}
+        # Unaliased trace_id — see fetch_dataset_eval_results: an `AS trace_id`
+        # alias shadows the UUID column in WHERE and matches nothing.
         result = await self._client.query(f"""  # type: ignore[attr-defined]
-SELECT toString(trace_id) AS trace_id, security_risk_level, security_risk_score, should_block,
+SELECT toString(trace_id), security_risk_level, security_risk_score, should_block,
        injection_detected, jailbreak_detected, skeleton_key_detected, secrets_detected,
        indirect_injection_detected, rag_poisoning_detected, tool_exfiltration_detected,
        tool_policy_violation_detected, cross_agent_injection_detected, image_injection_detected

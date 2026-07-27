@@ -8,11 +8,61 @@ services:
       - "8080:8080"
     env_file:
       - .env.development
+    # Local S3 (MinIO) for dataset imports. The API reaches MinIO internally at
+    # `minio:9000`, but presigned URLs are signed for `localhost:9000` so the
+    # browser (on the host) can PUT to it. In prod, leave all S3_* endpoint vars
+    # unset and set S3_UPLOADS_BUCKET to the real bucket.
+    environment:
+      S3_UPLOADS_BUCKET: fluiq-uploads
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_PUBLIC_ENDPOINT_URL: http://localhost:9100
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+      AWS_REGION: us-east-1
+    depends_on:
+      - minio
     volumes:
       - .:/app
     networks:
       - fluiq-ai
     restart: unless-stopped
+
+  # ── Local S3-compatible storage (dev only) ──
+  minio:
+    image: minio/minio
+    container_name: fluiq-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+      # Allow the dashboard origin to PUT uploads directly to MinIO from the browser.
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
+    ports:
+      - "9100:9000"   # S3 API (9000 is taken by ClickHouse on the host)
+      - "9101:9001"   # web console
+    volumes:
+      - minio-data:/data
+    networks:
+      - fluiq-ai
+    restart: unless-stopped
+
+  # Creates the uploads bucket once MinIO is up, then exits.
+  minio-init:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      sh -c "
+      until mc alias set local http://minio:9000 minioadmin minioadmin123; do echo 'waiting for minio'; sleep 1; done;
+      mc mb -p local/fluiq-uploads || true;
+      mc ilm rule add --expire-days 1 --prefix 'dataset-imports/' local/fluiq-uploads 2>/dev/null || mc ilm add --expiry-days 1 --prefix 'dataset-imports/' local/fluiq-uploads 2>/dev/null || true;
+      echo 'minio bucket + lifecycle ready'
+      "
+    networks:
+      - fluiq-ai
+
+volumes:
+  minio-data:
 
 networks:
   fluiq-ai:

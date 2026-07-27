@@ -78,6 +78,7 @@ POSTGRES_REVOKED_TOKEN_TABLE  = os.getenv("POSTGRES_REVOKED_TOKEN_TABLE")
 POSTGRES_PASSWORD_RESET_TABLE = os.getenv("POSTGRES_PASSWORD_RESET_TABLE")
 POSTGRES_GUARDRAILS_TABLE     = os.getenv("POSTGRES_GUARDRAILS_TABLE", "guardrail_policies")
 POSTGRES_ALERTS_TABLE         = os.getenv("POSTGRES_ALERTS_TABLE", "alert_settings")
+POSTGRES_CREDENTIALS_TABLE    = os.getenv("POSTGRES_CREDENTIALS_TABLE", "org_provider_credentials")
 
 SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL")
 SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME")
@@ -101,6 +102,33 @@ RENDER_DEPLOY_HOOK_URL = os.getenv("RENDER_DEPLOY_HOOK_URL")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
 S3_BLOG_MEDIA_BUCKET = os.getenv("S3_BLOG_MEDIA_BUCKET")
 S3_PRESIGN_TTL = int(os.getenv("S3_PRESIGN_TTL", "3600"))  # seconds
+# Bucket for user uploads (dataset imports). Defaults to the blog media bucket so
+# no new infra is required, but can point at a dedicated bucket in prod.
+S3_UPLOADS_BUCKET = os.getenv("S3_UPLOADS_BUCKET") or S3_BLOG_MEDIA_BUCKET
+# Optional S3-compatible endpoint override (e.g. MinIO for local dev). Empty in
+# prod → boto3 uses the regional AWS endpoint.
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL") or None
+# The endpoint used to SIGN presigned URLs the browser hits. With MinIO the API
+# reaches the server internally (S3_ENDPOINT_URL=http://minio:9000) but the
+# browser must hit it via a published host (http://localhost:9000), so the two
+# differ locally. Both empty in prod → the regional AWS endpoint is used for both.
+S3_PUBLIC_ENDPOINT_URL = os.getenv("S3_PUBLIC_ENDPOINT_URL") or None
+
+# ── Customer provider credentials (BYOK) ─────────────────────────────────────
+# Provider keys are envelope-encrypted (see shared/crypto.py): a per-credential
+# data key from KMS, AES-256-GCM ciphertext in Postgres, plaintext data key
+# never persisted. Recovering a key needs the DB row *and* kms:Decrypt, so an
+# RDS snapshot alone is inert.
+#
+# CREDENTIAL_KMS_KEY_ID is the CMK arn/alias; the ECS task role needs
+# kms:GenerateDataKey + kms:Decrypt on it. When unset, the BYOK surface is
+# disabled rather than degraded — there is deliberately no unencrypted path.
+#
+# The `local` backend exists only so the feature can be developed and tested
+# without AWS. It must be selected explicitly and needs a base64 32-byte key.
+CREDENTIAL_ENCRYPTION_BACKEND = os.getenv("CREDENTIAL_ENCRYPTION_BACKEND", "kms").lower()
+CREDENTIAL_KMS_KEY_ID = os.getenv("CREDENTIAL_KMS_KEY_ID")
+CREDENTIAL_ENCRYPTION_LOCAL_KEY = os.getenv("CREDENTIAL_ENCRYPTION_LOCAL_KEY")
 
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST")
 CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT"))

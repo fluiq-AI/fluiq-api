@@ -36,6 +36,7 @@ from db_queues.postgresql.prompts import (
     update_prompt,
 )
 from routes.auth.helper import extract_api_key, get_current_session
+from shared.placeholders import ANSWER_PLACEHOLDER_RE
 
 prompts_router = APIRouter()
 
@@ -113,14 +114,14 @@ async def save_prompt(
     session: dict = Depends(get_current_session),
 ):
     org_id = uuid.UUID(session["org_id"])
-    if payload.kind == "judge" and "$answer" not in payload.template:
+    if payload.kind == "judge" and not ANSWER_PLACEHOLDER_RE.search(payload.template):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
-                "A judge prompt must reference the $answer placeholder. "
-                "Use $question, $answer, and $context to inject the data under "
-                "evaluation, and ask the model to return a JSON object with a "
-                "numeric \"score\" (0-1) and a \"reason\"."
+                "A judge prompt must reference the {{answer}} placeholder. "
+                "Use {{question}}, {{answer}}, and {{context}} to inject the data "
+                "under evaluation, and ask the model to return a JSON object with "
+                "a numeric \"score\" (0-1) and a \"reason\"."
             ),
         )
     try:

@@ -4,8 +4,8 @@ GET  /alerts        — read this org's alert settings (JWT auth)
 PUT  /alerts        — save alert settings (JWT auth, plan-gated per section)
 POST /alerts/test   — send a test message to the Slack webhook (JWT auth)
 
-Eval alerts require Team+, security alerts require Growth+ — mirrors the
-pricing page (Slack anomaly alerts ship on Team, fluiq.secure() on Growth).
+Both require a paid plan — mirrors the pricing page, where Slack alerts
+ship from Starter up.
 """
 from __future__ import annotations
 
@@ -30,8 +30,10 @@ from shared import slack
 
 alerts_router = APIRouter()
 
-_EVAL_TIERS     = {"Team", "Growth", "Enterprise"}
-_SECURITY_TIERS = {"Growth", "Enterprise"}
+_EVAL_TIERS     = {"Starter", "Team", "Growth", "Enterprise"}
+# Security scanning is metered, not tier-gated (see routes/secure), so its
+# alerts follow the paid tiers rather than Growth alone.
+_SECURITY_TIERS = {"Starter", "Team", "Growth", "Enterprise"}
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -100,12 +102,12 @@ async def save_alerts(
     if payload.eval.enabled and tier not in _EVAL_TIERS:
         raise HTTPException(
             status.HTTP_402_PAYMENT_REQUIRED,
-            f"Eval alerts require Team plan or above (current: {tier}).",
+            f"Eval alerts require a paid plan (current: {tier}).",
         )
     if payload.security.enabled and tier not in _SECURITY_TIERS:
         raise HTTPException(
             status.HTTP_402_PAYMENT_REQUIRED,
-            f"Security alerts require Growth plan or above (current: {tier}).",
+            f"Security alerts require a paid plan (current: {tier}).",
         )
 
     settings = AlertSettings(

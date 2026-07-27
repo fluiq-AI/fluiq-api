@@ -1044,12 +1044,16 @@ async def infra_worker_scale(
 # LLM-as-Judge prompts (platform-global; edited here, read by the evaluator)
 # ---------------------------------------------------------------------------
 
-# Mirrors the worker's string.Template syntax: $var or ${var}.
-_PLACEHOLDER_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+# Mirrors the worker's placeholder scanner: the {{var}} standard plus the legacy
+# string.Template forms ($var / ${var}) that older saved prompts still use.
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}|\$\{(\w+)\}|\$(\w+)")
 
 
 def _template_identifiers(template: str) -> set[str]:
-    return {m.group(1) or m.group(2) for m in _PLACEHOLDER_RE.finditer(template)}
+    return {
+        m.group(1) or m.group(2) or m.group(3)
+        for m in _PLACEHOLDER_RE.finditer(template)
+    }
 
 
 class JudgePromptView(BaseModel):
