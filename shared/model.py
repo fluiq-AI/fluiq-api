@@ -5,7 +5,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
-UserType = Literal["Free", "Team", "Growth", "Enterprise", "Admin"]
+UserType = Literal["Free", "Starter", "Team", "Growth", "Enterprise", "Admin"]
 
 class UserModel(BaseModel):
     user_id: UUID

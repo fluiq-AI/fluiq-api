@@ -159,11 +159,16 @@ CREATE TABLE IF NOT EXISTS datasets (
     org_id      UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
     name        TEXT        NOT NULL,
     description TEXT,
+    -- 'single'  = single-prompt dataset (input/output + custom scorer).
+    -- 'agentic' = full-trajectory dataset (all inputs/outputs/tools/MCP calls).
+    kind        TEXT        NOT NULL DEFAULT 'agentic',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ,
     UNIQUE (org_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_datasets_org_id ON datasets(org_id);
+-- Existing datasets predate typing and are trajectory-capable → default 'agentic'.
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'agentic';
 
 CREATE TABLE IF NOT EXISTS dataset_examples (
     example_id      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -194,6 +199,13 @@ CREATE TABLE IF NOT EXISTS dataset_runs (
     finished_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_dataset_runs_dataset ON dataset_runs(dataset_id, created_at DESC);
+-- Judge model ("provider:model") this run graded with. Multi-model comparison
+-- launches one run per model, so this is what labels the columns in the report.
+ALTER TABLE dataset_runs ADD COLUMN IF NOT EXISTS model TEXT;
+-- Groups the runs launched together by one multi-model comparison, so the UI
+-- can tell when every model in a batch has finished.
+ALTER TABLE dataset_runs ADD COLUMN IF NOT EXISTS batch_id UUID;
+CREATE INDEX IF NOT EXISTS idx_dataset_runs_batch ON dataset_runs(batch_id);
 
 -- One row per example enrolled in a run. `trace_id` is the id the job was
 -- published under (the example's source trace, or a synthesized id for
@@ -221,6 +233,34 @@ CREATE TABLE IF NOT EXISTS dataset_agent_links (
     PRIMARY KEY (dataset_id, agent_key, agent_kind)
 );
 CREATE INDEX IF NOT EXISTS idx_dataset_agent_links_agent ON dataset_agent_links(org_id, agent_key, agent_kind);
+
+-- Custom scorers (client-defined LLM-as-judge prompts) saved to a dataset, so a
+-- dataset remembers its own scorers for future metrics runs. The prompt itself
+-- lives in the org-wide prompt library (prompts, kind='judge') and is reusable
+-- across datasets; this table just links a slug + threshold to the dataset.
+CREATE TABLE IF NOT EXISTS dataset_scorers (
+    dataset_id  UUID             NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
+    org_id      UUID             NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    slug        TEXT             NOT NULL,
+    threshold   DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    created_at  TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (dataset_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_dataset_scorers_dataset ON dataset_scorers(dataset_id);
+
+-- Per-dataset LLM-as-Judge prompt overrides. Lets two datasets grade the same
+-- built-in metric with different prompts (e.g. hallucination tuned per domain).
+-- Sent with the run as eval_config.judge_prompt_overrides; the evaluator applies
+-- them above the org → platform → default chain for that message only.
+CREATE TABLE IF NOT EXISTS dataset_judge_prompts (
+    dataset_id  UUID        NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
+    org_id      UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    name        TEXT        NOT NULL,
+    template    TEXT        NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (dataset_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_dataset_judge_prompts_dataset ON dataset_judge_prompts(dataset_id);
 
 -- Feedback collected when a user deletes their account.
 -- user_id is NOT a FK so the record survives after the user row is removed.
@@ -463,3 +503,45 @@ CREATE INDEX IF NOT EXISTS idx_org_invites_email ON organization_invitations(low
 -- user creates is stamped 'Free' here so it can be upgraded independently of
 -- any paid plan the creator holds on their home org.
 ALTER TABLE organizations ADD COLUMN IF NOT EXISTS plan_tier TEXT;
+-- ── Customer provider credentials (BYOK) ─────────────────────────────────────
+-- Envelope-encrypted OpenAI/Anthropic/etc. keys supplied by the customer, used
+-- to run their judge calls on their own provider account. See shared/crypto.py.
+--
+-- What is NOT here, deliberately: the plaintext key, and the plaintext data key
+-- that would decrypt it. `ciphertext` is AES-256-GCM under a per-credential DEK
+-- that only KMS can unwrap, with the org id bound in as additional
+-- authenticated data — so a row lifted into another org's context fails its tag
+-- check rather than decrypting. A leaked snapshot of this table is inert.
+--
+-- `fingerprint` is sha256(plaintext)[:16]: it dedupes re-pasted keys and scopes
+-- caches without being reversible. `last4` is display-only.
+CREATE TABLE IF NOT EXISTS org_provider_credentials (
+    credential_id    UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id           UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    provider         TEXT        NOT NULL
+                     CHECK (provider IN ('openai', 'anthropic', 'gemini', 'moonshot', 'azure_openai', 'bedrock')),
+    label            TEXT,
+    ciphertext       BYTEA       NOT NULL,
+    nonce            BYTEA       NOT NULL,
+    wrapped_dek      BYTEA       NOT NULL,
+    key_version      INTEGER     NOT NULL DEFAULT 1,
+    last4            TEXT        NOT NULL,
+    fingerprint      TEXT        NOT NULL,
+    status           TEXT        NOT NULL DEFAULT 'active'
+                     CHECK (status IN ('active', 'invalid', 'revoked')),
+    last_verified_at TIMESTAMPTZ,
+    last_error       TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Re-pasting the same key is an update, not a second row.
+    UNIQUE (org_id, provider, fingerprint)
+);
+-- The evaluator's hot path: "the active key for this org+provider".
+CREATE INDEX IF NOT EXISTS idx_org_provider_credentials_lookup
+    ON org_provider_credentials(org_id, provider, status);
+
+-- CREATE TABLE above only applies to fresh databases, so widen the provider
+-- list on any deployment that already created the table.
+ALTER TABLE org_provider_credentials DROP CONSTRAINT IF EXISTS org_provider_credentials_provider_check;
+ALTER TABLE org_provider_credentials ADD CONSTRAINT org_provider_credentials_provider_check
+    CHECK (provider IN ('openai', 'anthropic', 'gemini', 'moonshot', 'azure_openai', 'bedrock'));

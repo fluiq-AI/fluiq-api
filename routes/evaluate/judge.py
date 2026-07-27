@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import json
 import re
-from string import Template
 from typing import Any
 from config import ANTHROPIC_API_KEY
+from shared.placeholders import substitute
 
 SUPPORTED_METRICS = frozenset({
     "hallucination",
@@ -18,6 +18,10 @@ SUPPORTED_METRICS = frozenset({
     "toxicity",
     "coherence",
     "completeness",
+    # RAG retrieval quality. context_precision is single-shot here (question +
+    # retrieved context); context_recall needs a ground-truth reference and so
+    # lives only in the worker's dataset metrics runs, not this BYOK path.
+    "context_precision",
 })
 
 _SYSTEM = (
@@ -27,10 +31,13 @@ _SYSTEM = (
 
 _PROMPTS: dict[str, str] = {
     "hallucination": (
-        "Does the RESPONSE contain factual claims that are NOT supported by the PROMPT/CONTEXT? "
+        "Does the RESPONSE contain factual claims that are NOT supported by the "
+        "PROMPT or CONTEXT (and are not well-known facts)? "
         "Score 0.0 (severe hallucination — most claims are unsupported) to 1.0 "
-        "(no hallucination — every claim is grounded in the prompt or well-known facts).\n\n"
-        "PROMPT:\n{prompt}\n\nRESPONSE:\n{response}\n\n"
+        "(no hallucination — every claim is grounded in the prompt, the context, "
+        "or well-known facts). The CONTEXT may include tool / MCP results the "
+        "agent retrieved — treat those as ground truth the agent had available.\n\n"
+        "PROMPT:\n{prompt}\n\nCONTEXT:\n{context}\n\nRESPONSE:\n{response}\n\n"
         'Return JSON: {{"score": float, "reason": str}}'
     ),
     "faithfulness": (
@@ -63,6 +70,14 @@ _PROMPTS: dict[str, str] = {
         "Does the RESPONSE fully answer the QUESTION without omitting key information? "
         "Score 0.0 (no answer given) to 1.0 (comprehensive and complete).\n\n"
         "QUESTION:\n{prompt}\n\nRESPONSE:\n{response}\n\n"
+        'Return JSON: {{"score": float, "reason": str}}'
+    ),
+    "context_precision": (
+        "Given the QUESTION and the retrieved CONTEXT, how precise and relevant is "
+        "the CONTEXT for answering the question? "
+        "Score 0.0 (context is irrelevant or mostly noise) to 1.0 "
+        "(context is on-point and sufficient to answer).\n\n"
+        "QUESTION:\n{prompt}\n\nCONTEXT:\n{context}\n\n"
         'Return JSON: {{"score": float, "reason": str}}'
     ),
 }
@@ -165,18 +180,22 @@ def run_custom_judges(
 ) -> dict[str, dict[str, Any]]:
     """Run client-defined judge prompts referenced by slug.
 
-    ``judges`` maps ``{slug: template}`` where the template uses ``string.Template``
-    ``$question`` / ``$answer`` / ``$context`` placeholders. Returns
+    ``judges`` maps ``{slug: template}`` where the template uses
+    ``{{question}}`` / ``{{answer}}`` / ``{{context}}`` placeholders (the legacy
+    ``$answer`` form still substitutes). Returns
     ``{slug: {"score": float, "reason": str}}`` mirroring :func:`run_metrics`.
     """
     results: dict[str, dict[str, Any]] = {}
     for slug, template in judges.items():
         if not template or not template.strip():
             continue
-        rendered = Template(_ensure_output_contract(template)).safe_substitute(
-            question=prompt,
-            answer=response,
-            context=context or prompt,
+        rendered = substitute(
+            _ensure_output_contract(template),
+            {
+                "question": prompt,
+                "answer":   response,
+                "context":  context or prompt,
+            },
         )
         try:
             raw = _call_anthropic(rendered, judge_model)

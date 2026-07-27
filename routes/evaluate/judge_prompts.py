@@ -13,7 +13,6 @@ override row.
 """
 from __future__ import annotations
 
-import re
 import uuid
 from datetime import datetime
 from typing import List, Optional
@@ -30,15 +29,11 @@ from db_queues.postgresql.eval_prompts_org import (
     upsert_org_judge_prompt,
 )
 from routes.auth.helper import get_current_session
+from shared.placeholders import identifiers
 
 judge_prompts_router = APIRouter()
 
-# $var or ${var} — must match the worker's string.Template identifier scan.
-_IDENT_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
-
-
-def _identifiers(template: str) -> set[str]:
-    return {m.group(1) or m.group(2) for m in _IDENT_RE.finditer(template)}
+_identifiers = identifiers
 
 
 class OrgJudgePromptView(BaseModel):
@@ -86,7 +81,7 @@ def _validate_template(prompt_row: dict, template: str) -> None:
             status_code=400,
             detail=(
                 "Template is missing required placeholder(s): "
-                + ", ".join(f"${{{m}}}" for m in missing)
+                + ", ".join("{{" + m + "}}" for m in missing)
             ),
         )
 

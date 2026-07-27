@@ -12,7 +12,8 @@ The org's GuardrailPolicy is fetched (60 s cache) and:
   - block_threshold    → sent to the worker; 'medium' lowers the block bar
   - alert_webhook      → POSTed asynchronously on every block
 
-Requires Growth tier or above (see ``_SECURE_TIERS``).
+Metered by scan volume per plan (see ``shared.quotas.TIER_SECURITY_QUOTAS``);
+available on every plan including Free.
 """
 from __future__ import annotations
 
@@ -26,33 +27,42 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 import config
-from db_queues.postgresql.auth import resolve_api_key, get_org_tier
+from db_queues.postgresql.auth import resolve_api_key
+from shared.quotas import get_quota_status
 from db_queues.postgresql.guardrails import get_policy, GuardrailPolicy
 from db_queues.kafka import kafka_queue, wait_for_reply
 from routes.auth.helper import extract_api_key
 from shared.net import is_safe_public_url
+from shared.ids import coerce_trace_uuid
 from . import scanners
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_SECURE_TIERS = {"Growth", "Enterprise"}
-
-
 async def _resolve_and_gate(api_key: str) -> tuple:
+    """Resolve the caller and check their security-scan allowance.
+
+    Metered by volume rather than gated by tier. Scanning costs us regex and
+    NER time, not tokens, so locking it behind the second-most-expensive plan
+    priced the cheapest thing we run as if it were the most expensive — and
+    meant nobody could try the one pillar our competitors do not ship at all.
+    Every plan including Free gets a real allowance; volume is what you pay for.
+    """
     if not api_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key required")
     resolved = await resolve_api_key(api_key)
     if resolved is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
     org_id, prefix, _key_id = resolved
-    tier = await get_org_tier(org_id) or "Free"
-    if tier not in _SECURE_TIERS:
+
+    status_ = await get_quota_status(org_id)
+    if status_.security_over:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail=(
-                f"fluiq.secure() requires Growth plan or above "
-                f"(current plan: {tier}). Upgrade at getfluiq.com/dashboard."
+                f"Monthly security-scan allowance used "
+                f"({status_.security_count:,} / {status_.security_quota:,} on "
+                f"{status_.tier}). Upgrade at getfluiq.com/dashboard."
             ),
         )
     return org_id, prefix
@@ -173,7 +183,7 @@ async def _publish_blocked_trace(
         if context:
             event.update({k: v for k, v in context.items() if v is not None})
         event.update({
-            "trace_id":     trace_id,
+            "trace_id":     coerce_trace_uuid(trace_id) or trace_id,
             "type":         "llm",
             "status":       "blocked",
             "success":      False,

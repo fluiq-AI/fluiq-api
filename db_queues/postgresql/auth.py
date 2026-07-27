@@ -17,6 +17,7 @@ API_KEY_PREFIX_LENGTH = 11
 
 API_KEY_LIMITS: dict[str, int] = {
     "Free": 1,
+    "Starter": 3,
     "Team": 5,
     "Growth": 15,
     "Enterprise": 50,
@@ -195,14 +196,16 @@ async def get_organization(org_id: uuid.UUID) -> Optional[OrganizationModel]:
     return OrganizationModel(**dict(row))
 
 
-# Self-serve trial config. Team & Growth can be trialed for 5 days without a
-# card; the trial reverts to Free on expiry. Enterprise is sales-led (no trial).
+# Self-serve trial config. Starter, Team & Growth can be trialed for 5 days
+# without a card; the trial reverts to Free on expiry. Enterprise is sales-led
+# (no trial). Keep in sync with TRIALABLE_TIERS in the frontend's
+# UpgradePlanButton.
 TRIAL_DAYS = 5
-TRIALABLE_TIERS = frozenset({"Team", "Growth"})
+TRIALABLE_TIERS = frozenset({"Starter", "Team", "Growth"})
 
 
 async def get_org_tier(org_id: uuid.UUID) -> Optional[str]:
-    """Return the tier (`Free` / `Team` / `Growth` / `Enterprise`) for an org.
+    """Return the tier (`Free` / `Starter` / `Team` / `Growth` / `Enterprise`).
 
     Effective tier is ``organizations.plan_tier`` when set, else the org owner's
     ``users.user_type`` row (the legacy path). Returns ``None`` if the org or its

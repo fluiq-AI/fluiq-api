@@ -30,7 +30,7 @@ async def begin_trial(
     body: StartTrialRequest,
     session: dict = Depends(get_current_session),
 ) -> StartTrialResponse:
-    """Start a self-serve 5-day trial of a paid plan (Team / Growth), no card.
+    """Start a self-serve 5-day trial of a paid plan (Starter / Team / Growth), no card.
 
     The org owner is flipped to the requested tier with a ``trial_ends_at`` set
     5 days out; ``get_org_tier`` reverts it to Free on expiry. Eligibility is
