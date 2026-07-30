@@ -77,10 +77,12 @@ logger = logging.getLogger(__name__)
 app = FastAPI(lifespan=lifespan)
 
 _allowed_origins: list[str] = []
-if config.FRONTEND_BASE_URL:
-    _allowed_origins.append(config.FRONTEND_BASE_URL)
-    if config.FRONTEND_BASE_URL.startswith("https://") and not config.FRONTEND_BASE_URL.startswith("https://www."):
-        _allowed_origins.append("https://www." + config.FRONTEND_BASE_URL.removeprefix("https://"))
+if config.FRONTEND_BASE_URLS:
+    _allowed_origins: list[str] = []
+    for base_url in config.FRONTEND_BASE_URLS:
+        _allowed_origins.append(base_url)
+        if base_url.startswith("https://") and not base_url.startswith("https://www."):
+            _allowed_origins.append("https://www." + base_url.removeprefix("https://"))
 
 # Localhost origins are allowed so (a) the frontend prerender step — which runs
 # in a headless browser on 127.0.0.1:<random-port> during the build and fetches
