@@ -78,7 +78,6 @@ app = FastAPI(lifespan=lifespan)
 
 _allowed_origins: list[str] = []
 if config.FRONTEND_BASE_URLS:
-    _allowed_origins: list[str] = []
     for base_url in config.FRONTEND_BASE_URLS:
         _allowed_origins.append(base_url)
         if base_url.startswith("https://") and not base_url.startswith("https://www."):
