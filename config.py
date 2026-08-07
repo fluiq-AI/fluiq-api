@@ -86,13 +86,16 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 
 PASSWORD_RESET_OTP_LENGTH = int(os.getenv("PASSWORD_RESET_OTP_LENGTH"))
 PASSWORD_RESET_EXPIRE_MINUTES = int(os.getenv("PASSWORD_RESET_EXPIRE_MINUTES"))
-# FRONTEND_BASE_URL = (os.getenv("FRONTEND_BASE_URL") or "").rstrip("/")
-
 FRONTEND_BASE_URLS: list[str] = [
     url.strip().rstrip("/")
     for url in os.getenv("FRONTEND_BASE_URLS", "").split(",")
     if url.strip()
 ]
+
+# Every entry above is CORS-allowed, but links we *generate* — password-reset
+# emails, OAuth redirects, invite links, Slack alert links — have to pick one.
+# The first entry is the canonical domain.
+FRONTEND_BASE_URL = FRONTEND_BASE_URLS[0] if FRONTEND_BASE_URLS else ""
 
 # Render "Deploy Hook" URL for the frontend static site. When a blog post is
 # published / updated / unpublished we POST here to trigger a rebuild, which
