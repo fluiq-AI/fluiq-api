@@ -36,7 +36,6 @@ _EVENT_TYPE_MAP: list[tuple[str, str, str]] = [
     ("POST",   "/api/v1/secure", "security_check"),
     ("POST",   "/api/v1/evaluate", "eval_run"),
     ("POST",   "/api/v1/trace",  "llm_call"),
-    ("POST",   "/api/v1/optimize", "optimize_call"),
     ("POST",   "/admin",         "admin_action"),
     ("DELETE", "/admin",         "admin_action"),
 ]

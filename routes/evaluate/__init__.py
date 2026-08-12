@@ -20,7 +20,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 import config
@@ -1147,4 +1147,63 @@ async def evaluate_trace_metrics(
     )
 
 
-__all__ = ["evaluate_router", "EvaluateRequest", "EvaluateResponse"]
+# ── GET /evaluate/recent-evals  (CI eval gate, API key auth) ──────────────────
+#
+# Moved here from /api/v1/optimize/evals when the optimization pillar was
+# removed; it was always an evaluation endpoint that happened to live under the
+# optimize prefix.
+
+class EvalEntry(BaseModel):
+    trace_id: Optional[str]
+    metric: str
+    score: Optional[float]
+    evaluator: str
+    judge_model: str
+
+
+class RecentEvalsResponse(BaseModel):
+    window_minutes: int
+    total: int
+    passed: int
+    failed: int
+    avg_score: Optional[float]
+    entries: List[EvalEntry]
+
+
+@evaluate_router.get("/evaluate/recent-evals", response_model=RecentEvalsResponse)
+async def get_recent_evals(
+    api_key: Optional[str] = Depends(extract_api_key),
+    window_minutes: int = Query(default=30, ge=1, le=1440),
+    threshold: float = Query(default=0.7, ge=0.0, le=1.0),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> RecentEvalsResponse:
+    """Return evaluation scores for the last ``window_minutes`` of traces.
+
+    Designed for CI eval gates.  The caller passes ``threshold`` and
+    inspects ``failed`` > 0 to decide whether to block the PR.
+
+    Auth: SDK API key in ``x-api-key`` header (no login required — safe for CI).
+    No tier gating — all accounts with at least one evaluation can use this.
+    """
+    org_id = await _resolve_org(api_key or "")
+    rows = await clickhouse_client.fetch_recent_evals(
+        organization_id=org_id,
+        window_minutes=window_minutes,
+        limit=limit,
+    )
+    entries = [EvalEntry(**r) for r in rows]
+    scores = [e.score for e in entries if e.score is not None]
+    passed = sum(1 for s in scores if s >= threshold)
+    failed = sum(1 for s in scores if s < threshold)
+    avg_score = (sum(scores) / len(scores)) if scores else None
+    return RecentEvalsResponse(
+        window_minutes=window_minutes,
+        total=len(entries),
+        passed=passed,
+        failed=failed,
+        avg_score=round(avg_score, 4) if avg_score is not None else None,
+        entries=entries,
+    )
+
+
+__all__ = ["evaluate_router", "EvaluateRequest", "EvaluateResponse", "RecentEvalsResponse", "EvalEntry"]

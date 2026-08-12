@@ -152,8 +152,6 @@ CLICKHOUSE_AUDIT_TABLE       = os.getenv("CLICKHOUSE_AUDIT_TABLE", "audit_log")
 AUDIT_HMAC_SECRET            = os.getenv("AUDIT_HMAC_SECRET", "change-me-in-production")
 
 REDIS_URL = os.getenv("REDIS_URL")
-REDIS_SDK_URL = os.getenv("REDIS_SDK_URL") or REDIS_URL
-REDIS_DEFAULT_TTL_SECONDS = int(os.getenv("REDIS_DEFAULT_TTL_SECONDS"))
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
