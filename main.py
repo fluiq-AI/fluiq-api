@@ -21,7 +21,6 @@ from routes.guardrails import guardrails_router
 from routes.evaluate import evaluate_router
 from routes.evaluate.judge_prompts import judge_prompts_router
 from routes.feedback import feedback_router
-from routes.optimize import optimize_router
 from routes.datasets import datasets_router
 from routes.prompts import prompts_router
 from routes.quota import quota_router
@@ -179,7 +178,6 @@ app.include_router(judge_prompts_router, prefix="/api/v1")
 app.include_router(feedback_router, prefix="/api/v1")
 app.include_router(prompts_router, prefix="/api/v1")
 app.include_router(datasets_router, prefix="/api/v1")
-app.include_router(optimize_router, prefix="/api/v1/optimize")
 app.include_router(secure_router, prefix="/api/v1")
 app.include_router(demo_router, prefix="/api/v1")
 app.include_router(contact_router, prefix="/api/v1")

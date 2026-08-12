@@ -24,7 +24,6 @@ for _k, _v in [
     ("PASSWORD_RESET_OTP_LENGTH", "6"),
     ("PASSWORD_RESET_EXPIRE_MINUTES", "15"),
     ("CLICKHOUSE_PORT", "8123"),
-    ("REDIS_DEFAULT_TTL_SECONDS", "300"),
     ("KAFKA_SECURITY_CHECK_TIMEOUT", "30"),
 ]:
     os.environ.setdefault(_k, _v)
