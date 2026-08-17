@@ -149,6 +149,12 @@ CLICKHOUSE_TRACE_COSTS_TABLE = os.getenv("CLICKHOUSE_TRACE_COSTS_TABLE")
 CLICKHOUSE_EVALUATIONS_TABLE = os.getenv("CLICKHOUSE_EVALUATIONS_TABLE")
 CLICKHOUSE_SECURITY_TABLE    = os.getenv("CLICKHOUSE_SECURITY_TABLE")
 CLICKHOUSE_AUDIT_TABLE       = os.getenv("CLICKHOUSE_AUDIT_TABLE", "audit_log")
+# Defaulted rather than required: tags arrived after the other tables, and an
+# older deployment's env file has no entry for it.
+CLICKHOUSE_TRACE_TAGS_TABLE  = os.getenv("CLICKHOUSE_TRACE_TAGS_TABLE", "fluiq.trace_tags")
+CLICKHOUSE_REVIEW_FLAGS_TABLE = os.getenv(
+    "CLICKHOUSE_REVIEW_FLAGS_TABLE", "fluiq.review_flags",
+)
 AUDIT_HMAC_SECRET            = os.getenv("AUDIT_HMAC_SECRET", "change-me-in-production")
 
 REDIS_URL = os.getenv("REDIS_URL")

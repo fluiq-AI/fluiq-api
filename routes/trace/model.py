@@ -22,6 +22,9 @@ class TraceRecord(BaseModel):
     cost: float | None = None
     currency: str | None = None
     evaluations: list[EvaluationScore] = []
+    # Labels, from the SDK at call time or the dashboard afterwards. Populated
+    # per page rather than per row — see list_traces.
+    tags: list[str] = []
 
 
 class TraceListResponse(BaseModel):

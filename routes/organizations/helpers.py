@@ -58,7 +58,17 @@ async def _build_session(user_id: uuid.UUID, org_id: uuid.UUID) -> LoginResponse
     organization = await get_organization(org_id)
     if user is None or organization is None:
         raise HTTPException(status_code=404, detail="Account or organization not found")
-    access_token, expires_in = _create_access_token(user_id=str(user_id), org_id=str(org_id))
+    # Switching org can change the caller's role, so the new token carries
+    # the role in the org being switched *to*.
+    from shared.permissions import role_of
+    _role = None
+    try:
+        _role = await role_of(str(user_id), org_id if isinstance(org_id, uuid.UUID) else uuid.UUID(str(org_id)))
+    except Exception:  # noqa: BLE001
+        pass
+    access_token, expires_in = _create_access_token(
+        user_id=str(user_id), org_id=str(org_id), role=_role,
+    )
     refresh_token, refresh_expires_in = _create_refresh_token(
         user_id=str(user_id), org_id=str(org_id)
     )

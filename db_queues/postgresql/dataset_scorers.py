@@ -1,8 +1,10 @@
 """PostgreSQL helpers for dataset-scoped custom scorers.
 
-A custom scorer is a client-defined LLM-as-judge prompt (``prompts`` row with
-``kind='judge'``) that a dataset remembers for its metrics runs. The prompt is
-org-wide and reusable; this table links a slug + threshold to a dataset.
+A custom scorer is a client-defined check that a dataset remembers for its
+metrics runs — either an LLM-as-judge prompt (``prompts`` row with
+``kind='judge'``) or a deterministic expression (``kind='code'``). Both are
+org-wide and reusable; this table links a slug + threshold to a dataset, and the
+evaluator routes on the prompt row's kind.
 """
 from __future__ import annotations
 
@@ -29,10 +31,12 @@ async def list_dataset_scorers(dataset_id: uuid.UUID, org_id: uuid.UUID) -> List
         rows = await conn.fetch(
             """
             SELECT s.slug, s.threshold, s.created_at,
-                   p.name AS name, p.template AS template
+                   p.name AS name, p.template AS template, p.kind AS kind,
+                   p.config AS config
             FROM dataset_scorers s
             LEFT JOIN prompts p
-              ON p.org_id = s.org_id AND p.slug = s.slug AND p.kind = 'judge'
+              ON p.org_id = s.org_id AND p.slug = s.slug
+             AND p.kind IN ('judge', 'code')
             WHERE s.dataset_id = $1 AND s.org_id = $2
             ORDER BY s.created_at
             """,

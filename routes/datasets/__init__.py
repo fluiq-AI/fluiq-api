@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 import config
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from db_queues.clickhouse import clickhouse_client
 from db_queues.kafka import kafka_queue, wait_for_playground_reply
@@ -45,8 +45,10 @@ from db_queues.postgresql.dataset_runs import (
     link_agent,
     list_agent_links,
     list_runs,
+    record_generation,
     unlink_agent,
 )
+from . import task_runner
 from db_queues.postgresql.dataset_scorers import (
     dataset_owned,
     delete_dataset_judge_prompt,
@@ -67,6 +69,8 @@ from routes.auth.helper import extract_api_key, get_current_session
 # Reuse the org judge-prompt editor's validator so the two paths can't drift on
 # what makes an override safe (non-empty, keeps every required placeholder).
 from routes.evaluate.judge_prompts import _validate_template as _validate_judge_template
+from shared.choice_scores import ChoiceError, parse_choices
+from shared.code_scorer import ScorerError, compile_scorer
 from shared.placeholders import ANSWER_PLACEHOLDER_RE
 from shared.quotas import bump_eval_count, get_quota_status
 from shared.dataset_media import store_trajectory_media, hydrate_trajectory_media
@@ -74,6 +78,19 @@ from shared import s3
 
 datasets_router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Strong references to in-flight background generations. The event loop only
+# holds a weak reference to a task, so without this a run's generation can be
+# garbage-collected mid-flight and silently cancelled — the run would then sit
+# at "running" with no error to explain it.
+_BACKGROUND_RUNS: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> None:
+    """Run a coroutine detached from the request, keeping it alive until done."""
+    task = asyncio.create_task(coro)
+    _BACKGROUND_RUNS.add(task)
+    task.add_done_callback(_BACKGROUND_RUNS.discard)
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -139,9 +156,65 @@ RUN_METRICS = frozenset({
 })
 
 
+class RunTaskRequest(BaseModel):
+    """The thing being evaluated: a prompt + model executed against every example.
+
+    Either reference a saved prompt (``prompt_id``, optionally pinned to
+    ``prompt_version``) or supply an inline ``template``. Omitting the task
+    entirely keeps the legacy behaviour — grade the output the example already
+    carries.
+    """
+    prompt_id:      Optional[uuid.UUID] = None
+    # Slug is the CI-friendly reference: it is what a prompt is called in a repo,
+    # and it resolves whether or not the prompt has been deployed.
+    prompt_slug:    Optional[str]       = None
+    prompt_version: Optional[int]       = None
+    template:       Optional[str]       = None
+    system:         Optional[str]       = None
+    model:          Optional[str]       = None
+    max_tokens:     int                 = 2048
+    # A whole conversation instead of one prompt — including simulated assistant
+    # turns, so a multi-turn exchange can be evaluated as one thing.
+    messages:       Optional[List[Dict[str, str]]] = None
+    # Tools the model may call. A tool request is recorded as the output, which
+    # is what makes tool *selection* scorable.
+    tools:          Optional[List[Dict[str, Any]]] = None
+    # Further steps, each fed the previous one's output as {{previous}} — a
+    # chain evaluated end to end rather than one prompt at a time.
+    steps:          Optional[List[Dict[str, Any]]] = None
+
+    @model_validator(mode="after")
+    def _needs_a_source(self) -> "RunTaskRequest":
+        if (
+            self.prompt_id is None
+            and not (self.prompt_slug or "").strip()
+            and not (self.template or "").strip()
+            and not self.messages
+        ):
+            raise ValueError(
+                "task needs a prompt_id, a prompt_slug, a template, or messages"
+            )
+        return self
+
+
 class CreateRunRequest(BaseModel):
     kind:  str                      # 'agentic' | 'security' | 'metrics'
     depth: Optional[str] = None     # agentic depth: fast | standard | deep
+    # When present, the run first EXECUTES this prompt+model against every
+    # example and grades the fresh output. When absent, it grades the output the
+    # example already carries (a recorded trace response or expected_output).
+    task:  Optional[RunTaskRequest] = None
+    # Experiment identity: what this run was, so a list of runs reads as a list
+    # of experiments rather than a list of timestamps.
+    name:        Optional[str] = None
+    description: Optional[str] = None
+    # Labels on the run, so a history of experiments is sliceable the way traces
+    # are — "every run tagged baseline", "everything from the pricing sprint".
+    tags:        List[str] = Field(default_factory=list)
+    # Run every example this many times and average. A judge is a model, so two
+    # runs on identical input disagree; averaging N trials turns that variance
+    # from a mystery into a number you chose the size of.
+    trials:      int = Field(1, ge=1, le=10)
     # Judge selection as "provider:model" (e.g. "anthropic:claude-sonnet-5"),
     # applied to every example in the run. Omitted uses the server default.
     # Batch runs are where judge choice costs the most: the model is paid for
@@ -711,21 +784,89 @@ async def _launch_run(org_id: uuid.UUID, dataset_id: uuid.UUID, payload: CreateR
     judge_prompt_overrides: Dict[str, str] = {}
     if payload.kind in ("metrics", "agentic"):
         judge_prompt_overrides = await list_dataset_judge_prompts(dataset_id, org_id)
+
+    # ── Resolve the task, if this run has one ──
+    # Both resolution and key lookup happen BEFORE the run row exists, so a
+    # misconfigured task fails the request with a usable message instead of
+    # creating a run that then fails on every example.
+    task: Optional[task_runner.ResolvedTask] = None
+    provider = key = ""
+    if payload.task is not None:
+        try:
+            task = await task_runner.resolve_task(
+                org_id,
+                model=payload.task.model,
+                template=payload.task.template,
+                system=payload.task.system,
+                max_tokens=payload.task.max_tokens,
+                prompt_id=payload.task.prompt_id,
+                prompt_slug=payload.task.prompt_slug,
+                prompt_version=payload.task.prompt_version,
+                messages=payload.task.messages,
+                tools=payload.task.tools,
+                steps=payload.task.steps,
+            )
+            provider, key = await task_runner.resolve_key(org_id, task.model)
+        except task_runner.TaskError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            )
+
     # For metrics runs the kind-specific config column records which metrics
     # ran (the way `depth` records the agentic depth).
     depth = ",".join(run_metrics) if payload.kind == "metrics" else payload.depth
     # Record the judge model so a multi-model comparison can label each run.
     run = await create_run(
         org_id, dataset_id, payload.kind, depth, payload.judge, payload.batch_id,
+        task=task.to_json() if task else None,
+        name=(payload.name or "").strip() or None,
+        description=(payload.description or "").strip() or None,
+        tags=[t.strip().lower() for t in (payload.tags or []) if t and t.strip()][:10],
     )
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
     run_id = run["run_id"]
 
-    examples = await list_examples(dataset_id, org_id, limit=500)
+    # The task cap bounds how many provider calls one launch can make, so trials
+    # have to count against it — otherwise 500 examples at 10 trials would fire
+    # 5,000 generations through a ceiling meant to stop exactly that.
+    trials = max(1, min(int(payload.trials or 1), 10)) if task else 1
+    examples = await list_examples(
+        dataset_id, org_id,
+        limit=(task_runner.MAX_TASK_EXAMPLES // trials) if task else 500,
+    )
     if not examples:
         await finalize_run(run_id, org_id, "complete", {"total": 0, "completed": 0})
         return _serialize_run({**run, "item_count": 0})
+
+    # ── Task runs: enroll every example, then generate in the background ──
+    # Generation is N provider calls; doing it inline would hold the request open
+    # for minutes on a large dataset. Items are written first so the report can
+    # show real progress from the moment the launch returns.
+    if task is not None:
+        # Trials are expanded here rather than inside generation, so each is a
+        # genuinely independent call — re-scoring one output N times would
+        # measure the judge's variance while hiding the task's.
+        expanded = [ex for ex in examples for _ in range(trials)]
+        task_items = [(ex["example_id"], str(uuid.uuid4()), "task") for ex in expanded]
+        await add_run_items(run_id, org_id, task_items)
+        _spawn(_generate_and_score(
+            org_id=org_id,
+            run_id=run_id,
+            task=task,
+            provider=provider,
+            key=key,
+            kind=payload.kind,
+            examples=expanded,
+            trace_ids=[t[1] for t in task_items],
+            run_metrics=run_metrics,
+            custom_judges=custom_judges,
+            judge_prompt_overrides=judge_prompt_overrides,
+            judge=payload.judge,
+        ))
+        return _serialize_run({
+            **run, "total": len(task_items), "item_count": len(task_items),
+        })
 
     items: List[tuple] = []
     for ex in examples:
@@ -864,6 +1005,175 @@ async def _launch_run(org_id: uuid.UUID, dataset_id: uuid.UUID, payload: CreateR
     return _serialize_run({**run, "total": len(items), "item_count": len(items)})
 
 
+# ── Task generation (background) ──────────────────────────────────────────────
+
+def _task_event(trace_id: str, model: str, rendered: str, output: str) -> dict:
+    """Shape a task generation as the LLM event the eval/security workers read.
+
+    A task run is always a single fresh turn — there is no trajectory to
+    reconstruct — so this is deliberately the simplest event the workers accept.
+    """
+    return {
+        "trace_id":      trace_id,
+        "root_trace_id": trace_id,
+        "type":          "llm",
+        "integration":   "DATASET_TASK",
+        "model":         model,
+        "input":         rendered,
+        "response":      output,
+    }
+
+
+async def _publish_task_score(
+    *,
+    org_id: uuid.UUID,
+    kind: str,
+    trace_id: str,
+    event: dict,
+    expected: str,
+    run_metrics: List[str],
+    custom_judges: Dict[str, float],
+    judge_prompt_overrides: Dict[str, str],
+    judge: Optional[str],
+    example_metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Publish the scoring job for one freshly generated task output."""
+    if kind == "security":
+        await kafka_queue.add_job(
+            {
+                "operation":       "sdk_security",
+                "organization_id": str(org_id),
+                "trace_id":        trace_id,
+                "event":           event,
+                "security_config": {"guardrail": "default"},
+            },
+            topic=config.KAFKA_SECURITY_TOPIC,
+            key=str(org_id),
+        )
+        return
+
+    # 'agentic' over a task produces one turn, not a trajectory, so both quality
+    # kinds grade it with the standard LLM metrics — the same fallback the
+    # synthetic-example path already uses.
+    metrics = run_metrics if kind == "metrics" else ["hallucination", "relevance"]
+    job: Dict[str, Any] = {
+        "operation":       "sdk_llm",
+        "organization_id": str(org_id),
+        "trace_id":        trace_id,
+        "event":           event,
+        "eval_config": {
+            "metrics":                metrics,
+            "custom_judges":          custom_judges,
+            "judge_prompt_overrides": judge_prompt_overrides,
+        },
+    }
+    # A code scorer can branch on the example's own columns ("gold-tier replies
+    # must mention the account manager"), so the row's metadata rides along.
+    # Scalars only: nested structures are not addressable from a scorer anyway.
+    if example_metadata:
+        scalars = {
+            k: v for k, v in example_metadata.items()
+            if isinstance(v, (str, int, float, bool))
+        }
+        if scalars:
+            job["eval_config"]["example_metadata"] = scalars
+    if judge:
+        job["judge"] = judge
+    # The expected output is the reference the factual metrics grade against.
+    # Unlike the legacy path there is no self-comparison risk here: the answer
+    # was just generated by the task, so it is never the expected output.
+    if expected:
+        job["reference"] = expected
+    await kafka_queue.add_job(job, topic=config.KAFKA_EVAL_TOPIC, key=str(org_id))
+    bump_eval_count(org_id)
+
+
+async def _generate_and_score(
+    *,
+    org_id: uuid.UUID,
+    run_id: uuid.UUID,
+    task: task_runner.ResolvedTask,
+    provider: str,
+    key: str,
+    kind: str,
+    examples: List[dict],
+    trace_ids: List[str],
+    run_metrics: List[str],
+    custom_judges: Dict[str, float],
+    judge_prompt_overrides: Dict[str, str],
+    judge: Optional[str],
+) -> None:
+    """Execute the task against every example, then queue each output for scoring.
+
+    Runs detached from the request. Every example is isolated: a provider error
+    on one is recorded against that item and the rest of the run proceeds, so a
+    single rate-limit or content refusal never costs the whole run.
+    """
+    gate = task_runner.semaphore()
+
+    async def one(example: dict, trace_id: str) -> None:
+        async with gate:
+            meta = example.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:  # noqa: BLE001
+                    meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+
+            gen = await task_runner.generate(task, key, provider, example, meta)
+            # An empty completion has nothing to grade. Treating it as a failure
+            # here — before the single bookkeeping write — keeps it out of the
+            # scoring denominator so the run can still finalize.
+            if gen.ok and not (gen.output or "").strip():
+                gen.error = "Task returned an empty response."
+
+            try:
+                await record_generation(
+                    run_id, org_id, trace_id,
+                    output=gen.output if gen.ok else None,
+                    error=gen.error,
+                    latency_ms=gen.latency_ms,
+                    input_tokens=gen.input_tokens,
+                    output_tokens=gen.output_tokens,
+                    cost_usd=gen.cost_usd,
+                )
+            except Exception:  # noqa: BLE001 — a bookkeeping write must not stop scoring
+                logger.exception(
+                    "[DATASET] generation record failed run=%s trace=%s", run_id, trace_id
+                )
+
+            if not gen.ok:
+                return
+
+            try:
+                await _publish_task_score(
+                    org_id=org_id,
+                    kind=kind,
+                    trace_id=trace_id,
+                    event=_task_event(trace_id, task.model, gen.rendered, gen.output),
+                    expected=str(example.get("expected_output") or "").strip(),
+                    run_metrics=run_metrics,
+                    custom_judges=custom_judges,
+                    judge_prompt_overrides=judge_prompt_overrides,
+                    judge=judge,
+                    example_metadata=meta,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[DATASET] scoring publish failed run=%s trace=%s", run_id, trace_id
+                )
+
+    try:
+        await asyncio.gather(
+            *(one(ex, tid) for ex, tid in zip(examples, trace_ids)),
+            return_exceptions=True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("[DATASET] task generation failed run=%s", run_id)
+
+
 @datasets_router.get("/datasets/{dataset_id}/runs")
 async def get_dataset_runs(
     dataset_id: uuid.UUID,
@@ -908,6 +1218,12 @@ async def _summarize_and_finalize(
     not only when its individual report is opened."""
     trace_ids = [it["trace_id"] for it in items]
 
+    # On a task run the scoreable population is the examples whose generation
+    # actually produced an output: a provider error or empty completion has
+    # nothing to score, so counting it would pin the run at "running" forever.
+    gen_failed = sum(1 for it in items if it.get("gen_error"))
+    expected_results = len(items) - gen_failed
+
     if run["kind"] == "agentic":
         rows = await clickhouse_client.fetch_dataset_eval_results(org_id, trace_ids)
         by_trace: Dict[str, Any] = {}
@@ -928,7 +1244,15 @@ async def _summarize_and_finalize(
             by_trace[r["trace_id"]] = r  # dedupe: keep one row per trace
         summary = _security_summary(by_trace, len(items))
 
-    if summary["completed"] >= len(items) and run["status"] == "running":
+    if gen_failed:
+        summary["gen_failed"] = gen_failed
+
+    # A task run is only settled once every example has finished generating.
+    # Without this a run whose first few generations land instantly would
+    # finalize against a denominator the later examples had yet to join.
+    generating = bool(run.get("task")) and (run.get("generated") or 0) < len(items)
+
+    if not generating and summary["completed"] >= expected_results and run["status"] == "running":
         await finalize_run(run["run_id"], org_id, "complete", summary)
         run = {
             **run,
@@ -960,6 +1284,15 @@ async def _build_report(org_id: uuid.UUID, run_id: uuid.UUID):
             "source":          it["source"],
             "input":           it.get("input"),
             "expected_output": it.get("expected_output"),
+            # What the task produced, plus what it cost to produce — the
+            # technical metrics that sit next to the quality scores. All None on
+            # a task-less run, where nothing was generated.
+            "output":          it.get("output"),
+            "gen_error":       it.get("gen_error"),
+            "latency_ms":      it.get("latency_ms"),
+            "input_tokens":    it.get("input_tokens"),
+            "output_tokens":   it.get("output_tokens"),
+            "cost_usd":        it.get("cost_usd"),
             "done":            it["trace_id"] in by_trace,
             "result": (
                 by_trace.get(it["trace_id"])
@@ -984,12 +1317,116 @@ async def _build_report(org_id: uuid.UUID, run_id: uuid.UUID):
         except Exception:  # noqa: BLE001
             pass
 
+    # Trials: several items share one example_id, so the per-example view folds
+    # them into one row carrying the mean and the spread. Left unfolded, a
+    # 3-trial run would look like a dataset three times the size, and the point
+    # of running trials — seeing how much a score *moves* — would be invisible.
+    item_out = _fold_trials(item_out)
+
+    # The org's weighted composites, applied to this run's metrics. Best-effort:
+    # a report is still a report without its aggregate, and a missing definition
+    # should not cost the numbers it was meant to summarise.
+    aggregates: Dict[str, Any] = {}
+    try:
+        from routes.aggregates import for_org
+        from shared.aggregates import apply_all
+
+        defined = await for_org(org_id)
+        if defined:
+            aggregates = apply_all(defined, summary.get("metrics") or {})
+    except Exception:  # noqa: BLE001
+        logger.exception("[DATASET] aggregate scores failed run=%s", run_id)
+
     return {
         "run":     _serialize_run(run),
         "summary": summary,
         "items":   item_out,
         "usage":   usage,
+        "aggregates": aggregates,
     }
+
+
+def _fold_trials(items: List[dict]) -> List[dict]:
+    """Collapse repeated trials of one example into a single row.
+
+    Returns the input untouched when every example appears once, so a run
+    without trials pays nothing for this.
+
+    The folded row reports the mean **and** the spread, because those answer
+    different questions: the mean is the score, the spread is how much you
+    should trust it. A metric that swings 40 points between identical runs is
+    telling you something the mean alone hides.
+    """
+    seen: Dict[str, int] = {}
+    for item in items:
+        key = str(item.get("example_id"))
+        seen[key] = seen.get(key, 0) + 1
+    if all(count == 1 for count in seen.values()):
+        return items
+
+    grouped: Dict[str, List[dict]] = {}
+    order: List[str] = []
+    for item in items:
+        key = str(item.get("example_id"))
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(item)
+
+    folded: List[dict] = []
+    for key in order:
+        trials = grouped[key]
+        first = trials[0]
+        if len(trials) == 1:
+            folded.append(first)
+            continue
+
+        # Average each metric across the trials that produced it.
+        per_metric: Dict[str, List[float]] = {}
+        for trial in trials:
+            result = trial.get("result")
+            if not isinstance(result, list):
+                continue
+            for row in result:
+                score = row.get("score")
+                if isinstance(score, (int, float)):
+                    per_metric.setdefault(str(row.get("metric")), []).append(float(score))
+
+        averaged = [
+            {
+                "metric": metric,
+                "score": sum(values) / len(values),
+                # The gap between the best and worst trial of this metric.
+                "spread": max(values) - min(values),
+                "trials": len(values),
+            }
+            for metric, values in sorted(per_metric.items())
+        ]
+        done = [t for t in trials if t.get("done")]
+        folded.append({
+            **first,
+            "result":   averaged or first.get("result"),
+            "trials":   len(trials),
+            # A run is only as done as its slowest trial; showing an average of
+            # two when the third is still scoring would move as it lands.
+            "done":     len(done) == len(trials),
+            "output":   first.get("output"),
+            "latency_ms": _mean_of(trials, "latency_ms"),
+            "cost_usd":   _sum_of(trials, "cost_usd"),
+        })
+    return folded
+
+
+def _mean_of(items: List[dict], key: str) -> Optional[float]:
+    values = [i[key] for i in items if isinstance(i.get(key), (int, float))]
+    return sum(values) / len(values) if values else None
+
+
+def _sum_of(items: List[dict], key: str) -> Optional[float]:
+    """Cost sums rather than averages: three trials cost three times as much,
+    and reporting the mean would understate a trialled run threefold."""
+    values = [i[key] for i in items if isinstance(i.get(key), (int, float))]
+    return sum(values) if values else None
 
 
 def _agentic_summary(by_trace: Dict[str, List[dict]], total: int) -> dict:
@@ -1902,6 +2339,13 @@ class SaveScorerRequest(BaseModel):
     template:  str
     threshold: float = 0.5
     slug:      Optional[str] = None
+    # 'judge' asks a model; 'code' evaluates a sandboxed expression. Both are
+    # referenced identically at run time — the difference is only what runs.
+    kind:      str = "judge"
+    # Judge only: a fixed set of {label, score}. The judge picks a label and the
+    # score comes from here, so it never has to invent a number. Absent keeps
+    # the free 0..1 behaviour.
+    choices:   Optional[List[Dict[str, Any]]] = None
 
     @field_validator("name")
     @classmethod
@@ -1913,26 +2357,45 @@ class SaveScorerRequest(BaseModel):
             raise ValueError("name must be 120 characters or fewer")
         return v
 
-    @field_validator("template")
+    @field_validator("kind")
     @classmethod
-    def _validate_template(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("prompt is required")
-        # Mirrors the Prompts page: a judge prompt must reference the answer it
-        # grades, else it can't see the example's output.
-        if not ANSWER_PLACEHOLDER_RE.search(v):
-            raise ValueError(
-                "A scorer prompt must reference the {{answer}} placeholder "
-                "(the example's output being graded)."
-            )
+    def _validate_kind(cls, v: str) -> str:
+        v = (v or "judge").strip().lower()
+        if v not in ("judge", "code"):
+            raise ValueError("kind must be 'judge' or 'code'")
         return v
 
-    @field_validator("threshold")
-    @classmethod
-    def _validate_threshold(cls, v: float) -> float:
-        if not (0.0 <= v <= 1.0):
+    @model_validator(mode="after")
+    def _validate_body(self) -> "SaveScorerRequest":
+        if not self.template or not self.template.strip():
+            raise ValueError("scorer body is required")
+        if not (0.0 <= self.threshold <= 1.0):
             raise ValueError("threshold must be between 0 and 1")
-        return v
+        if self.kind == "code":
+            if self.choices:
+                raise ValueError(
+                    "Choices apply to LLM judges. A code scorer returns its own "
+                    "number, so there is nothing for a choice table to map."
+                )
+            # Compiled here so an invalid scorer is rejected at author time
+            # rather than skipping every example of the next run in silence.
+            try:
+                compile_scorer(self.template)
+            except ScorerError as exc:
+                raise ValueError(str(exc)) from exc
+        else:
+            # A judge prompt must reference the answer it grades, else it can't
+            # see the example's output. Mirrors the Prompts page.
+            if not ANSWER_PLACEHOLDER_RE.search(self.template):
+                raise ValueError(
+                    "A scorer prompt must reference the {{answer}} placeholder "
+                    "(the example's output being graded)."
+                )
+            try:
+                parse_choices(self.choices)
+            except ChoiceError as exc:
+                raise ValueError(str(exc)) from exc
+        return self
 
 
 _SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -1944,10 +2407,20 @@ def _slugify(name: str) -> str:
 
 
 def _serialize_scorer(row: dict) -> dict:
+    config = row.get("config")
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except ValueError:
+            config = None
     return {
         "slug":       row["slug"],
         "name":       row.get("name") or row["slug"],
         "template":   row.get("template"),
+        # Older links resolve to a judge; only a scorer explicitly saved as code
+        # is one, so the fallback here has to be 'judge'.
+        "kind":       row.get("kind") or "judge",
+        "choices":    (config or {}).get("choices") if isinstance(config, dict) else None,
         "threshold":  float(row["threshold"]) if row.get("threshold") is not None else 0.5,
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
     }
@@ -2022,8 +2495,9 @@ async def save_dataset_scorer(
 ):
     """Create (or update) a custom scorer and save it to the dataset.
 
-    The judge prompt lives in the org-wide prompt library (``kind='judge'``) so
-    it's reusable across datasets; this also links it to the dataset (with its
+    The scorer lives in the org-wide prompt library (``kind='judge'`` for an
+    LLM-as-judge prompt, ``kind='code'`` for a deterministic expression) so it's
+    reusable across datasets; this also links it to the dataset (with its
     threshold) so the dataset remembers it for future metrics runs.
     """
     org_id = uuid.UUID(session["org_id"])
@@ -2039,23 +2513,41 @@ async def save_dataset_scorer(
 
     existing = await get_prompt_by_slug(org_id, slug)
     if existing is not None:
-        if (existing.get("kind") or "completion") != "judge":
+        existing_kind = existing.get("kind") or "completion"
+        if existing_kind not in ("judge", "code"):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"A non-scorer prompt with slug '{slug}' already exists.",
             )
+        # Switching a saved scorer between judge and code would silently change
+        # how every dataset already referencing that slug is graded.
+        if existing_kind != payload.kind:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"'{slug}' is already a {existing_kind} scorer. "
+                    f"Delete it, or save the {payload.kind} scorer under a different name."
+                ),
+            )
         await update_prompt(
-            existing["prompt_id"], org_id, name=payload.name, template=payload.template
+            existing["prompt_id"], org_id,
+            name=payload.name, template=payload.template,
+            # Removing the choices must actually remove them, or a judge could
+            # never be turned back into a free-scoring one.
+            config={"choices": payload.choices} if payload.choices else None,
+            clear_config=not payload.choices,
         )
     else:
         await create_prompt(
             org_id, payload.name, slug, payload.template,
-            model=None, variables=[], kind="judge",
+            model=None, variables=[], kind=payload.kind,
+            config={"choices": payload.choices} if payload.choices else None,
         )
 
     await link_dataset_scorer(dataset_id, org_id, slug, payload.threshold)
     return _serialize_scorer({
         "slug": slug, "name": payload.name, "template": payload.template,
+        "kind": payload.kind, "config": {"choices": payload.choices} if payload.choices else None,
         "threshold": payload.threshold, "created_at": None,
     })
 
@@ -2190,6 +2682,16 @@ async def _attach_enrichment(org_id: uuid.UUID, examples: List[dict]) -> None:
 
 # ── Serializers ───────────────────────────────────────────────────────────────
 
+def _run_tags(raw: Any) -> List[str]:
+    """Run tags, however the pool handed them back."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    return [str(t) for t in raw] if isinstance(raw, list) else []
+
+
 def _serialize_run(row: dict) -> dict:
     summary = row.get("summary") or {}
     if isinstance(summary, str):
@@ -2197,6 +2699,12 @@ def _serialize_run(row: dict) -> dict:
             summary = json.loads(summary)
         except ValueError:
             summary = {}
+    task = row.get("task")
+    if isinstance(task, str):
+        try:
+            task = json.loads(task)
+        except ValueError:
+            task = None
     return {
         "run_id":      str(row["run_id"]),
         "dataset_id":  str(row["dataset_id"]),
@@ -2208,6 +2716,13 @@ def _serialize_run(row: dict) -> dict:
         "total":       row.get("total", 0),
         "item_count":  row.get("item_count", row.get("total", 0)),
         "summary":     summary,
+        # Experiment identity + reproducibility: what ran, and what it was called.
+        "name":        row.get("name"),
+        "description": row.get("description"),
+        "tags":        _run_tags(row.get("tags")),
+        "task":        task,
+        "generated":   row.get("generated") or 0,
+        "gen_failed":  row.get("gen_failed") or 0,
         "created_at":  row["created_at"].isoformat() if row.get("created_at") else None,
         "finished_at": row["finished_at"].isoformat() if row.get("finished_at") else None,
     }

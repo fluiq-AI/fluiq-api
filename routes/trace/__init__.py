@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import config
 import uuid
 from datetime import datetime, timezone
@@ -14,10 +15,12 @@ from db_queues.clickhouse import clickhouse_client
 from db_queues.kafka import kafka_queue, wait_for_reply
 from db_queues.postgresql.auth import get_organization, resolve_api_key
 from db_queues.postgresql.guardrails import get_policy
+from db_queues.postgresql import online_rules
 from realtime import running_registry, trace_broker
 from routes.auth.helper import extract_api_key, get_current_session
 from shared.cache import cached_json, dash_key
 from shared.ids import coerce_trace_uuid
+from shared.online_scoring import scorers_of, select_rule
 from shared.quotas import (
     QuotaStatus,
     UNLIMITED,
@@ -36,6 +39,7 @@ from .model import (
 )
 
 import logging
+from typing import Any
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -129,6 +133,18 @@ async def ingestion(
     # explicit eval_config as also enabling eval so older SDKs (which send
     # _eval_config on LLM warn-mode but not the _eval flag) keep working.
     eval_enabled    = bool(event.pop("_eval", False)) or eval_config is not None
+    # Tags stripped off the event and stored in their own table; user metadata
+    # stays on the event, where the drawer can render it and JSONExtract can
+    # filter it without a second write path.
+    sdk_tags        = normalize_tags(event.pop("_tags", None))
+    user_metadata   = event.pop("_metadata", None)
+    if isinstance(user_metadata, dict) and user_metadata:
+        # Kept under a reserved key so it can never collide with a field the
+        # tracer or an integration writes.
+        event["fluiq_metadata"] = {
+            str(k): v for k, v in user_metadata.items()
+            if isinstance(v, (str, int, float, bool))
+        }
 
     is_running = event.get("status") == "running"
 
@@ -203,11 +219,29 @@ async def ingestion(
     if not is_running:
         bump_trace_count(org_id)
 
+    # Tags are written after the trace publish so a tag-store hiccup can never
+    # cost the trace itself — the label is the accessory, the trace is the data.
+    if sdk_tags and not is_running:
+        try:
+            await clickhouse_client.add_trace_tags(
+                organization_id=org_id,
+                trace_id=uuid.UUID(str(trace_id)),
+                tags=sdk_tags,
+                root_trace_id=(
+                    uuid.UUID(str(event["root_trace_id"]))
+                    if event.get("root_trace_id") else None
+                ),
+                source="sdk",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[INGEST] tag write failed org=%s trace=%s", org_id, trace_id)
+
     # Evaluation is opt-in: it runs ONLY when the caller enabled it via
     # fluiq.eval() (the SDK sets the `_eval` flag, plus `_eval_config` with the
     # metrics/thresholds on LLM calls). instrument() alone never auto-evaluates.
     # Quota-gated; the worker's judge cache keeps repeated prompts cheap.
     eval_skipped = False
+    scored_inline = False
     if not is_running and eval_enabled:
         if quota.eval_over:
             eval_skipped = True
@@ -217,6 +251,7 @@ async def ingestion(
             # carry no `_eval_config`.
             await kafka_queue.add_job(job, topic=config.KAFKA_EVAL_TOPIC, key=str(org_id))
             bump_eval_count(org_id)
+            scored_inline = True
         elif event.get("type") == "llm" and eval_config:
             await kafka_queue.add_job(
                 {**job, "eval_config": eval_config, "operation": "sdk_llm"},
@@ -224,6 +259,14 @@ async def ingestion(
                 key=str(org_id),
             )
             bump_eval_count(org_id)
+            scored_inline = True
+
+    # Online scoring: continuous evaluation of traffic the SDK said nothing
+    # about. Skipped when this trace was already scored above — a rule exists to
+    # cover what fluiq.eval() doesn't, not to grade the same call twice.
+    online_rule = None
+    if not is_running and not scored_inline and not quota.eval_over:
+        online_rule = await _apply_online_rules(org_id, event, trace_id, job)
 
     if not is_running and security_config:
         # Forward the org's warn-mode PII policy so the worker suppresses ignored
@@ -240,7 +283,148 @@ async def ingestion(
             security_job["response_gated"] = True
         await kafka_queue.add_job(security_job, topic=config.KAFKA_SECURITY_TOPIC, key=str(org_id))
 
-    return {"ok": True, "trace_id": trace_id, "eval_skipped": eval_skipped, **ingest_extra}
+    return {
+        "ok": True,
+        "trace_id": trace_id,
+        "eval_skipped": eval_skipped,
+        # Named so a developer can see *why* a trace got scored without them
+        # asking for it — an unexplained judge bill is a support ticket.
+        **({"online_rule": online_rule} if online_rule else {}),
+        **ingest_extra,
+    }
+
+
+async def _apply_online_rules(
+    org_id: uuid.UUID,
+    event: dict,
+    trace_id: str,
+    job: dict,
+) -> Optional[str]:
+    """Score this trace if an online rule selects it. Returns the rule's name.
+
+    Best-effort throughout: online scoring is a background quality signal, and
+    no failure in it may cost the customer the trace itself. A broken rule, an
+    unreachable database, or a full queue all end with the trace stored and
+    unscored.
+    """
+    try:
+        rules = await online_rules.active_rules(org_id)
+        if not rules:
+            return None
+
+        # A root span is one that is its own root: nested spans of an agent run
+        # would otherwise each be scored, multiplying the bill by trajectory depth.
+        root_id = event.get("root_trace_id") or event.get("trace_id")
+        is_root = str(root_id or trace_id) == str(event.get("trace_id") or trace_id)
+
+        rule = select_rule(rules, event, str(trace_id), is_root)
+        if rule is None:
+            return None
+
+        metrics, custom_judges = scorers_of(rule)
+        scoring_job = {
+            **job,
+            "operation": "sdk_llm",
+            "eval_config": {
+                "metrics":       metrics,
+                "custom_judges": custom_judges,
+            },
+            # Stamped so a score can be traced back to the rule that ordered it.
+            "online_rule_id":   rule.get("rule_id"),
+            "online_rule_name": rule.get("name"),
+        }
+        if rule.get("judge"):
+            scoring_job["judge"] = rule["judge"]
+
+        await kafka_queue.add_job(
+            scoring_job, topic=config.KAFKA_EVAL_TOPIC, key=str(org_id),
+        )
+        bump_eval_count(org_id)
+        return str(rule.get("name") or "")
+    except Exception:  # noqa: BLE001
+        logger.exception("[INGEST] online scoring failed org=%s trace=%s", org_id, trace_id)
+        return None
+
+
+# ── Tags ──────────────────────────────────────────────────────────────────────
+
+_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._\-/]{0,62}$")
+MAX_TAGS_PER_TRACE = 25
+
+
+def normalize_tags(raw: Any) -> list[str]:
+    """Clean a caller's tags, dropping anything unusable rather than failing.
+
+    Lowercased and de-duplicated, because ``Prompt-A`` and ``prompt-a`` being
+    different tags is a trap that only shows up once a filter silently returns
+    nothing. Invalid entries are dropped rather than rejected: tagging is a
+    side-channel on an ingest call, and failing a whole trace over a stray
+    character would cost the customer data to gain them nothing.
+    """
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    out: list[str] = []
+    for item in raw:
+        tag = str(item or "").strip().lower()
+        if tag and _TAG_RE.match(tag) and tag not in out:
+            out.append(tag)
+        if len(out) >= MAX_TAGS_PER_TRACE:
+            break
+    return out
+
+
+class TagRequest(BaseModel):
+    tags: list[str]
+
+
+@router.get("/traces/tags")
+async def list_org_tags(session: dict = Depends(get_current_session)):
+    """Every tag the org uses, most-used first — for the filter dropdown."""
+    org_id = uuid.UUID(session["org_id"])
+    return {"tags": await clickhouse_client.fetch_org_tags(org_id)}
+
+
+@router.post("/traces/{trace_id}/tags", status_code=status.HTTP_201_CREATED)
+async def add_tags(
+    trace_id: uuid.UUID,
+    payload: TagRequest,
+    session: dict = Depends(get_current_session),
+):
+    """Tag a trace from the dashboard."""
+    tags = normalize_tags(payload.tags)
+    if not tags:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No usable tags. Use lowercase letters, digits, and . _ - / "
+                "(up to 63 characters)."
+            ),
+        )
+    await clickhouse_client.add_trace_tags(
+        organization_id=uuid.UUID(session["org_id"]),
+        trace_id=trace_id,
+        tags=tags,
+        source="dashboard",
+        created_by=str(session.get("sub") or ""),
+    )
+    return {"tags": tags}
+
+
+@router.delete("/traces/{trace_id}/tags/{tag}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_tag(
+    trace_id: uuid.UUID,
+    tag: str,
+    session: dict = Depends(get_current_session),
+):
+    await clickhouse_client.remove_trace_tag(
+        organization_id=uuid.UUID(session["org_id"]),
+        trace_id=trace_id,
+        tag=tag.strip().lower(),
+    )
 
 
 @router.get("/traces", response_model=TraceListResponse)
@@ -258,6 +442,8 @@ async def list_traces(
     security: str = Query(default="all"),
     integration: str = Query(default="all"),
     quality: str = Query(default="all"),
+    # Repeatable: ?tag=prompt-a&tag=canary means "carrying both".
+    tag: Optional[list[str]] = Query(default=None),
 ) -> TraceListResponse:
     """Return traces for the caller's organization.
 
@@ -301,8 +487,25 @@ async def list_traces(
         security=security,
         integration=integration,
         quality=quality,
+        tags=[t for t in (tag or []) if t and t.strip()] or None,
     )
     persisted = [TraceRecord(**row) for row in rows]
+    # Tags for the page, fetched after: they are many-per-trace, so joining them
+    # into the trace query would either fan the page out or add a third
+    # groupArray subquery to a query that already has two. Best-effort — a tag
+    # lookup failing must not cost the trace list.
+    try:
+        page_ids = [
+            str(p.event.get("trace_id"))
+            for p in persisted
+            if isinstance(p.event, dict) and p.event.get("trace_id")
+        ]
+        tag_map = await clickhouse_client.fetch_tags_for_traces(org_id, page_ids)
+        for record in persisted:
+            tid = str(record.event.get("trace_id")) if isinstance(record.event, dict) else ""
+            record.tags = tag_map.get(tid, [])
+    except Exception:  # noqa: BLE001
+        logger.exception("[TRACES] tag lookup failed org=%s", org_id)
     # In-flight runs only surface on the first page; subsequent pages page
     # through historical (durable) rows where ephemeral entries don't
     # belong. The registry is scoped to this replica only — running rows

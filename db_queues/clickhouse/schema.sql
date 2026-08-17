@@ -353,3 +353,62 @@ CREATE TABLE IF NOT EXISTS audit_log (
 ) ENGINE = MergeTree()
 ORDER BY (organization_id, created_at)
 TTL created_at + INTERVAL 10 YEAR;
+-- ── Trace tags ──────────────────────────────────────────────────────────────
+-- Labels on a trace, from the SDK at call time (`fluiq.tag(...)`) or from the
+-- dashboard afterwards. Tags are what make production traffic sliceable: the
+-- A/B case from the workshop — tag one cohort `prompt-a`, the other `prompt-b`,
+-- then compare their scores — is not expressible without them.
+--
+-- A separate table rather than a column on `traces`, because dashboard tagging
+-- is a mutation and MergeTree does not update rows. ReplacingMergeTree keyed on
+-- (org, trace, tag) makes re-tagging idempotent, and `deleted` makes untagging
+-- an insert rather than a rewrite. Reads use FINAL: this table is tiny beside
+-- `traces`, and without it an untag could be undone by an unmerged part.
+--
+-- No TTL. A tag outliving its trace is inert (it filters to a trace_id that no
+-- longer exists) and costs a few bytes, whereas a TTL that fired early would
+-- silently drop the labels someone curated.
+CREATE TABLE IF NOT EXISTS fluiq.trace_tags
+(
+    organization_id UUID,
+    trace_id        UUID,
+    root_trace_id   UUID,
+    tag             LowCardinality(String),
+    -- 'sdk' = stamped at call time; 'dashboard' = applied by a person after.
+    source          LowCardinality(String) DEFAULT 'sdk',
+    created_by      String DEFAULT '',
+    deleted         UInt8 DEFAULT 0,
+    updated_at      DateTime64(3, 'UTC') DEFAULT now64(3)
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (organization_id, trace_id, tag);
+
+-- ── Review flags ────────────────────────────────────────────────────────────
+-- "Someone should look at this." Raised from the trace drawer, from a low score,
+-- or from a thumbs-down, and cleared when it has been dealt with.
+--
+-- Distinct from a tag (fluiq.trace_tags) because a flag has a *state*: a tag
+-- labels what a trace is, a flag records that it needs attention and later that
+-- it got some. Folding the two together would make "resolved" just another
+-- label and lose the queue.
+--
+-- ReplacingMergeTree on (org, trace) so re-flagging and resolving are inserts
+-- rather than updates, same as tags. Reads use FINAL.
+CREATE TABLE IF NOT EXISTS fluiq.review_flags
+(
+    organization_id UUID,
+    trace_id        UUID,
+    root_trace_id   UUID,
+    -- 'open' = needs a human; 'resolved' = one has been.
+    status          LowCardinality(String) DEFAULT 'open',
+    -- Why it was raised: 'manual' | 'low_score' | 'feedback'. Kept so the queue
+    -- can say what put a trace there, which is most of what a reviewer needs
+    -- before opening it.
+    reason          LowCardinality(String) DEFAULT 'manual',
+    note            String DEFAULT '',
+    flagged_by      String DEFAULT '',
+    resolved_by     String DEFAULT '',
+    updated_at      DateTime64(3, 'UTC') DEFAULT now64(3)
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (organization_id, trace_id);

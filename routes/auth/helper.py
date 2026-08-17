@@ -53,8 +53,16 @@ def _verify_password(password: str, hashed_password: str) -> bool:
         return False
 
 
-def _create_access_token(user_id: str, org_id: str) -> tuple[str, int]:
-    """Encode a short-lived access JWT. Returns (token, expires_in_seconds)."""
+def _create_access_token(
+    user_id: str, org_id: str, role: str | None = None,
+) -> tuple[str, int]:
+    """Encode a short-lived access JWT. Returns (token, expires_in_seconds).
+
+    ``role`` is the caller's membership role in this org. Carried on the token so
+    the annotator-scope middleware can decide without a database read on every
+    request; the token's own expiry bounds how long a role change takes to apply,
+    which for a short-lived access token is minutes.
+    """
     expires_in = config.JWT_EXPIRE_MINUTES * 60
     now = datetime.now(timezone.utc)
     payload = {
@@ -64,6 +72,8 @@ def _create_access_token(user_id: str, org_id: str) -> tuple[str, int]:
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=expires_in)).timestamp()),
     }
+    if role:
+        payload["role"] = role
     token = jwt.encode(payload, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
     return token, expires_in
 

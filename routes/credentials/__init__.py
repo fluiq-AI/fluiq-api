@@ -31,6 +31,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
+from shared.providers import VERIFY_ENDPOINTS
 from db_queues.postgresql.credentials import (
     VALID_PROVIDERS,
     delete_credential,
@@ -50,13 +51,9 @@ credentials_router = APIRouter()
 _VERIFY_TIMEOUT_SECONDS = 10.0
 
 # Cheapest authenticated call per provider that proves a key works without
-# spending tokens. Hardcoded — never interpolated from request data.
-_VERIFY_ENDPOINTS: dict[str, tuple[str, dict]] = {
-    "openai":    ("https://api.openai.com/v1/models", {}),
-    "anthropic": ("https://api.anthropic.com/v1/models", {"anthropic-version": "2023-06-01"}),
-    "gemini":    ("https://generativelanguage.googleapis.com/v1beta/models", {}),
-    "moonshot":  ("https://api.moonshot.ai/v1/models", {}),
-}
+# spending tokens, from the provider registry. Hardcoded there — never
+# interpolated from request data.
+_VERIFY_ENDPOINTS = VERIFY_ENDPOINTS
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────

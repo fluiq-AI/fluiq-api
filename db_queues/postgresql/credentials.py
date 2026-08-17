@@ -32,7 +32,10 @@ logger = logging.getLogger(__name__)
 
 _TABLE = config.POSTGRES_CREDENTIALS_TABLE
 
-VALID_PROVIDERS = {"openai", "anthropic", "gemini", "moonshot", "azure_openai", "bedrock"}
+# Derived from the single provider registry (shared/providers.py) rather than
+# restated here — the two drifting is how a key gets stored for a provider
+# the judge then refuses to route.
+from shared.providers import VALID_PROVIDERS  # noqa: F401
 
 
 @dataclass

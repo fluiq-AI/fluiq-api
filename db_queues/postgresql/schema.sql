@@ -107,8 +107,13 @@ CREATE TABLE IF NOT EXISTS prompts (
     --                fluiq.eval(custom_judges={...}). Judge templates use
     --                string.Template $question/$answer/$context placeholders and
     --                are expected to return {"score": float, "reason": str}.
+    -- 'code'       = a deterministic scorer: a sandboxed expression over
+    --                output/expected/input/metadata returning 0..1 or a bool.
+    --                Referenced by slug exactly like a judge, because from the
+    --                client's side both are just "a scorer with a threshold" —
+    --                the evaluator routes on this column. Costs no model call.
     kind        TEXT        NOT NULL DEFAULT 'completion'
-                CHECK (kind IN ('completion', 'judge')),
+                CHECK (kind IN ('completion', 'judge', 'code')),
     is_deployed BOOLEAN     NOT NULL DEFAULT FALSE,
     deployed_at TIMESTAMPTZ,
     version     INTEGER     NOT NULL DEFAULT 1,
@@ -120,6 +125,23 @@ CREATE INDEX IF NOT EXISTS idx_prompts_org_id ON prompts(org_id);
 CREATE INDEX IF NOT EXISTS idx_prompts_org_slug ON prompts(org_id, slug);
 -- Migration for existing deployments
 ALTER TABLE prompts ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'completion';
+-- Scorer configuration that isn't the body itself. Today: a judge's choice set,
+--   {"choices": [{"label": "Y", "score": 1}, {"label": "N", "score": 0}]}
+-- which makes the judge pick a written option and take its score from this
+-- table instead of inventing a float. NULL/absent keeps the free-score
+-- behaviour every existing judge has.
+ALTER TABLE prompts ADD COLUMN IF NOT EXISTS config JSONB;
+-- Widen the kind constraint in place for deployments created before code
+-- scorers existed. Dropping by name then re-adding is the only way to alter a
+-- CHECK; both steps are guarded so re-applying the schema stays idempotent.
+ALTER TABLE prompts DROP CONSTRAINT IF EXISTS prompts_kind_check;
+DO $$
+BEGIN
+    ALTER TABLE prompts ADD CONSTRAINT prompts_kind_check
+        CHECK (kind IN ('completion', 'judge', 'code'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
 
 CREATE TABLE IF NOT EXISTS prompt_versions (
     version_id  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -207,6 +229,28 @@ ALTER TABLE dataset_runs ADD COLUMN IF NOT EXISTS model TEXT;
 ALTER TABLE dataset_runs ADD COLUMN IF NOT EXISTS batch_id UUID;
 CREATE INDEX IF NOT EXISTS idx_dataset_runs_batch ON dataset_runs(batch_id);
 
+-- ── Task-driven runs (an "experiment") ──────────────────────────────────────
+-- Historically a run only *graded output that already existed* (a recorded
+-- trace response, or the example's expected_output). A run may now instead
+-- carry a `task`: the prompt + model that is EXECUTED against every example to
+-- produce fresh output, which is then what gets graded. That makes a run
+-- reproducible and comparable — the thing an experiment has to be.
+--
+-- Shape: {"template": str, "system": str|null, "model": str, "max_tokens": int,
+--         "prompt_id": uuid|null, "prompt_version": int|null, "prompt_name": str|null}
+-- NULL task = the legacy grade-what-exists behaviour, unchanged.
+ALTER TABLE dataset_runs ADD COLUMN IF NOT EXISTS task JSONB;
+-- Human identity for the run, so a list of runs reads as a list of experiments
+-- rather than a list of timestamps.
+ALTER TABLE dataset_runs ADD COLUMN IF NOT EXISTS name TEXT;
+ALTER TABLE dataset_runs ADD COLUMN IF NOT EXISTS description TEXT;
+-- Generation progress for task runs. `generated` counts examples whose task
+-- output came back (success or failure); `gen_failed` counts the failures,
+-- which are excluded from the scoring denominator so one dead provider call
+-- can't leave a run pinned at "running" forever.
+ALTER TABLE dataset_runs ADD COLUMN IF NOT EXISTS generated  INT NOT NULL DEFAULT 0;
+ALTER TABLE dataset_runs ADD COLUMN IF NOT EXISTS gen_failed INT NOT NULL DEFAULT 0;
+
 -- One row per example enrolled in a run. `trace_id` is the id the job was
 -- published under (the example's source trace, or a synthesized id for
 -- text-only examples); the report joins ClickHouse results on it. `source`
@@ -221,6 +265,16 @@ CREATE TABLE IF NOT EXISTS dataset_run_items (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_dataset_run_items_run ON dataset_run_items(run_id);
+-- Task-run generation results, per example. These are the "technical metrics"
+-- a run report shows next to the quality scores: what the task actually
+-- produced, and what it cost to produce it. All NULL for legacy (task-less)
+-- runs, where nothing was generated.
+ALTER TABLE dataset_run_items ADD COLUMN IF NOT EXISTS output        TEXT;
+ALTER TABLE dataset_run_items ADD COLUMN IF NOT EXISTS gen_error     TEXT;
+ALTER TABLE dataset_run_items ADD COLUMN IF NOT EXISTS latency_ms    INT;
+ALTER TABLE dataset_run_items ADD COLUMN IF NOT EXISTS input_tokens  INT;
+ALTER TABLE dataset_run_items ADD COLUMN IF NOT EXISTS output_tokens INT;
+ALTER TABLE dataset_run_items ADD COLUMN IF NOT EXISTS cost_usd      DOUBLE PRECISION;
 
 -- Agents linked to a dataset so their future runs are auto-appended as examples
 -- (the import of past runs happens immediately at link time, client-side).
@@ -545,3 +599,176 @@ CREATE INDEX IF NOT EXISTS idx_org_provider_credentials_lookup
 ALTER TABLE org_provider_credentials DROP CONSTRAINT IF EXISTS org_provider_credentials_provider_check;
 ALTER TABLE org_provider_credentials ADD CONSTRAINT org_provider_credentials_provider_check
     CHECK (provider IN ('openai', 'anthropic', 'gemini', 'moonshot', 'azure_openai', 'bedrock'));
+
+
+-- ── Online scoring rules ────────────────────────────────────────────────────
+-- Continuous evaluation of live traffic.
+--
+-- Everything before this was opt-in per call: a trace is only scored when the
+-- SDK asked for it via fluiq.eval(). That means quality coverage is whatever a
+-- developer hardcoded months ago, and a regression in a path nobody instrumented
+-- is invisible. A rule inverts it — the org declares "score this share of this
+-- kind of traffic with these scorers", and it applies to traffic the SDK said
+-- nothing about.
+--
+-- Sampling is the whole reason this is affordable: judging 100% of production
+-- costs a model call per request, so a rule normally runs at 5-20%.
+CREATE TABLE IF NOT EXISTS online_scoring_rules (
+    rule_id       UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id        UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    -- Reserved for Projects (docs/decision-projects.md). Inert while NULL; here
+    -- from day one so these rows never need migrating when projects land.
+    project_id    UUID,
+    name          TEXT        NOT NULL,
+    description   TEXT,
+    enabled       BOOLEAN     NOT NULL DEFAULT TRUE,
+    -- Built-in metrics (hallucination, relevance, …) applied to each sampled trace.
+    metrics       JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    -- Client-defined scorers by slug -> threshold, exactly as fluiq.eval() takes
+    -- them. Both judge and code scorers are addressed this way.
+    custom_judges JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    -- Percentage of matching traces to score, 0-100.
+    sample_rate   NUMERIC(5,2) NOT NULL DEFAULT 10
+                  CHECK (sample_rate >= 0 AND sample_rate <= 100),
+    -- Which spans qualify. 'root' is the default because scoring every nested
+    -- span of an agent run multiplies cost by the depth of the trajectory.
+    span_scope    TEXT        NOT NULL DEFAULT 'root'
+                  CHECK (span_scope IN ('root', 'all')),
+    -- Optional narrowing. NULL/empty means "any".
+    integrations  JSONB       NOT NULL DEFAULT '[]'::jsonb,  -- e.g. ["OPENAI"]
+    models        JSONB       NOT NULL DEFAULT '[]'::jsonb,  -- e.g. ["gpt-5-mini"]
+    -- "provider:model" for the judge, else the server default.
+    judge         TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- The ingest hot path: "the enabled rules for this org". Read on every trace,
+-- so it is cached in-process and this index is the cache-miss path.
+CREATE INDEX IF NOT EXISTS idx_online_rules_org
+    ON online_scoring_rules(org_id) WHERE enabled;
+
+
+-- ── Saved views ─────────────────────────────────────────────────────────────
+-- A named, shareable set of filters over a dashboard list.
+--
+-- Filters today are ephemeral component state: you narrow the trace list to the
+-- thing you care about, and it's gone on the next page load and unreachable by
+-- anyone else. A view makes "all thumbs-down responses from GPT-5 last week"
+-- something a team keeps, which is what turns a filter into a review queue.
+--
+-- `filters` is stored opaquely rather than as columns. The set of filters a
+-- surface offers changes with the surface, and a schema migration per new
+-- filter would guarantee the feature stagnates. The cost is that an unknown key
+-- is ignored on read, which is also the desired behaviour when a filter is
+-- retired.
+CREATE TABLE IF NOT EXISTS saved_views (
+    view_id     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id      UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    -- Reserved for Projects (docs/decision-projects.md); inert while NULL.
+    project_id  UUID,
+    -- Which list this view belongs to, e.g. 'traces'. A view is meaningless on
+    -- a surface whose filters it doesn't share.
+    surface     TEXT        NOT NULL DEFAULT 'traces',
+    name        TEXT        NOT NULL,
+    description TEXT,
+    filters     JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    -- Shared views are the point — a review queue only works if the reviewers
+    -- can see it. Private ones exist so a half-built view isn't inflicted on
+    -- the team.
+    shared      BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_by  UUID,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (org_id, surface, name)
+);
+CREATE INDEX IF NOT EXISTS idx_saved_views_org_surface
+    ON saved_views(org_id, surface, created_at);
+
+
+-- ── Review rubrics ──────────────────────────────────────────────────────────
+-- What a human reviewer is asked, field by field.
+--
+-- Annotation was one number and one comment, which is what you build when the
+-- reviewer is the person who wrote the code. It stops working the moment the
+-- reviewer is a subject-matter expert: a clinician grading a summary is not
+-- thinking "0.7", they are answering "is the dosage right — yes / no / unclear"
+-- across four separate questions. One number cannot hold four answers, and the
+-- one it holds is an average nobody chose.
+--
+-- Each field becomes its own `human.annotation` row in ClickHouse, keyed by
+-- `key`, so a rubric answer is queryable next to the judge scores it disagrees
+-- with (see the Review 2x2).
+CREATE TABLE IF NOT EXISTS review_rubric_fields (
+    field_id   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id     UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    -- Reserved for Projects (docs/decision-projects.md); inert while NULL.
+    project_id UUID,
+    -- Stable identifier the score is stored under. Renaming the label is free;
+    -- changing the key orphans the history, so it is set once.
+    key        TEXT        NOT NULL,
+    label      TEXT        NOT NULL,
+    help       TEXT,
+    -- 'choice'  = pick one labelled option, each worth a score (the rubric case)
+    -- 'boolean' = yes/no, stored 1/0
+    -- 'slider'  = a 0-1 rating
+    -- 'text'    = a comment, recorded but not scored
+    kind       TEXT        NOT NULL DEFAULT 'choice'
+               CHECK (kind IN ('choice', 'boolean', 'slider', 'text')),
+    -- For 'choice': [{"label": "Correct", "score": 1}, ...]
+    options    JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    -- Whether a reviewer must answer before the annotation is accepted.
+    required   BOOLEAN     NOT NULL DEFAULT FALSE,
+    position   INT         NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (org_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_review_rubric_org
+    ON review_rubric_fields(org_id, position);
+
+-- ── Annotator role ──────────────────────────────────────────────────────────
+-- A reviewer who may read traces and record verdicts, and nothing else.
+--
+-- Subject-matter experts are often contractors or clinicians, not staff. Giving
+-- them 'member' to let them annotate would also hand them API keys, provider
+-- credentials, billing, and the ability to delete a dataset — which is why
+-- teams end up not inviting them at all and doing the review badly in-house.
+ALTER TABLE organization_members DROP CONSTRAINT IF EXISTS organization_members_role_check;
+DO $$
+BEGIN
+    ALTER TABLE organization_members ADD CONSTRAINT organization_members_role_check
+        CHECK (role IN ('owner', 'admin', 'member', 'annotator'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
+
+
+-- ── Aggregate scores ────────────────────────────────────────────────────────
+-- A weighted composite of several scorers, reported as one number.
+--
+-- A run with six metrics has six answers and no verdict, so everyone invents
+-- their own average in their head — and they invent different ones. An
+-- aggregate makes the weighting explicit and shared: "quality" means 50%
+-- faithfulness, 30% relevance, 20% tone, because someone decided that once
+-- rather than each reader deciding it again.
+CREATE TABLE IF NOT EXISTS aggregate_scores (
+    aggregate_id UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id       UUID        NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    project_id   UUID,      -- reserved; see docs/decision-projects.md
+    slug         TEXT        NOT NULL,
+    name         TEXT        NOT NULL,
+    description  TEXT,
+    -- [{"metric": "faithfulness", "weight": 0.5}, ...]. Weights are normalised
+    -- on read rather than forced to sum to 1 on write: someone adding a fourth
+    -- component should not have to re-do the arithmetic on the other three.
+    components   JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (org_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_aggregate_scores_org ON aggregate_scores(org_id);
+
+-- Tags on a run, so a history of experiments can be sliced the way traces can.
+-- Stored on the row rather than in a join table: a run has a handful of tags,
+-- they are set once at launch, and nothing needs to query "every run with tag X"
+-- across orgs.
+ALTER TABLE dataset_runs ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb;

@@ -1,6 +1,7 @@
 """PostgreSQL CRUD helpers for saved prompts."""
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -104,17 +105,21 @@ async def create_prompt(
     model: Optional[str],
     variables: List[str],
     kind: str = "completion",
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Create a prompt. ``config`` carries scorer settings that aren't the body
+    itself — today a judge's choice set."""
     async with postgres_client.acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO prompts
-                (org_id, name, slug, template, model, variables, kind, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, NOW())
+                (org_id, name, slug, template, model, variables, kind, config, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb, NOW())
             RETURNING *
             """,
             org_id, name, slug, template, model,
             [{"name": v} for v in variables], kind,
+            json.dumps(config) if config else None,
         )
         return dict(row)
 
@@ -144,7 +149,15 @@ async def update_prompt(
     template: Optional[str] = None,
     model: Optional[str] = None,
     variables: Optional[List[str]] = None,
+    config: Optional[Dict[str, Any]] = None,
+    clear_config: bool = False,
 ) -> Optional[Dict[str, Any]]:
+    """Update a prompt, snapshotting the previous version first.
+
+    ``config`` is three-valued on purpose: omitted leaves it untouched, a dict
+    replaces it, and ``clear_config`` removes it. Without the third case there
+    would be no way to turn a choice-scored judge back into a free-scoring one.
+    """
     sets = ["updated_at = NOW()", "version = version + 1"]
     args: list[Any] = []
     idx = 1
@@ -164,6 +177,12 @@ async def update_prompt(
     if variables is not None:
         sets.append(f"variables = ${idx}::jsonb")
         args.append([{"name": v} for v in variables])
+        idx += 1
+    if clear_config:
+        sets.append("config = NULL")
+    elif config is not None:
+        sets.append(f"config = ${idx}::jsonb")
+        args.append(json.dumps(config))
         idx += 1
 
     args += [prompt_id, org_id]

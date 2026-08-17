@@ -62,6 +62,23 @@ logger = logging.getLogger(__name__)
 
 auth_router = APIRouter()
 
+
+async def _role_for(user_id: str, org_id: str) -> str | None:
+    """The caller's role in this org, for the access token's ``role`` claim.
+
+    Best-effort: a token minted without the claim is treated as a full member by
+    the annotator middleware, which is the behaviour every account had before
+    roles existed. Failing the login over a membership lookup would be a worse
+    trade than briefly over-granting a role that a re-issued token corrects.
+    """
+    try:
+        from shared.permissions import role_of
+        import uuid as _uuid
+
+        return await role_of(str(user_id), _uuid.UUID(str(org_id)))
+    except Exception:  # noqa: BLE001
+        return None
+
 @auth_router.post(
     "/register",
     status_code=status.HTTP_201_CREATED,
@@ -90,7 +107,8 @@ async def register(payload: RegisterPayload) -> RegisterResponse:
         )
     user, organization = result
     access_token, expires_in = _create_access_token(
-        user_id=str(user.user_id), org_id=str(user.org_id)
+        user_id=str(user.user_id), org_id=str(user.org_id),
+        role=await _role_for(str(user.user_id), str(user.org_id)),
     )
     refresh_token, refresh_expires_in = _create_refresh_token(
         user_id=str(user.user_id), org_id=str(user.org_id)
@@ -123,7 +141,8 @@ async def login(payload: LoginPayload) -> LoginResponse:
         )
     user, organization = result
     access_token, expires_in = _create_access_token(
-        user_id=str(user.user_id), org_id=str(user.org_id)
+        user_id=str(user.user_id), org_id=str(user.org_id),
+        role=await _role_for(str(user.user_id), str(user.org_id)),
     )
     refresh_token, refresh_expires_in = _create_refresh_token(
         user_id=str(user.user_id), org_id=str(user.org_id)
@@ -320,12 +339,14 @@ GITHUB_EMAILS_URL = "https://api.github.com/user/emails"
 COOKIE_NAME = "oauth_state"
 COOKIE_MAX_AGE = 600 
 
-def _build_session_redirect(user, organization, user_id: str, org_id: str) -> RedirectResponse:
+async def _build_session_redirect(user, organization, user_id: str, org_id: str) -> RedirectResponse:
     """
     Build a redirect to the frontend /auth/callback with the full session
     encoded as base64 JSON so the frontend can hydrate the Redux store.
     """
-    access_token, expires_in = _create_access_token(user_id=user_id, org_id=org_id)
+    access_token, expires_in = _create_access_token(
+        user_id=user_id, org_id=org_id, role=await _role_for(user_id, org_id),
+    )
     refresh_token, refresh_expires_in = _create_refresh_token(user_id=user_id, org_id=org_id)
 
     session = {
@@ -433,7 +454,7 @@ async def google_callback(
         return _error_redirect("Could not create account")
 
     user, organization = result
-    resp = _build_session_redirect(
+    resp = await _build_session_redirect(
         user=user,
         organization=organization,
         user_id=str(user.user_id),
@@ -541,7 +562,7 @@ async def github_callback(
         return _error_redirect("Could not create account")
 
     user, organization = result
-    resp = _build_session_redirect(
+    resp = await _build_session_redirect(
         user=user,
         organization=organization,
         user_id=str(user.user_id),

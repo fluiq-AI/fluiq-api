@@ -36,11 +36,23 @@ from db_queues.postgresql.prompts import (
     update_prompt,
 )
 from routes.auth.helper import extract_api_key, get_current_session
+from shared.code_scorer import (
+    BUILTIN_NAMES,
+    SCOPE_NAMES,
+    ScorerError,
+    compile_scorer,
+    run_scorer,
+)
 from shared.placeholders import ANSWER_PLACEHOLDER_RE
 
 prompts_router = APIRouter()
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,61}[a-z0-9]$")
+
+#: What a saved prompt can be. 'code' is a deterministic scorer rather than a
+#: prompt, but it lives here to inherit slugs, versioning, and env deployment —
+#: a scorer needs all three for exactly the reasons a prompt does.
+VALID_PROMPT_KINDS = frozenset({"completion", "judge", "code"})
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -57,8 +69,8 @@ class SavePromptRequest(BaseModel):
     @classmethod
     def _validate_kind(cls, v: str) -> str:
         v = (v or "completion").strip().lower()
-        if v not in ("completion", "judge"):
-            raise ValueError("kind must be 'completion' or 'judge'")
+        if v not in VALID_PROMPT_KINDS:
+            raise ValueError(f"kind must be one of: {', '.join(sorted(VALID_PROMPT_KINDS))}")
         return v
 
     @field_validator("slug")
@@ -99,6 +111,70 @@ class DeployRequest(BaseModel):
     deploy: bool = True
 
 
+# ── Code scorers ──────────────────────────────────────────────────────────────
+
+def _validate_code_scorer(source: str) -> None:
+    """Reject an invalid code scorer at author time.
+
+    A scorer that fails to compile would otherwise be skipped silently on every
+    example of every run — the run would complete, the metric would simply be
+    absent, and nothing would say why.
+    """
+    try:
+        compile_scorer(source)
+    except ScorerError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc),
+        ) from exc
+
+
+class TestScorerRequest(BaseModel):
+    """A scorer plus one example to try it on."""
+    source:   str
+    output:   str = ""
+    expected: str = ""
+    input:    str = ""
+    metadata: Dict[str, Any] = {}
+
+
+@prompts_router.get("/prompts/code-scorer/reference")
+async def code_scorer_reference(_session: dict = Depends(get_current_session)):
+    """What a code scorer may reference, for the editor's help panel.
+
+    Served rather than duplicated in the frontend so the two can't disagree
+    about which helpers exist.
+    """
+    return {
+        "scope":    list(SCOPE_NAMES),
+        "builtins": list(BUILTIN_NAMES),
+    }
+
+
+@prompts_router.post("/prompts/code-scorer/test")
+async def test_code_scorer(
+    payload: TestScorerRequest,
+    _session: dict = Depends(get_current_session),
+):
+    """Run a code scorer against one example and return what it scored.
+
+    Authoring a scorer blind and finding out across a whole run is the slow way
+    to get it wrong, so the editor can try one here first. Errors come back 200
+    with ``ok: false`` — a scorer that legitimately rejects its input is a normal
+    result to render, not a failed request.
+    """
+    try:
+        score, reason = run_scorer(
+            payload.source,
+            output=payload.output,
+            expected=payload.expected,
+            input=payload.input,
+            metadata=payload.metadata,
+        )
+    except ScorerError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "score": score, "reason": reason}
+
+
 # ── Session-authenticated CRUD ────────────────────────────────────────────────
 
 @prompts_router.get("/prompts")
@@ -124,6 +200,8 @@ async def save_prompt(
                 "a numeric \"score\" (0-1) and a \"reason\"."
             ),
         )
+    if payload.kind == "code":
+        _validate_code_scorer(payload.template)
     try:
         row = await create_prompt(
             org_id=org_id,
@@ -152,6 +230,12 @@ async def edit_prompt(
     session: dict = Depends(get_current_session),
 ):
     org_id = uuid.UUID(session["org_id"])
+    # An edit that breaks a code scorer must be rejected here, not discovered
+    # once it has silently skipped every example of the next run.
+    if payload.template is not None:
+        existing = await get_prompt_full(prompt_id, org_id)
+        if existing and existing.get("kind") == "code":
+            _validate_code_scorer(payload.template)
     row = await update_prompt(
         prompt_id, org_id,
         name=payload.name,

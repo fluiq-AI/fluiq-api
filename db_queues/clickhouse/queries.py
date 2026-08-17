@@ -65,10 +65,12 @@ class ClickHouseQueryMixin:
         security: str = "all",
         integration: str = "all",
         quality: str = "all",
+        tags: Optional[list[str]] = None,
         table: Optional[str] = None,
         costs_table: Optional[str] = None,
         evaluations_table: Optional[str] = None,
         security_table: Optional[str] = None,
+        tags_table: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         if self._client is None:  # type: ignore[attr-defined]
             await self.start()  # type: ignore[attr-defined]
@@ -87,6 +89,25 @@ class ClickHouseQueryMixin:
         if api_key_prefix is not None:
             where += " AND t.api_key_prefix = {prefix:String}"
             params["prefix"] = api_key_prefix
+        if tags:
+            # A pre-join predicate on the base table, deliberately: putting it
+            # here keeps the fast path (page first, join after) valid, whereas a
+            # join on the tags table would force every tag-filtered load down the
+            # slow full-join branch.
+            #
+            # AND, not OR: two tags means "traces carrying both". Filters
+            # everywhere else in this list narrow, and one that widened instead
+            # would be a trap.
+            tags_target = tags_table or config.CLICKHOUSE_TRACE_TAGS_TABLE
+            for i, tag in enumerate(tags):
+                where += (
+                    f" AND t.trace_id IN ("
+                    f"   SELECT trace_id FROM {tags_target} FINAL"
+                    f"   WHERE organization_id = {{org_id:UUID}}"
+                    f"     AND tag = {{tag_{i}:String}} AND deleted = 0"
+                    f" )"
+                )
+                params[f"tag_{i}"] = tag
         if root_trace_id is not None:
             where += " AND t.root_trace_id = {root_trace_id:UUID}"
             params["root_trace_id"] = str(root_trace_id)
@@ -457,6 +478,658 @@ class ClickHouseQueryMixin:
         return [
             {"day": row[0], "provider": row[1] or "", "cost": float(row[2] or 0)}
             for row in result.result_rows
+        ]
+
+    # ── Trace tags ────────────────────────────────────────────────────────────
+
+    async def add_trace_tags(
+        self,
+        organization_id: uuid.UUID,
+        trace_id: uuid.UUID,
+        tags: list[str],
+        root_trace_id: Optional[uuid.UUID] = None,
+        source: str = "dashboard",
+        created_by: str = "",
+        table: Optional[str] = None,
+    ) -> None:
+        """Attach tags to a trace. Idempotent — re-tagging replaces the row.
+
+        Writes ``deleted = 0`` explicitly so re-adding a previously removed tag
+        supersedes the tombstone instead of racing it.
+        """
+        if not tags:
+            return
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target = table or config.CLICKHOUSE_TRACE_TAGS_TABLE
+        now = datetime.now(timezone.utc)
+        rows = [
+            [
+                organization_id, trace_id, root_trace_id or trace_id,
+                tag, source, created_by, 0, now,
+            ]
+            for tag in tags
+        ]
+        await self._client.insert(  # type: ignore[attr-defined]
+            target, rows,
+            column_names=[
+                "organization_id", "trace_id", "root_trace_id",
+                "tag", "source", "created_by", "deleted", "updated_at",
+            ],
+        )
+
+    async def remove_trace_tag(
+        self,
+        organization_id: uuid.UUID,
+        trace_id: uuid.UUID,
+        tag: str,
+        table: Optional[str] = None,
+    ) -> None:
+        """Untag by inserting a tombstone. ReplacingMergeTree collapses it onto
+        the original row; reads filter ``deleted = 0`` after FINAL."""
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target = table or config.CLICKHOUSE_TRACE_TAGS_TABLE
+        await self._client.insert(  # type: ignore[attr-defined]
+            target,
+            [[organization_id, trace_id, trace_id, tag, "dashboard", "", 1,
+              datetime.now(timezone.utc)]],
+            column_names=[
+                "organization_id", "trace_id", "root_trace_id",
+                "tag", "source", "created_by", "deleted", "updated_at",
+            ],
+        )
+
+    async def fetch_tags_for_traces(
+        self,
+        organization_id: uuid.UUID,
+        trace_ids: list[str],
+        table: Optional[str] = None,
+    ) -> dict[str, list[str]]:
+        """``{trace_id: [tag, …]}`` for a page of traces.
+
+        Fetched separately rather than joined into the trace query: tags are a
+        many-per-trace dimension, and joining them would either fan the page out
+        or need another groupArray subquery in a query that already has two.
+        """
+        if not trace_ids:
+            return {}
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target = table or config.CLICKHOUSE_TRACE_TAGS_TABLE
+        result = await self._client.query(  # type: ignore[attr-defined]
+            f"SELECT toString(trace_id), tag FROM {target} FINAL "
+            f"WHERE organization_id = {{org_id:UUID}} "
+            f"  AND trace_id IN {{trace_ids:Array(UUID)}} "
+            f"  AND deleted = 0",
+            parameters={"org_id": str(organization_id), "trace_ids": trace_ids},
+        )
+        out: dict[str, list[str]] = {}
+        for trace_id, tag in result.result_rows:
+            out.setdefault(str(trace_id), []).append(tag)
+        return out
+
+    async def fetch_org_tags(
+        self,
+        organization_id: uuid.UUID,
+        limit: int = 100,
+        table: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Every tag the org uses, with counts — for the filter's dropdown.
+
+        Ordered by frequency: a tag applied to one trace by accident should not
+        sit above the one applied to ten thousand on purpose.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target = table or config.CLICKHOUSE_TRACE_TAGS_TABLE
+        result = await self._client.query(  # type: ignore[attr-defined]
+            f"SELECT tag, count() AS n FROM {target} FINAL "
+            f"WHERE organization_id = {{org_id:UUID}} AND deleted = 0 "
+            f"GROUP BY tag ORDER BY n DESC LIMIT {{limit:UInt32}}",
+            parameters={"org_id": str(organization_id), "limit": int(limit)},
+        )
+        return [{"tag": r[0], "count": int(r[1] or 0)} for r in result.result_rows]
+
+    # ── Review ────────────────────────────────────────────────────────────────
+
+    async def set_review_flag(
+        self,
+        organization_id: uuid.UUID,
+        trace_id: uuid.UUID,
+        *,
+        status: str = "open",
+        reason: str = "manual",
+        note: str = "",
+        actor: str = "",
+        root_trace_id: Optional[uuid.UUID] = None,
+        table: Optional[str] = None,
+    ) -> None:
+        """Raise or clear a review flag. Idempotent — re-flagging replaces."""
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target = table or config.CLICKHOUSE_REVIEW_FLAGS_TABLE
+        await self._client.insert(  # type: ignore[attr-defined]
+            target,
+            [[
+                organization_id, trace_id, root_trace_id or trace_id,
+                status, reason, note,
+                actor if status == "open" else "",
+                actor if status == "resolved" else "",
+                datetime.now(timezone.utc),
+            ]],
+            column_names=[
+                "organization_id", "trace_id", "root_trace_id",
+                "status", "reason", "note",
+                "flagged_by", "resolved_by", "updated_at",
+            ],
+        )
+
+    async def fetch_flags_for_traces(
+        self,
+        organization_id: uuid.UUID,
+        trace_ids: list[str],
+        table: Optional[str] = None,
+    ) -> dict[str, dict[str, Any]]:
+        """``{trace_id: {status, reason, note}}`` for a page of traces."""
+        if not trace_ids:
+            return {}
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target = table or config.CLICKHOUSE_REVIEW_FLAGS_TABLE
+        result = await self._client.query(  # type: ignore[attr-defined]
+            f"SELECT toString(trace_id), status, reason, note FROM {target} FINAL "
+            f"WHERE organization_id = {{org_id:UUID}} "
+            f"  AND trace_id IN {{trace_ids:Array(UUID)}}",
+            parameters={"org_id": str(organization_id), "trace_ids": trace_ids},
+        )
+        return {
+            str(r[0]): {"status": r[1], "reason": r[2], "note": r[3]}
+            for r in result.result_rows
+        }
+
+    async def fetch_review_queue(
+        self,
+        organization_id: uuid.UUID,
+        hours: int = 168,
+        limit: int = 100,
+        offset: int = 0,
+        source: str = "all",
+        table: Optional[str] = None,
+        evals_table: Optional[str] = None,
+        flags_table: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Traces that want a human, worst first.
+
+        Three things put a trace here, and the queue unions them rather than
+        making the reviewer check three places:
+
+          ``flagged``   someone raised it by hand
+          ``feedback``  an end user said it was bad
+          ``low_score`` a judge scored it below the review threshold
+
+        Ordered by human verdict then judge score, so the rows a person already
+        told us are bad lead — those are the ones with the most information in
+        them, and the ones a reviewer can act on fastest.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target       = table       or self.default_table  # type: ignore[attr-defined]
+        evals_target = evals_table or config.CLICKHOUSE_EVALUATIONS_TABLE
+        flags_target = flags_table or config.CLICKHOUSE_REVIEW_FLAGS_TABLE
+
+        # Built as a scored per-trace summary first, then filtered — the three
+        # sources overlap constantly (a thumbs-down usually also scores badly),
+        # and unioning row sets would double-count those.
+        having = {
+            "flagged":  "flag_status = 'open'",
+            "feedback": "human_score IS NOT NULL AND human_score < 0.5",
+            "low_score": "judge_score IS NOT NULL AND judge_score < 0.5",
+        }.get(source) or (
+            "flag_status = 'open' "
+            "OR (human_score IS NOT NULL AND human_score < 0.5) "
+            "OR (judge_score IS NOT NULL AND judge_score < 0.5)"
+        )
+
+        result = await self._client.query(  # type: ignore[attr-defined]
+            f"""
+SELECT toString(t.trace_id)          AS trace_id,
+       toString(t.root_trace_id)     AS root_trace_id,
+       t.ingested_at                 AS ingested_at,
+       JSONExtractString(toString(t.event), 'model')       AS model,
+       JSONExtractString(toString(t.event), 'integration') AS integration,
+       substring(JSONExtractString(toString(t.event), 'response'), 1, 300) AS preview,
+       e.judge_score                 AS judge_score,
+       e.human_score                 AS human_score,
+       e.comment                     AS comment,
+       f.status                      AS flag_status,
+       f.reason                      AS flag_reason,
+       f.note                        AS flag_note
+FROM {target} AS t
+LEFT JOIN (
+    SELECT trace_id,
+           avgIf(score, evaluator NOT LIKE 'human.%')  AS judge_score,
+           avgIf(score, evaluator LIKE 'human.%')      AS human_score,
+           anyIf(JSONExtractString(toString(details), 'comment'),
+                 evaluator LIKE 'human.%')             AS comment
+    FROM {evals_target}
+    WHERE organization_id = {{org_id:UUID}}
+    GROUP BY trace_id
+) AS e ON t.trace_id = e.trace_id
+LEFT JOIN (
+    SELECT trace_id, status, reason, note FROM {flags_target} FINAL
+    WHERE organization_id = {{org_id:UUID}}
+) AS f ON t.trace_id = f.trace_id
+WHERE t.organization_id = {{org_id:UUID}}
+  AND t.ingested_at >= now() - toIntervalHour({{hours:UInt32}})
+  AND (t.is_root = 1 OR t.trace_id = t.root_trace_id)
+  AND ({having})
+  AND (f.status != 'resolved' OR f.status = '')
+ORDER BY human_score ASC NULLS LAST, judge_score ASC NULLS LAST, t.ingested_at DESC
+LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}
+""",
+            parameters={
+                "org_id": str(organization_id),
+                "hours":  int(hours),
+                "limit":  int(limit),
+                "offset": int(offset),
+            },
+        )
+
+        def _f(v: Any) -> Optional[float]:
+            return float(v) if v is not None else None
+
+        return [
+            {
+                "trace_id":      r[0],
+                "root_trace_id": r[1],
+                "ingested_at":   r[2].isoformat() if r[2] else None,
+                "model":         r[3] or None,
+                "integration":   r[4] or None,
+                "preview":       r[5] or "",
+                "judge_score":   _f(r[6]),
+                "human_score":   _f(r[7]),
+                "comment":       r[8] or "",
+                "flag_status":   r[9] or "",
+                "flag_reason":   r[10] or "",
+                "flag_note":     r[11] or "",
+            }
+            for r in result.result_rows
+        ]
+
+    async def fetch_judge_agreement_pairs(
+        self,
+        organization_id: uuid.UUID,
+        judge_metric: str,
+        human_field: Optional[str] = None,
+        hours: int = 720,
+        limit: int = 2000,
+        table: Optional[str] = None,
+        evals_table: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Every trace where one judge metric and a human both left a score.
+
+        This is the raw material for asking whether a judge is any good: pairs
+        of (what the judge said, what a person said) about the same output.
+
+        ``human_field`` names a rubric field. Left unset, every human annotation
+        on the trace is averaged — right when the rubric is a single quality
+        question, wrong when it holds several unrelated ones, so callers that
+        know which field they mean should say so.
+
+        Only traces carrying both sides come back. A judge score with no human
+        label is not evidence about the judge, and silently treating an absent
+        label as a zero would manufacture disagreement out of nothing.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target       = table       or self.default_table  # type: ignore[attr-defined]
+        evals_target = evals_table or config.CLICKHOUSE_EVALUATIONS_TABLE
+
+        # Restricting the human side to one field, when asked, happens inside the
+        # aggregate rather than as a row filter: a WHERE would also drop the
+        # judge rows on the same trace and leave nothing to pair with.
+        human_expr = (
+            "avgIf(score, evaluator LIKE 'human.%' AND metric = {human_field:String})"
+            if human_field else
+            "avgIf(score, evaluator LIKE 'human.%')"
+        )
+        human_count = (
+            "countIf(evaluator LIKE 'human.%' AND metric = {human_field:String})"
+            if human_field else
+            "countIf(evaluator LIKE 'human.%')"
+        )
+
+        result = await self._client.query(  # type: ignore[attr-defined]
+            f"""
+SELECT toString(e.trace_id) AS trace_id,
+       e.judge              AS judge,
+       e.human              AS human,
+       e.comment            AS comment,
+       substring(JSONExtractString(toString(t.event), 'response'), 1, 300) AS preview,
+       substring(JSONExtractString(toString(t.event), 'prompt'), 1, 300)   AS input
+FROM (
+    SELECT trace_id,
+           avgIf(score, evaluator NOT LIKE 'human.%'
+                        AND metric = {{judge_metric:String}})  AS judge,
+           {human_expr}                                        AS human,
+           anyIf(JSONExtractString(toString(details), 'comment'),
+                 evaluator LIKE 'human.%')                     AS comment
+    FROM {evals_target}
+    WHERE organization_id = {{org_id:UUID}}
+      AND ingested_at >= now() - toIntervalHour({{hours:UInt32}})
+    GROUP BY trace_id
+    HAVING countIf(evaluator NOT LIKE 'human.%'
+                   AND metric = {{judge_metric:String}}) > 0
+       AND {human_count} > 0
+) AS e
+LEFT JOIN {target} AS t ON t.trace_id = e.trace_id
+WHERE t.organization_id = {{org_id:UUID}}
+LIMIT {{limit:UInt32}}
+""",
+            parameters={
+                "org_id":       str(organization_id),
+                "judge_metric": str(judge_metric),
+                "human_field":  str(human_field or ""),
+                "hours":        int(hours),
+                "limit":        int(limit),
+            },
+        )
+        return [
+            {
+                "trace_id": r[0],
+                "judge":    float(r[1]) if r[1] is not None else None,
+                "human":    float(r[2]) if r[2] is not None else None,
+                "comment":  r[3] or "",
+                "preview":  r[4] or "",
+                "input":    r[5] or "",
+            }
+            for r in result.result_rows
+        ]
+
+    async def fetch_labelled_metrics(
+        self,
+        organization_id: uuid.UUID,
+        hours: int = 720,
+        table: Optional[str] = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Which judge metrics and rubric fields have enough overlap to compare.
+
+        Offered so the UI can present only pairings that would actually produce
+        an answer. Without it the obvious design is two free dropdowns, most of
+        whose combinations return "0 examples compared" — an empty result that
+        reads like a bug rather than like a choice that was never viable.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        evals_target = table or config.CLICKHOUSE_EVALUATIONS_TABLE
+        result = await self._client.query(  # type: ignore[attr-defined]
+            f"""
+SELECT metric,
+       evaluator LIKE 'human.%' AS is_human,
+       count()                  AS scored,
+       uniqExact(trace_id)      AS traces
+FROM {evals_target}
+WHERE organization_id = {{org_id:UUID}}
+  AND ingested_at >= now() - toIntervalHour({{hours:UInt32}})
+  AND metric != ''
+GROUP BY metric, is_human
+ORDER BY traces DESC
+LIMIT 200
+""",
+            parameters={"org_id": str(organization_id), "hours": int(hours)},
+        )
+        judges: list[dict[str, Any]] = []
+        humans: list[dict[str, Any]] = []
+        for metric, is_human, scored, traces in result.result_rows:
+            row = {"metric": metric, "scored": int(scored), "traces": int(traces)}
+            (humans if is_human else judges).append(row)
+        return {"judge_metrics": judges, "human_fields": humans}
+
+    async def fetch_review_matrix(
+        self,
+        organization_id: uuid.UUID,
+        hours: int = 168,
+        threshold: float = 0.5,
+        evals_table: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Human verdict crossed with judge score, per trace.
+
+        The diagnostic from the workshop (09:25–11:28): the interesting cells are
+        the two where the human and the judge disagree, because those say the
+        *eval* is wrong rather than the app. Counting them is the difference
+        between "our scores went down" and knowing which of the two to fix.
+
+        Only traces carrying both signals can be placed, so the response also
+        reports how many were skipped — a matrix built from four traces should
+        not be read as confidently as one built from four hundred.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        evals_target = evals_table or config.CLICKHOUSE_EVALUATIONS_TABLE
+        result = await self._client.query(  # type: ignore[attr-defined]
+            f"""
+SELECT countIf(human_good AND judge_good)          AS agreed_good,
+       countIf(human_good AND NOT judge_good)      AS judge_harsh,
+       countIf(NOT human_good AND judge_good)      AS judge_lenient,
+       countIf(NOT human_good AND NOT judge_good)  AS agreed_bad
+FROM (
+    SELECT trace_id,
+           avgIf(score, evaluator LIKE 'human.%')     >= {{threshold:Float64}} AS human_good,
+           avgIf(score, evaluator NOT LIKE 'human.%') >= {{threshold:Float64}} AS judge_good
+    FROM {evals_target}
+    WHERE organization_id = {{org_id:UUID}}
+      AND ingested_at >= now() - toIntervalHour({{hours:UInt32}})
+    GROUP BY trace_id
+    HAVING countIf(evaluator LIKE 'human.%') > 0
+       AND countIf(evaluator NOT LIKE 'human.%') > 0
+)
+""",
+            parameters={
+                "org_id":    str(organization_id),
+                "hours":     int(hours),
+                "threshold": float(threshold),
+            },
+        )
+        row = result.result_rows[0] if result.result_rows else (0, 0, 0, 0)
+
+        # How much of the window could not be placed, so the matrix can say what
+        # it is a matrix *of* rather than implying it covers everything.
+        coverage = await self._client.query(  # type: ignore[attr-defined]
+            f"""
+SELECT countIf(has_human > 0 AND has_judge > 0) AS both,
+       countIf(has_judge > 0 AND has_human = 0) AS judge_only,
+       countIf(has_human > 0 AND has_judge = 0) AS human_only
+FROM (
+    SELECT trace_id,
+           countIf(evaluator LIKE 'human.%')     AS has_human,
+           countIf(evaluator NOT LIKE 'human.%') AS has_judge
+    FROM {evals_target}
+    WHERE organization_id = {{org_id:UUID}}
+      AND ingested_at >= now() - toIntervalHour({{hours:UInt32}})
+    GROUP BY trace_id
+)
+""",
+            parameters={"org_id": str(organization_id), "hours": int(hours)},
+        )
+        cov = coverage.result_rows[0] if coverage.result_rows else (0, 0, 0)
+
+        return {
+            "agreed_good":   int(row[0] or 0),
+            "judge_harsh":   int(row[1] or 0),
+            "judge_lenient": int(row[2] or 0),
+            "agreed_bad":    int(row[3] or 0),
+            "coverage": {
+                "both":       int(cov[0] or 0),
+                "judge_only": int(cov[1] or 0),
+                "human_only": int(cov[2] or 0),
+            },
+        }
+
+    # ── Monitor (operational time series) ─────────────────────────────────────
+
+    async def fetch_monitor_series(
+        self,
+        organization_id: uuid.UUID,
+        hours: int = 72,
+        bucket_minutes: int = 60,
+        model: Optional[str] = None,
+        table: Optional[str] = None,
+        costs_table: Optional[str] = None,
+        evals_table: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Operational metrics over time: volume, latency, spend, tokens, scores.
+
+        Three separate grouped queries rather than one joined one. Joining
+        traces to costs to evaluations would fan out — a trace with four eval
+        rows would count four times toward latency and spend — and the fix
+        (nested aggregation before the join) reads worse and runs slower than
+        asking each table its own question. Each returns at most
+        ``hours × 60 / bucket_minutes`` rows.
+
+        Latency percentiles come from the event JSON, which is the only place a
+        span's duration is recorded.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        target       = table       or self.default_table  # type: ignore[attr-defined]
+        costs_target = costs_table or config.CLICKHOUSE_TRACE_COSTS_TABLE
+        evals_target = evals_table or config.CLICKHOUSE_EVALUATIONS_TABLE
+
+        bucket = max(1, int(bucket_minutes))
+        params = {
+            "org_id": str(organization_id),
+            "hours":  int(hours),
+            "bucket": bucket,
+        }
+        # An empty model filter must not become `model = ''`, which would match
+        # nothing rather than everything.
+        model_filter = ""
+        if model:
+            params["model"] = model
+            model_filter = " AND JSONExtractString(toString(event), 'model') = {model:String}"
+
+        traffic = await self._client.query(  # type: ignore[attr-defined]
+            f"""
+SELECT toString(toStartOfInterval(ingested_at, INTERVAL {{bucket:UInt32}} MINUTE)) AS bucket,
+       count()                                                        AS spans,
+       countIf(is_root = 1)                                           AS runs,
+       quantile(0.5)(JSONExtractFloat(toString(event), 'latency'))    AS p50,
+       quantile(0.95)(JSONExtractFloat(toString(event), 'latency'))   AS p95,
+       countIf(JSONExtractBool(toString(event), 'success') = 0)       AS errors
+FROM {target}
+WHERE organization_id = {{org_id:UUID}}
+  AND ingested_at >= now() - toIntervalHour({{hours:UInt32}}){model_filter}
+GROUP BY bucket
+ORDER BY bucket
+""",
+            parameters=params,
+        )
+
+        spend = await self._client.query(  # type: ignore[attr-defined]
+            f"""
+SELECT toString(toStartOfInterval(ingested_at, INTERVAL {{bucket:UInt32}} MINUTE)) AS bucket,
+       sum(total_cost)                        AS cost,
+       sum(input_tokens + output_tokens)      AS tokens,
+       sum(cached_input_tokens)               AS cached_tokens
+FROM {costs_target}
+WHERE organization_id = {{org_id:UUID}}
+  AND ingested_at >= now() - toIntervalHour({{hours:UInt32}})
+GROUP BY bucket
+ORDER BY bucket
+""",
+            parameters={k: v for k, v in params.items() if k != "model"},
+        )
+
+        # Human feedback rides in the same table under evaluator 'human.%', and
+        # must not be averaged into an automated quality score — they answer
+        # different questions and move for different reasons.
+        scores = await self._client.query(  # type: ignore[attr-defined]
+            f"""
+SELECT toString(toStartOfInterval(ingested_at, INTERVAL {{bucket:UInt32}} MINUTE)) AS bucket,
+       avgIf(score, evaluator NOT LIKE 'human.%')     AS judge_score,
+       countIf(evaluator NOT LIKE 'human.%')          AS judged,
+       avgIf(score, evaluator = 'human.feedback')     AS feedback_score,
+       countIf(evaluator = 'human.feedback')          AS feedback_count
+FROM {evals_target}
+WHERE organization_id = {{org_id:UUID}}
+  AND ingested_at >= now() - toIntervalHour({{hours:UInt32}})
+GROUP BY bucket
+ORDER BY bucket
+""",
+            parameters={k: v for k, v in params.items() if k != "model"},
+        )
+
+        def _f(value: Any) -> Optional[float]:
+            return float(value) if value is not None else None
+
+        return {
+            "traffic": [
+                {
+                    "bucket": r[0], "spans": int(r[1] or 0), "runs": int(r[2] or 0),
+                    "p50": _f(r[3]), "p95": _f(r[4]), "errors": int(r[5] or 0),
+                }
+                for r in traffic.result_rows
+            ],
+            "spend": [
+                {
+                    "bucket": r[0], "cost": float(r[1] or 0),
+                    "tokens": int(r[2] or 0), "cached_tokens": int(r[3] or 0),
+                }
+                for r in spend.result_rows
+            ],
+            "scores": [
+                {
+                    "bucket": r[0], "judge_score": _f(r[1]), "judged": int(r[2] or 0),
+                    "feedback_score": _f(r[3]), "feedback_count": int(r[4] or 0),
+                }
+                for r in scores.result_rows
+            ],
+        }
+
+    async def fetch_monitor_breakdown(
+        self,
+        organization_id: uuid.UUID,
+        hours: int = 72,
+        limit: int = 8,
+        costs_table: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Per-model totals for the window: calls, tokens, spend.
+
+        The companion to the time series: a line going up tells you something
+        changed, and this tells you which model it was.
+        """
+        if self._client is None:  # type: ignore[attr-defined]
+            await self.start()  # type: ignore[attr-defined]
+        costs_target = costs_table or config.CLICKHOUSE_TRACE_COSTS_TABLE
+        result = await self._client.query(  # type: ignore[attr-defined]
+            f"""
+SELECT model,
+       provider,
+       count()                            AS calls,
+       sum(input_tokens + output_tokens)  AS tokens,
+       sum(total_cost)                    AS cost
+FROM {costs_target}
+WHERE organization_id = {{org_id:UUID}}
+  AND ingested_at >= now() - toIntervalHour({{hours:UInt32}})
+  AND model != ''
+GROUP BY model, provider
+ORDER BY cost DESC
+LIMIT {{limit:UInt32}}
+""",
+            parameters={
+                "org_id": str(organization_id),
+                "hours":  int(hours),
+                "limit":  int(limit),
+            },
+        )
+        return [
+            {
+                "model": r[0] or "", "provider": r[1] or "",
+                "calls": int(r[2] or 0), "tokens": int(r[3] or 0),
+                "cost": float(r[4] or 0),
+            }
+            for r in result.result_rows
         ]
 
     # ── Agents ────────────────────────────────────────────────────────────────

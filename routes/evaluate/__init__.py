@@ -33,6 +33,18 @@ from db_queues.postgresql.prompts import get_custom_judge_template
 from realtime import trace_broker
 from routes.auth.helper import extract_api_key, get_current_session
 from shared.quotas import bump_eval_count, get_quota_status
+from shared.providers import BYOK_FOR_PRICE, PROVIDER_DISPLAY
+from shared.completions import (
+    MILLION,
+    MOONSHOT_BASE_URL,
+    PRICE_PROVIDER,
+    complete_anthropic,
+    complete_for,
+    complete_gemini,
+    complete_openai,
+    estimate_cost,
+    provider_for_model,
+)
 from .judge import run_custom_judges, run_metrics, SUPPORTED_METRICS
 from .judge import (
     _PROMPTS as _METRIC_PROMPTS,
@@ -394,28 +406,16 @@ async def evaluate_playground(
 
 # BYOK provider (what a stored key is filed under) -> the name model_prices uses.
 # None means no price sheet, so cost is simply omitted (best-effort).
-_PRICE_PROVIDER: Dict[str, Optional[str]] = {
-    "anthropic": "Anthropic",
-    "openai":    "OpenAI",
-    "gemini":    "Google",
-    "moonshot":  "Moonshot",
-}
+# Lives in shared.completions so the dataset task runner prices its generations
+# exactly the way the judge path prices its calls.
+_PRICE_PROVIDER = PRICE_PROVIDER
 
 # Reverse of the above for the providers we can actually serve: price-sheet name
 # (lowercased) -> BYOK provider id.
-_BYOK_FOR_PRICE: Dict[str, str] = {
-    "anthropic": "anthropic",
-    "openai":    "openai",
-    "google":    "gemini",
-    "moonshot":  "moonshot",
-}
-
-_PROVIDER_DISPLAY: Dict[str, str] = {
-    "anthropic": "Anthropic",
-    "openai":    "OpenAI",
-    "gemini":    "Google",
-    "moonshot":  "Moonshot",
-}
+# Both derived from the single provider registry, so a provider added there
+# appears in the model dropdown and is labelled correctly without a second edit.
+_BYOK_FOR_PRICE   = BYOK_FOR_PRICE
+_PROVIDER_DISPLAY = PROVIDER_DISPLAY
 
 # Substrings that mark a model as not a plain text-chat model. Applied to the
 # model id so these SKUs never reach a prompt-comparison dropdown.
@@ -427,9 +427,9 @@ _NON_CHAT_MARKERS = (
 )
 
 # Moonshot (Kimi) speaks the OpenAI wire format; only the host differs.
-_MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
+_MOONSHOT_BASE_URL = MOONSHOT_BASE_URL
 
-_MILLION = Decimal(1_000_000)
+_MILLION = MILLION
 
 
 def _is_chat_model(model: str) -> bool:
@@ -493,43 +493,6 @@ async def fetch_chat_models() -> List[Dict[str, str]]:
     return out
 
 
-def _d(value: Any) -> Decimal:
-    if value in (None, ""):
-        return Decimal(0)
-    return value if isinstance(value, Decimal) else Decimal(str(value))
-
-
-async def _estimate_compare_cost(
-    provider: str, model: str, in_tok: int, out_tok: int, cached_tok: int = 0
-) -> Optional[float]:
-    price_provider = _PRICE_PROVIDER.get(provider)
-    if price_provider is None:
-        return None
-    price = await pg_client.fetch_price(price_provider, model, "Text")
-    if price is None:
-        return None
-
-    billable = max(in_tok - cached_tok, 0)
-    threshold = price.get("long_context_consider_token_greater_than")
-    long_ctx = bool(threshold) and in_tok > int(threshold)
-
-    if long_ctx:
-        in_rate     = _d(price.get("long_context_input_per_million"))
-        cached_rate = _d(price.get("long_context_cached_input_per_million"))
-        out_rate    = _d(price.get("long_context_output_per_million"))
-    else:
-        in_rate     = _d(price.get("input_token_cost_per_million"))
-        cached_rate = _d(price.get("cached_input_token_cost_per_million"))
-        out_rate    = _d(price.get("output_token_cost_per_million"))
-
-    total = (
-        Decimal(billable) * in_rate
-        + Decimal(cached_tok) * cached_rate
-        + Decimal(out_tok) * out_rate
-    ) / _MILLION
-    return float(round(total, 8))
-
-
 class MetricScore(BaseModel):
     metric: str
     score:  float
@@ -585,120 +548,17 @@ class PairwiseResponse(BaseModel):
 
 # ── Provider transports ───────────────────────────────────────────────────────
 #
-# Plain completion calls over httpx (already a dependency) rather than four
-# provider SDKs. Each returns ``(output, input_tokens, output_tokens,
-# cached_tokens)``. BYOK only: the caller resolves the key from the org's stored
-# credentials, so there is no managed key to leak or forget to rotate.
+# The transports themselves live in ``shared.completions`` so the dataset task
+# runner (which generates the output) and the judge (which grades it) share one
+# implementation of provider handling, token accounting, and pricing. Aliased to
+# the original private names so every call site below is unchanged.
 
-async def _complete_anthropic(
-    key: str, model: str, prompt: str, *, system: str = "", max_tokens: int = 2048,
-) -> tuple[str, int, int, int]:
-    payload: Dict[str, Any] = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if system:
-        payload["system"] = system
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=payload,
-        )
-    r.raise_for_status()
-    body = r.json()
-    text = "".join(b.get("text", "") for b in body.get("content", []) if b.get("type") == "text")
-    usage = body.get("usage") or {}
-    cached = (usage.get("cache_read_input_tokens") or 0) + (usage.get("cache_creation_input_tokens") or 0)
-    return text, int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0), int(cached)
-
-
-async def _complete_openai(
-    key: str, model: str, prompt: str, base_url: str = "https://api.openai.com/v1",
-    *, system: str = "", max_tokens: int = 2048,
-) -> tuple[str, int, int, int]:
-    messages = ([{"role": "system", "content": system}] if system else []) + [
-        {"role": "user", "content": prompt}
-    ]
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(
-            f"{base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "content-type": "application/json"},
-            json={"model": model, "max_tokens": max_tokens, "messages": messages},
-        )
-    r.raise_for_status()
-    body = r.json()
-    choices = body.get("choices") or [{}]
-    text = (choices[0].get("message") or {}).get("content") or ""
-    usage = body.get("usage") or {}
-    cached = ((usage.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0
-    return text, int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0), int(cached)
-
-
-async def _complete_gemini(
-    key: str, model: str, prompt: str, *, system: str = "", max_tokens: int = 2048,
-) -> tuple[str, int, int, int]:
-    payload: Dict[str, Any] = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": max_tokens},
-    }
-    if system:
-        payload["systemInstruction"] = {"parts": [{"text": system}]}
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            headers={"x-goog-api-key": key, "content-type": "application/json"},
-            json=payload,
-        )
-    r.raise_for_status()
-    body = r.json()
-    parts = (((body.get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
-    text = "".join(p.get("text", "") for p in parts)
-    usage = body.get("usageMetadata") or {}
-    cached = usage.get("cachedContentTokenCount") or 0
-    return text, int(usage.get("promptTokenCount") or 0), int(usage.get("candidatesTokenCount") or 0), int(cached)
-
-
-async def _complete_for(
-    provider: str, key: str, model: str, prompt: str,
-    *, system: str = "", max_tokens: int = 2048,
-) -> tuple[str, int, int, int]:
-    """Dispatch a completion to the right provider transport."""
-    if provider == "anthropic":
-        return await _complete_anthropic(key, model, prompt, system=system, max_tokens=max_tokens)
-    if provider == "openai":
-        return await _complete_openai(key, model, prompt, system=system, max_tokens=max_tokens)
-    if provider == "moonshot":
-        return await _complete_openai(
-            key, model, prompt, base_url=_MOONSHOT_BASE_URL, system=system, max_tokens=max_tokens
-        )
-    if provider == "gemini":
-        return await _complete_gemini(key, model, prompt, system=system, max_tokens=max_tokens)
-    raise RuntimeError(f"unsupported provider {provider!r}")
-
-
-def _provider_for_model(model: str) -> Optional[str]:
-    """Resolve the BYOK provider for any compare or judge model id by its prefix.
-
-    Prefix-based so it works for any newly-priced model without a lookup table;
-    the model_prices row is the authority on which models exist, this is only the
-    mapping to the key that pays for the call.
-    """
-    m = model.lower()
-    if m.startswith("claude"):
-        return "anthropic"
-    if m.startswith(("gpt", "o1", "o3", "o4", "chatgpt")):
-        return "openai"
-    if m.startswith("gemini"):
-        return "gemini"
-    if m.startswith(("kimi", "moonshot")):
-        return "moonshot"
-    return None
+_complete_anthropic   = complete_anthropic
+_complete_openai      = complete_openai
+_complete_gemini      = complete_gemini
+_complete_for         = complete_for
+_provider_for_model   = provider_for_model
+_estimate_compare_cost = estimate_cost
 
 
 async def _run_one(prompt: str, model: str, org_id: uuid.UUID) -> CompareModelResult:

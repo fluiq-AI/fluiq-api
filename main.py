@@ -31,6 +31,15 @@ from routes.contact import router as contact_router
 from routes.blog import blog_router
 from routes.models import models_router
 from routes.alerts import alerts_router
+from routes.online_rules import online_rules_router
+from routes.monitor import monitor_router
+from routes.views import views_router
+from routes.review import review_router
+from routes.resources import resources_router
+from routes.rubrics import rubrics_router
+from routes.aggregates import aggregates_router
+from routes.sql import sql_router
+from middleware.annotator import AnnotatorScopeMiddleware
 from routes.credentials import credentials_router
 from routes.otel import otel_router
 from routes.organizations import organizations_router
@@ -141,6 +150,9 @@ class SelectiveGZipMiddleware:
 
 app.add_middleware(SelectiveGZipMiddleware)
 app.add_middleware(AuditMiddleware)
+# Ahead of the routes so a route added later is closed to contractors by
+# default rather than exposed until someone notices.
+app.add_middleware(AnnotatorScopeMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins or ["*"],
@@ -167,6 +179,14 @@ app.include_router(admin_router, prefix="/admin")
 app.include_router(audit_router, prefix="/api/v1")
 app.include_router(guardrails_router, prefix="/api/v1")
 app.include_router(alerts_router, prefix="/api/v1")
+app.include_router(online_rules_router, prefix="/api/v1")
+app.include_router(monitor_router, prefix="/api/v1")
+app.include_router(views_router, prefix="/api/v1")
+app.include_router(review_router, prefix="/api/v1")
+app.include_router(resources_router, prefix="/api/v1")
+app.include_router(rubrics_router, prefix="/api/v1")
+app.include_router(aggregates_router, prefix="/api/v1")
+app.include_router(sql_router, prefix="/api/v1")
 app.include_router(credentials_router, prefix="/api/v1")
 app.include_router(trace.router, prefix="/api/v1")
 app.include_router(otel_router, prefix="/api/v1")
