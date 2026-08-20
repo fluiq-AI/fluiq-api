@@ -196,8 +196,14 @@ async def evaluate(
 
     for metric, data in raw_results.items():
         score     = data["score"]
-        threshold = thresholds.get(metric, 0.0)
-        passed    = score >= threshold
+        # An absent threshold means the platform default, not "anything goes".
+        threshold = thresholds.get(metric, config.EVAL_DEFAULT_THRESHOLD)
+        # A judge that errored scored 0 because it never ran, not because the
+        # answer was bad. Blocking on that would take production down with the
+        # judge provider, so it is reported and not counted as a failure.
+        errored   = bool(data.get("error"))
+        passed    = errored or score >= threshold
+        # An explicit 0 is still an opt-out: "record this metric, never fail on it".
         if not passed and threshold > 0:
             failures.append(metric)
         metric_results.append(MetricResult(
@@ -230,6 +236,10 @@ class AgenticEvalRequest(BaseModel):
     # Jury members for depth="deep", same "provider:model" form. Ignored at
     # shallower depths, where no panel is convened.
     jury:          Optional[List[str]] = None
+    # The org's own judges to apply, {slug: threshold}. Without this a custom
+    # judge could only run inside a dataset run — writing one and pressing "Run
+    # Agentic Eval" on a trace did nothing, with no error to explain why.
+    custom_judges: Optional[Dict[str, float]] = None
 
 
 class AgenticEvalResponse(BaseModel):
@@ -290,6 +300,10 @@ async def evaluate_agentic(
         job["judge"] = payload.judge
     if payload.jury:
         job["jury"] = payload.jury
+    if payload.custom_judges:
+        # The worker reads custom judges out of eval_config, the same envelope
+        # a dataset run sends, so a scorer behaves identically on both paths.
+        job["eval_config"] = {"custom_judges": payload.custom_judges}
 
     await kafka_queue.add_job(job, topic=config.KAFKA_EVAL_TOPIC, key=str(org_id))
     bump_eval_count(org_id)
@@ -992,8 +1006,9 @@ async def evaluate_trace_metrics(
     results: list[MetricResult] = []
     for metric, data in raw_results.items():
         score = data["score"]
-        threshold = thresholds.get(metric, 0.0)
-        passed = score >= threshold
+        threshold = thresholds.get(metric, config.EVAL_DEFAULT_THRESHOLD)
+        # See the note above: an unreachable judge must not fail the gate.
+        passed = bool(data.get("error")) or score >= threshold
         if not passed and threshold > 0:
             failures.append(metric)
         results.append(MetricResult(metric=metric, score=score, reason=data.get("reason", ""), passed=passed))

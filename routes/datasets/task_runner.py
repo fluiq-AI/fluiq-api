@@ -29,6 +29,7 @@ once per run rather than once per example.
 """
 from __future__ import annotations
 
+import json
 import asyncio
 import logging
 import time
@@ -198,6 +199,7 @@ async def resolve_task(
     resolved_name:    Optional[str] = None
     resolved_version: Optional[int] = None
     prompt_model:     Optional[str] = None
+    prompt_tools:     List[Dict[str, Any]] = []
 
     if prompt_id is None and prompt_slug:
         row = await get_prompt_by_slug(org_id, prompt_slug.strip())
@@ -213,6 +215,7 @@ async def resolve_task(
         template = row.get("template") or ""
         resolved_version = row.get("version")
         prompt_model = row.get("model")
+        prompt_tools = _tools_from_prompt(row)
 
         if prompt_version is not None and prompt_version != resolved_version:
             # Pin to a historical version so re-running an old experiment grades
@@ -237,7 +240,11 @@ async def resolve_task(
         )
 
     parsed_messages = _parse_messages(messages)
-    parsed_tools = _parse_tools(tools, where="task")
+    # An explicit toolset on the run wins; otherwise the saved prompt's own
+    # tools come along, so evaluating an agentic prompt doesn't silently run it
+    # without the tools it was written for — which would look like the model
+    # failing to call anything rather than like a misconfigured run.
+    parsed_tools = _parse_tools(tools, where="task") if tools else prompt_tools
     parsed_steps = [_parse_step(raw, index) for index, raw in enumerate(steps or [])]
 
     # A conversation replaces the single template, so one is only required when
@@ -300,6 +307,36 @@ def _parse_messages(raw: Optional[List[Dict[str, str]]]) -> List[Dict[str, str]]
         # answer and the run would score empty responses.
         raise TaskError("A conversation needs at least one user turn.")
     return out
+
+
+def _tools_from_prompt(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The toolset a saved prompt carries, flattened for the provider call.
+
+    A prompt stores plain tools and MCP servers separately, but a model is
+    offered one flat list — it selects by name and never sees the distinction.
+    The ``kind``/``server`` fields ride along so the agentic evaluator can still
+    tell an MCP call from a local one when it grades tool selection.
+    """
+    config = row.get("config")
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except ValueError:
+            return []
+    if not isinstance(config, dict):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for tool in config.get("tools") or []:
+        if isinstance(tool, dict) and str(tool.get("name") or "").strip():
+            out.append(dict(tool))
+    for server in config.get("mcp_servers") or []:
+        if not isinstance(server, dict):
+            continue
+        for tool in server.get("tools") or []:
+            if isinstance(tool, dict) and str(tool.get("name") or "").strip():
+                out.append({**tool, "kind": "mcp", "server": server.get("label")})
+    return out[:MAX_TOOLS]
 
 
 def _parse_tools(raw: Optional[List[Dict[str, Any]]], *, where: str) -> List[Dict[str, Any]]:

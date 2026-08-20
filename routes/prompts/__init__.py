@@ -17,7 +17,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from db_queues.postgresql.auth import resolve_api_key
 from db_queues.postgresql.prompts import (
@@ -57,6 +57,120 @@ VALID_PROMPT_KINDS = frozenset({"completion", "judge", "code"})
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
+MAX_PROMPT_TOOLS = 32
+MAX_MCP_SERVERS = 8
+
+#: What a judge prompt grades. An agent fails in more than one place — the wrong
+#: tool, the wrong documents, the wrong order, the wrong path, the wrong final
+#: answer — and each is a different prompt with different evidence in front of
+#: it. 'output' is the default and the only one that needs no trace.
+VALID_SCORE_TARGETS = frozenset({
+    "output", "retrieval", "tools", "trajectory", "coordination",
+})
+
+
+class ToolDef(BaseModel):
+    """A tool the prompt's model may call.
+
+    Carried on the prompt rather than only on a run, because for an agentic
+    prompt the toolset *is* part of the prompt: the same template with a
+    different set of tools is a different thing to evaluate, and tool selection
+    is the layer the agentic evaluator grades.
+    """
+    name:        str
+    description: str = ""
+    parameters:  Dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
+
+
+class McpServerDef(BaseModel):
+    """An MCP server whose tools the prompt may call.
+
+    ``tools`` is optional: naming the server alone records the dependency, and
+    listing its tools lets the evaluator score whether the right one was picked
+    without having to reach the server at eval time.
+    """
+    label:       str
+    url:         Optional[str] = None
+    description: str = ""
+    tools:       List[ToolDef] = Field(default_factory=list)
+
+
+def _validate_tools(tools: Optional[List[ToolDef]]) -> List[Dict[str, Any]]:
+    """Reject duplicate or unnamed tools at author time.
+
+    Providers reject duplicates too, but the error they return names the JSON
+    schema rather than the tool, which is no help when it surfaces mid-run.
+    """
+    if not tools:
+        return []
+    if len(tools) > MAX_PROMPT_TOOLS:
+        raise ValueError(f"At most {MAX_PROMPT_TOOLS} tools per prompt.")
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for tool in tools:
+        name = (tool.name or "").strip()
+        if not name:
+            raise ValueError("Every tool needs a name.")
+        if name in seen:
+            raise ValueError(f"Duplicate tool: {name!r}")
+        seen.add(name)
+        out.append({
+            "name":        name,
+            "description": (tool.description or "").strip(),
+            "parameters":  tool.parameters or {"type": "object", "properties": {}},
+            "kind":        "tool",
+        })
+    return out
+
+
+def _validate_mcp(servers: Optional[List[McpServerDef]]) -> List[Dict[str, Any]]:
+    """Same contract as tools, one level down.
+
+    A tool name must be unique across the whole offered set, not just within
+    its server — the model picks by name and never sees which server a name
+    came from, so two servers exporting ``search`` is genuinely ambiguous.
+    """
+    if not servers:
+        return []
+    if len(servers) > MAX_MCP_SERVERS:
+        raise ValueError(f"At most {MAX_MCP_SERVERS} MCP servers per prompt.")
+    seen_labels: set[str] = set()
+    seen_tools: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for server in servers:
+        label = (server.label or "").strip()
+        if not label:
+            raise ValueError("Every MCP server needs a label.")
+        if label in seen_labels:
+            raise ValueError(f"Duplicate MCP server: {label!r}")
+        seen_labels.add(label)
+        tools: List[Dict[str, Any]] = []
+        for tool in server.tools or []:
+            name = (tool.name or "").strip()
+            if not name:
+                raise ValueError(f"MCP server {label!r}: every tool needs a name.")
+            if name in seen_tools:
+                raise ValueError(
+                    f"Tool {name!r} is offered by more than one MCP server. "
+                    f"The model selects by name, so the duplicate is ambiguous."
+                )
+            seen_tools.add(name)
+            tools.append({
+                "name":        name,
+                "description": (tool.description or "").strip(),
+                "parameters":  tool.parameters or {"type": "object", "properties": {}},
+                "kind":        "mcp",
+                "server":      label,
+            })
+        out.append({
+            "label":       label,
+            "url":         (server.url or "").strip() or None,
+            "description": (server.description or "").strip(),
+            "tools":       tools,
+        })
+    return out
+
+
 class SavePromptRequest(BaseModel):
     name:      str
     slug:      str
@@ -64,6 +178,22 @@ class SavePromptRequest(BaseModel):
     model:     Optional[str] = None
     variables: List[str]     = []
     kind:      str           = "completion"
+    # Agentic prompts carry what the model may call. Stored under the prompt's
+    # existing ``config`` jsonb, so this needs no migration.
+    tools:       List[ToolDef]      = Field(default_factory=list)
+    mcp_servers: List[McpServerDef] = Field(default_factory=list)
+    #: Which part of a run a judge prompt grades. Ignored for non-judge kinds.
+    target:      str                = "output"
+
+    @field_validator("target")
+    @classmethod
+    def _validate_target(cls, v: str) -> str:
+        v = (v or "output").strip().lower()
+        if v not in VALID_SCORE_TARGETS:
+            raise ValueError(
+                f"target must be one of: {', '.join(sorted(VALID_SCORE_TARGETS))}"
+            )
+        return v
 
     @field_validator("kind")
     @classmethod
@@ -105,6 +235,11 @@ class UpdatePromptRequest(BaseModel):
     template:  Optional[str]       = None
     model:     Optional[str]       = None
     variables: Optional[List[str]] = None
+    # Omitted leaves the prompt's toolset untouched; an empty list clears it.
+    # Without that distinction there would be no way to remove the last tool.
+    tools:       Optional[List[ToolDef]]      = None
+    mcp_servers: Optional[List[McpServerDef]] = None
+    target:      Optional[str]                = None
 
 
 class DeployRequest(BaseModel):
@@ -203,6 +338,20 @@ async def save_prompt(
     if payload.kind == "code":
         _validate_code_scorer(payload.template)
     try:
+        tools = _validate_tools(payload.tools)
+        mcp = _validate_mcp(payload.mcp_servers)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc),
+        ) from exc
+    # Only write a config when there is something in it, so an ordinary
+    # completion prompt keeps a NULL config rather than an empty envelope.
+    config = {k: v for k, v in {"tools": tools, "mcp_servers": mcp}.items() if v}
+    # Only recorded for judges, and only when it isn't the default — an
+    # 'output' target stored explicitly would imply a choice nobody made.
+    if payload.kind == "judge" and payload.target != "output":
+        config["target"] = payload.target
+    try:
         row = await create_prompt(
             org_id=org_id,
             name=payload.name,
@@ -211,6 +360,7 @@ async def save_prompt(
             model=payload.model,
             variables=payload.variables,
             kind=payload.kind,
+            config=config or None,
         )
     except Exception as exc:
         if "unique" in str(exc).lower():
@@ -236,12 +386,52 @@ async def edit_prompt(
         existing = await get_prompt_full(prompt_id, org_id)
         if existing and existing.get("kind") == "code":
             _validate_code_scorer(payload.template)
+
+    # Toolset edits merge into the existing config rather than replacing it, so
+    # editing tools can't silently drop the MCP servers (or a code scorer's
+    # settings) that share the same column.
+    config_kwargs: Dict[str, Any] = {}
+    if (
+        payload.tools is not None
+        or payload.mcp_servers is not None
+        or payload.target is not None
+    ):
+        current = await get_prompt_full(prompt_id, org_id)
+        # _prompt_config, not dict(): asyncpg hands jsonb back as a string, and
+        # dict() on a string raises rather than parsing it.
+        config = dict(_prompt_config(current or {}))
+        try:
+            if payload.tools is not None:
+                config["tools"] = _validate_tools(payload.tools)
+            if payload.mcp_servers is not None:
+                config["mcp_servers"] = _validate_mcp(payload.mcp_servers)
+            if payload.target is not None:
+                target = payload.target.strip().lower()
+                if target not in VALID_SCORE_TARGETS:
+                    raise ValueError(
+                        f"target must be one of: {', '.join(sorted(VALID_SCORE_TARGETS))}"
+                    )
+                # Dropped rather than stored when it returns to the default, so
+                # the config doesn't accumulate no-op keys.
+                if target == "output":
+                    config.pop("target", None)
+                else:
+                    config["target"] = target
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc),
+            ) from exc
+        config = {k: v for k, v in config.items() if v}
+        # An emptied config becomes NULL rather than {}, matching create.
+        config_kwargs = {"config": config} if config else {"clear_config": True}
+
     row = await update_prompt(
         prompt_id, org_id,
         name=payload.name,
         template=payload.template,
         model=payload.model,
         variables=payload.variables,
+        **config_kwargs,
     )
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prompt not found")
@@ -406,7 +596,25 @@ def _serialize_version(row: dict) -> dict:
     }
 
 
+def _prompt_config(row: dict) -> dict:
+    """The prompt's config as a dict, whatever the driver handed back.
+
+    asyncpg returns a jsonb column as a string unless a codec is registered,
+    and the two shapes reaching the serializer would otherwise produce a
+    toolset that is sometimes a list and sometimes a character.
+    """
+    raw = row.get("config")
+    if isinstance(raw, str):
+        import json as _json
+        try:
+            raw = _json.loads(raw)
+        except ValueError:
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def _serialize(row: dict) -> dict:
+    config = _prompt_config(row)
     return {
         "prompt_id":    str(row["prompt_id"]),
         "org_id":       str(row["org_id"]),
@@ -416,6 +624,9 @@ def _serialize(row: dict) -> dict:
         "model":        row.get("model"),
         "variables":    row.get("variables") or [],
         "kind":         row.get("kind") or "completion",
+        "tools":        config.get("tools") or [],
+        "mcp_servers":  config.get("mcp_servers") or [],
+        "target":       config.get("target") or "output",
         "is_deployed":  bool(row.get("is_deployed", False)),
         "deployed_at":  row["deployed_at"].isoformat() if row.get("deployed_at") else None,
         "version":      row.get("version", 1),
@@ -429,6 +640,7 @@ def _serialize_fetch(row: dict) -> dict:
     """Slimmer response for the SDK fetch endpoint (template + metadata only)."""
     vars_raw = row.get("variables") or []
     variables = [v["name"] if isinstance(v, dict) else v for v in vars_raw]
+    config = _prompt_config(row)
     return {
         "prompt_id":  str(row["prompt_id"]),
         "slug":       row["slug"],
@@ -436,6 +648,11 @@ def _serialize_fetch(row: dict) -> dict:
         "template":   row["template"],
         "model":      row.get("model"),
         "variables":  variables,
+        # The SDK needs these to hand the same toolset to the model that the
+        # prompt was authored and evaluated with.
+        "tools":       config.get("tools") or [],
+        "mcp_servers": config.get("mcp_servers") or [],
+        "target":      config.get("target") or "output",
         "version":    row.get("version", 1),
         "environment": row.get("environment", "production"),
         "deployed_at": row.get("deployed_at").isoformat()

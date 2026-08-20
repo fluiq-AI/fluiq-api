@@ -18,6 +18,18 @@ KAFKA_EVAL_TOPIC = os.getenv("KAFKA_EVAL_TOPIC")
 # NOT configure fluiq.eval(). 1.0 = every call (default); 0 = none. An explicit
 # fluiq.eval() is always evaluated regardless of this rate.
 EVAL_AUTO_SAMPLE_RATE = float(os.getenv("EVAL_AUTO_SAMPLE_RATE", "1.0"))
+# The pass mark applied to a metric the caller gave no threshold for.
+#
+# This used to be 0.0, which meant every score passed — including 0.0. The
+# consequence was that fluiq.eval(mode="block") without an explicit thresholds=
+# argument could never block anything, while reporting passed=True on answers
+# the judge had scored zero. A gate that is off while appearing on is worse than
+# no gate. 0.7 matches the evaluator's own EVAL_JUDGE_THRESHOLD so warn mode and
+# block mode agree on what "failing" means.
+#
+# Passing an explicit 0 for a metric still means "never fail this one" — that
+# remains a deliberate opt-out, it is just no longer the accidental default.
+EVAL_DEFAULT_THRESHOLD = float(os.getenv("EVAL_DEFAULT_THRESHOLD", "0.7"))
 # Dedicated topic for the standalone security worker (separate from evals so the
 # heavy torch/spaCy security deps don't run in the evaluator).
 KAFKA_SECURITY_TOPIC = os.getenv("KAFKA_SECURITY_TOPIC")
@@ -62,7 +74,6 @@ def kafka_auth_kwargs() -> dict:
             "ssl_context": ssl.create_default_context(),
         }
     return {"security_protocol": "PLAINTEXT"}
-
 
 POSTGRES_DSN = os.getenv("POSTGRES_DSN")
 POSTGRES_POOL_MIN = int(os.getenv("POSTGRES_POOL_MIN"))

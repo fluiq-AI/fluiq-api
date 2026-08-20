@@ -35,7 +35,7 @@ async def list_prompts(org_id: uuid.UUID) -> List[Dict[str, Any]]:
         rows = await conn.fetch(
             f"""
             SELECT p.prompt_id, p.org_id, p.name, p.slug, p.template, p.model,
-                   p.variables, p.kind, p.is_deployed, p.deployed_at, p.version,
+                   p.variables, p.kind, p.config, p.is_deployed, p.deployed_at, p.version,
                    p.created_at, p.updated_at,
                    {_ENV_SUBQUERY}
             FROM prompts p

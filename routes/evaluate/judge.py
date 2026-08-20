@@ -153,7 +153,16 @@ def run_metrics(
                 "reason": str(data.get("reason") or ""),
             }
         except Exception as exc:
-            results[metric] = {"score": 0.0, "reason": f"judge error: {exc}"}
+            # Flagged, not just scored 0. A judge that could not be reached has
+            # not found a problem with the answer — it has failed to look. The
+            # caller uses this to keep an unreachable judge from blocking live
+            # traffic, which a bare 0.0 would do now that a missing threshold no
+            # longer means "anything passes".
+            results[metric] = {
+                "score":  0.0,
+                "reason": f"judge error: {exc}",
+                "error":  True,
+            }
     return results
 
 

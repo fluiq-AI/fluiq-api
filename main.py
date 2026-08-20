@@ -38,7 +38,6 @@ from routes.review import review_router
 from routes.resources import resources_router
 from routes.rubrics import rubrics_router
 from routes.aggregates import aggregates_router
-from routes.sql import sql_router
 from middleware.annotator import AnnotatorScopeMiddleware
 from routes.credentials import credentials_router
 from routes.otel import otel_router
@@ -186,7 +185,6 @@ app.include_router(review_router, prefix="/api/v1")
 app.include_router(resources_router, prefix="/api/v1")
 app.include_router(rubrics_router, prefix="/api/v1")
 app.include_router(aggregates_router, prefix="/api/v1")
-app.include_router(sql_router, prefix="/api/v1")
 app.include_router(credentials_router, prefix="/api/v1")
 app.include_router(trace.router, prefix="/api/v1")
 app.include_router(otel_router, prefix="/api/v1")
