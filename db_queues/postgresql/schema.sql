@@ -772,3 +772,24 @@ CREATE INDEX IF NOT EXISTS idx_aggregate_scores_org ON aggregate_scores(org_id);
 -- they are set once at launch, and nothing needs to query "every run with tag X"
 -- across orgs.
 ALTER TABLE dataset_runs ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- ---------------------------------------------------------------------------
+-- Marketing leads captured from the public site (response-gate demo, cost
+-- calculator, competitor comparison pages). Deliberately org-less: these are
+-- strangers, not users. One row per (email, source_page); a repeat submit from
+-- the same page keeps the original first-seen timestamp.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS leads (
+    lead_id     UUID PRIMARY KEY,
+    email       TEXT NOT NULL,
+    source_page TEXT NOT NULL,
+    context     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    referrer    TEXT,
+    user_agent  TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_email_source
+    ON leads (lower(email), source_page);
+CREATE INDEX IF NOT EXISTS idx_leads_created_at
+    ON leads (created_at DESC);

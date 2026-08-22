@@ -28,6 +28,7 @@ from routes.billing import billing_router
 from routes.secure import router as secure_router
 from routes.demo import router as demo_router
 from routes.contact import router as contact_router
+from routes.leads import router as leads_router
 from routes.blog import blog_router
 from routes.models import models_router
 from routes.alerts import alerts_router
@@ -199,6 +200,7 @@ app.include_router(datasets_router, prefix="/api/v1")
 app.include_router(secure_router, prefix="/api/v1")
 app.include_router(demo_router, prefix="/api/v1")
 app.include_router(contact_router, prefix="/api/v1")
+app.include_router(leads_router, prefix="/api/v1")
 app.include_router(blog_router, prefix="/api/v1")
 app.include_router(models_router, prefix="/api/v1")
 app.include_router(auth.auth_router, prefix="/auth")
