@@ -168,6 +168,27 @@ trace list page issued one query per run and stampeded ClickHouse.
 dataset copies the entire span tree into a no-TTL table, so an evaluation set
 stays reproducible after the source traces expire.
 
+## If you self-host this
+
+A full security audit is in
+[Documentations/security-audit-2026-07-18.md](https://github.com/fluiq-AI/Documentations/blob/main/security-audit-2026-07-18.md).
+Most findings were fixed; these were not, and they matter if you run this
+against real traffic:
+
+- **Raw PII and secrets persist in `traces.event` in plaintext** (M8, deferred).
+  The security worker detects and flags them, but the original span body is
+  stored unredacted in ClickHouse. Anyone with read access to the trace table
+  sees whatever your agents saw. If you self-host, this is the first thing to
+  fix.
+- **Fail-open is not per-category** (H4, partial). The gate can be set to block
+  on degraded, but you cannot currently say "fail closed for secrets, fail open
+  for everything else."
+- **`system` and `developer` role content is excluded from scanning** (L4).
+  Deliberate — it is your own text, not user input — but it means a poisoned
+  system prompt is not caught here.
+
+The audit lists the rest, including what was fixed and when.
+
 ## Tests
 
 ```bash
