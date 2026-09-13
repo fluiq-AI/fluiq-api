@@ -1,4 +1,102 @@
+# Local stack for fluiq-api: Kafka, ClickHouse, Postgres, Redis, MinIO and the
+# API itself.
+#
+# Both schemas are mounted into their container's init directory and applied on
+# first boot. The API also applies them itself at pool start, so re-running
+# against an existing volume is a no-op rather than an error.
+#
+# The three workers live in their own repos and are not started here. Bring this
+# up first — it creates the `fluiq-ai` network the workers attach to — then run
+# each worker against it:
+#
+#   github.com/fluiq-AI/fluiq-worker-tracer
+#   github.com/fluiq-AI/fluiq-worker-evaluator
+#   github.com/fluiq-AI/fluiq-worker-security
+
+name: fluiq
+
 services:
+  kafka:
+    image: apache/kafka:latest
+    container_name: fluiq-kafka
+    ports:
+      - "9092:29092"
+    environment:
+      KAFKA_NODE_ID: 0
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks: [fluiq-ai]
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: fluiq-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: fluiq
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./db_queues/clickhouse/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    networks: [fluiq-ai]
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: fluiq-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: fluiq
+      POSTGRES_PASSWORD: fluiq
+      POSTGRES_DB: fluiq
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db_queues/postgresql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fluiq -d fluiq"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [fluiq-ai]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: fluiq-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks: [fluiq-ai]
+    restart: unless-stopped
+
   api:
     build:
       context: .
@@ -8,10 +106,10 @@ services:
       - "8080:8080"
     env_file:
       - .env.development
-    # Local S3 (MinIO) for dataset imports. The API reaches MinIO internally at
-    # `minio:9000`, but presigned URLs are signed for `localhost:9000` so the
-    # browser (on the host) can PUT to it. In prod, leave all S3_* endpoint vars
-    # unset and set S3_UPLOADS_BUCKET to the real bucket.
+    # Local S3 (MinIO) for dataset imports and blog media. The API reaches MinIO
+    # internally at `minio:9000`, but presigned URLs are signed for
+    # `localhost:9100` so the browser (on the host) can PUT to it. In prod, leave
+    # all S3_* endpoint vars unset and set S3_UPLOADS_BUCKET to the real bucket.
     environment:
       S3_UPLOADS_BUCKET: fluiq-uploads
       S3_ENDPOINT_URL: http://minio:9000
@@ -20,11 +118,19 @@ services:
       AWS_SECRET_ACCESS_KEY: minioadmin123
       AWS_REGION: us-east-1
     depends_on:
-      - minio
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
     volumes:
       - .:/app
-    networks:
-      - fluiq-ai
+    networks: [fluiq-ai]
     restart: unless-stopped
 
   # ── Local S3-compatible storage (dev only) ──
@@ -42,8 +148,7 @@ services:
       - "9101:9001"   # web console
     volumes:
       - minio-data:/data
-    networks:
-      - fluiq-ai
+    networks: [fluiq-ai]
     restart: unless-stopped
 
   # Creates the uploads bucket once MinIO is up, then exits.
@@ -58,13 +163,15 @@ services:
       mc ilm rule add --expire-days 1 --prefix 'dataset-imports/' local/fluiq-uploads 2>/dev/null || mc ilm add --expiry-days 1 --prefix 'dataset-imports/' local/fluiq-uploads 2>/dev/null || true;
       echo 'minio bucket + lifecycle ready'
       "
-    networks:
-      - fluiq-ai
+    networks: [fluiq-ai]
 
 volumes:
+  kafka_data:
+  clickhouse_data:
+  postgres_data:
+  redis_data:
   minio-data:
 
 networks:
   fluiq-ai:
-    external: true
     name: fluiq-ai
